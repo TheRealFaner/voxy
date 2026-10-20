@@ -1,7 +1,7 @@
 package me.cortex.voxy.client.mixin.sodium;
 
 import me.cortex.voxy.client.VoxyClient;
-import me.cortex.voxy.client.core.VoxyRenderSystemAccess;
+import me.cortex.voxy.client.core.IVoxyRenderSystemHolder;
 import me.cortex.voxy.client.core.rendering.backend.RenderFrameStageState;
 import me.cortex.voxy.client.core.rendering.backend.RenderStage;
 import me.cortex.voxy.client.core.util.IrisUtil;
@@ -75,7 +75,7 @@ public abstract class MixinDefaultChunkRenderer extends ShaderChunkRenderer {
       TerrainRenderPass renderPass,
       CameraTransform camera) {
     var renderer =
-        ((VoxyRenderSystemAccess) Minecraft.getInstance().levelRenderer).voxy$getRenderSystem();
+        ((IVoxyRenderSystemHolder) Minecraft.getInstance().levelRenderer).voxy$getRenderSystem();
     if (renderer == null) {
       return;
     }
@@ -130,7 +130,7 @@ public abstract class MixinDefaultChunkRenderer extends ShaderChunkRenderer {
   @Unique
   private void renderVoxyTranslucent(ChunkRenderMatrices matrices, CameraTransform camera) {
     var renderer =
-        ((VoxyRenderSystemAccess) Minecraft.getInstance().levelRenderer).voxy$getRenderSystem();
+        ((IVoxyRenderSystemHolder) Minecraft.getInstance().levelRenderer).voxy$getRenderSystem();
     if (renderer == null) {
       return;
     }

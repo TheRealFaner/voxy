@@ -2,7 +2,7 @@ package me.cortex.voxy.client.mixin.minecraft;
 
 import com.mojang.blaze3d.systems.RenderSystem;
 import me.cortex.voxy.client.config.VoxyConfig;
-import me.cortex.voxy.client.core.VoxyRenderSystemAccess;
+import me.cortex.voxy.client.core.IVoxyRenderSystemHolder;
 import net.minecraft.client.Camera;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.FogRenderer;
@@ -27,7 +27,7 @@ public class MixinFogRenderer {
       boolean thickFog,
       float tickDelta,
       CallbackInfo ci) {
-    var vrs = VoxyRenderSystemAccess.getNullable();
+    var vrs = IVoxyRenderSystemHolder.getNullable();
     if (vrs == null) return;
 
     if (RenderSystem.getShaderFogEnd() < 10.0f) return;

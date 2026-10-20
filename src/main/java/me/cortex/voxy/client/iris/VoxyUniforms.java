@@ -4,7 +4,7 @@ import static net.irisshaders.iris.gl.uniform.UniformUpdateFrequency.PER_FRAME;
 
 import java.util.function.Supplier;
 import me.cortex.voxy.client.config.VoxyConfig;
-import me.cortex.voxy.client.core.VoxyRenderSystemAccess;
+import me.cortex.voxy.client.core.IVoxyRenderSystemHolder;
 import net.irisshaders.iris.gl.uniform.UniformHolder;
 import net.minecraft.client.Minecraft;
 import org.joml.Matrix4f;
@@ -15,7 +15,7 @@ public class VoxyUniforms {
   public static Matrix4f
       getViewProjection() { // This is 1 frame late ;-; cries, since the update occurs _before_ the
     // voxy render pipeline
-    var getVrs = (VoxyRenderSystemAccess) Minecraft.getInstance().levelRenderer;
+    var getVrs = (IVoxyRenderSystemHolder) Minecraft.getInstance().levelRenderer;
     if (getVrs == null || getVrs.voxy$getRenderSystem() == null) {
       return new Matrix4f();
     }
@@ -26,7 +26,7 @@ public class VoxyUniforms {
   public static Matrix4f
       getModelView() { // This is 1 frame late ;-; cries, since the update occurs _before_ the voxy
     // render pipeline
-    var getVrs = (VoxyRenderSystemAccess) Minecraft.getInstance().levelRenderer;
+    var getVrs = (IVoxyRenderSystemHolder) Minecraft.getInstance().levelRenderer;
     if (getVrs == null || getVrs.voxy$getRenderSystem() == null) {
       return new Matrix4f();
     }
@@ -37,7 +37,7 @@ public class VoxyUniforms {
   public static Matrix4f
       getProjection() { // This is 1 frame late ;-; cries, since the update occurs _before_ the voxy
     // render pipeline
-    var getVrs = (VoxyRenderSystemAccess) Minecraft.getInstance().levelRenderer;
+    var getVrs = (IVoxyRenderSystemHolder) Minecraft.getInstance().levelRenderer;
     if (getVrs == null || getVrs.voxy$getRenderSystem() == null) {
       return new Matrix4f();
     }

@@ -1,7 +1,7 @@
 package me.cortex.voxy.client.mixin.nvidium;
 
 import me.cortex.nvidium.RenderPipeline;
-import me.cortex.voxy.client.core.VoxyRenderSystemAccess;
+import me.cortex.voxy.client.core.IVoxyRenderSystemHolder;
 import net.caffeinemc.mods.sodium.client.render.chunk.ChunkRenderMatrices;
 import net.caffeinemc.mods.sodium.client.render.viewport.Viewport;
 import net.minecraft.client.Minecraft;
@@ -16,7 +16,7 @@ public class MixinRenderPipeline {
   private void voxy$injectRender(
       Viewport frustum, ChunkRenderMatrices crm, double px, double py, double pz, CallbackInfo ci) {
     var renderer =
-        ((VoxyRenderSystemAccess) Minecraft.getInstance().levelRenderer).voxy$getRenderSystem();
+        ((IVoxyRenderSystemHolder) Minecraft.getInstance().levelRenderer).voxy$getRenderSystem();
     if (renderer != null) {
       renderer.renderOpaque(renderer.setupFrame(crm, px, py, pz));
     }

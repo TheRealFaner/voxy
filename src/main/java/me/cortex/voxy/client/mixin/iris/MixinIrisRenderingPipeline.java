@@ -1,6 +1,6 @@
 package me.cortex.voxy.client.mixin.iris;
 
-import me.cortex.voxy.client.core.VoxyRenderSystemAccess;
+import me.cortex.voxy.client.core.IVoxyRenderSystemHolder;
 import me.cortex.voxy.client.core.rendering.backend.RenderFrameStageState;
 import me.cortex.voxy.client.core.rendering.backend.RenderStage;
 import me.cortex.voxy.client.core.util.IrisUtil;
@@ -102,7 +102,7 @@ public class MixinIrisRenderingPipeline implements VoxyPatchDataAccess, IrisVoxy
     var parameters = IrisUtil.getCapturedOrFallbackViewportParameters();
     if (parameters != null) {
       var renderer =
-          ((VoxyRenderSystemAccess) Minecraft.getInstance().levelRenderer).voxy$getRenderSystem();
+          ((IVoxyRenderSystemHolder) Minecraft.getInstance().levelRenderer).voxy$getRenderSystem();
       if (renderer != null) {
         RenderFrameStageState.store(
             parameters.runStage(
@@ -122,7 +122,7 @@ public class MixinIrisRenderingPipeline implements VoxyPatchDataAccess, IrisVoxy
   private void voxy$injectViewportSetup(CallbackInfo ci) {
     if (IrisUtil.CAPTURED_VIEWPORT_PARAMETERS != null) {
       var renderer =
-          ((VoxyRenderSystemAccess) Minecraft.getInstance().levelRenderer).voxy$getRenderSystem();
+          ((IVoxyRenderSystemHolder) Minecraft.getInstance().levelRenderer).voxy$getRenderSystem();
       if (renderer != null) {
         RenderFrameStageState.store(
             IrisUtil.CAPTURED_VIEWPORT_PARAMETERS.runStage(
@@ -138,7 +138,7 @@ public class MixinIrisRenderingPipeline implements VoxyPatchDataAccess, IrisVoxy
     var parameters = IrisUtil.getCapturedOrFallbackViewportParameters();
     if (parameters != null) {
       var renderer =
-          ((VoxyRenderSystemAccess) Minecraft.getInstance().levelRenderer).voxy$getRenderSystem();
+          ((IVoxyRenderSystemHolder) Minecraft.getInstance().levelRenderer).voxy$getRenderSystem();
       if (renderer != null) {
         parameters.runStage(
             renderer,
@@ -168,7 +168,7 @@ public class MixinIrisRenderingPipeline implements VoxyPatchDataAccess, IrisVoxy
     var parameters = IrisUtil.getCapturedOrFallbackViewportParameters();
     if (parameters != null) {
       var renderer =
-          ((VoxyRenderSystemAccess) Minecraft.getInstance().levelRenderer).voxy$getRenderSystem();
+          ((IVoxyRenderSystemHolder) Minecraft.getInstance().levelRenderer).voxy$getRenderSystem();
       if (renderer != null) {
         parameters.runStage(
             renderer,

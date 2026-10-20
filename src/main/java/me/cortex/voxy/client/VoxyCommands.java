@@ -13,7 +13,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Locale;
 import java.util.concurrent.CompletableFuture;
-import me.cortex.voxy.client.core.VoxyRenderSystemAccess;
+import me.cortex.voxy.client.core.IVoxyRenderSystemHolder;
 import me.cortex.voxy.common.DebugUtils;
 import me.cortex.voxy.commonImpl.VoxyCommon;
 import me.cortex.voxy.commonImpl.WorldIdentifier;
@@ -108,7 +108,7 @@ public class VoxyCommands {
     }
     var wr = Minecraft.getInstance().levelRenderer;
     if (wr != null) {
-      ((VoxyRenderSystemAccess) wr).voxy$shutdownRenderer();
+      ((IVoxyRenderSystemHolder) wr).voxy$shutdownRenderer();
     }
 
     VoxyCommon.shutdownInstance();

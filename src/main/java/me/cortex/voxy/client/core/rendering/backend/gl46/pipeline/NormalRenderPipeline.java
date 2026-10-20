@@ -24,7 +24,7 @@ import com.mojang.blaze3d.systems.RenderSystem;
 import java.util.List;
 import java.util.function.BooleanSupplier;
 import me.cortex.voxy.client.config.VoxyConfig;
-import me.cortex.voxy.client.core.VoxyRenderSystemAccess;
+import me.cortex.voxy.client.core.IVoxyRenderSystemHolder;
 import me.cortex.voxy.client.core.gl.GlFramebuffer;
 import me.cortex.voxy.client.core.gl.GlTexture;
 import me.cortex.voxy.client.core.rendering.backend.gl46.Gl46Viewport;
@@ -112,7 +112,7 @@ public class NormalRenderPipeline extends AbstractRenderPipeline {
   protected void finish(
       Gl46Viewport<?> viewport, int sourceFrameBuffer, int srcWidth, int srcHeight) {
     this.finalBlit.bind();
-    var vrs = VoxyRenderSystemAccess.getNullable();
+    var vrs = IVoxyRenderSystemHolder.getNullable();
     float fogStart = vrs != null ? vrs.getCapturedFogStart() : RenderSystem.getShaderFogStart();
     float fogEnd = vrs != null ? vrs.getCapturedFogEnd() : RenderSystem.getShaderFogEnd();
     float[] fogColor = vrs != null ? vrs.getCapturedFogColor() : RenderSystem.getShaderFogColor();

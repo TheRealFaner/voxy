@@ -3,7 +3,7 @@ package me.cortex.voxy.client.mixin.sodium;
 import me.cortex.voxy.client.ClientChunkCacheAccess;
 import me.cortex.voxy.client.config.VoxyConfig;
 import me.cortex.voxy.client.core.VoxyRenderSystem;
-import me.cortex.voxy.client.core.VoxyRenderSystemAccess;
+import me.cortex.voxy.client.core.IVoxyRenderSystemHolder;
 import me.cortex.voxy.common.VoxyFlags;
 import me.cortex.voxy.common.platform.PlatformAccess;
 import me.cortex.voxy.common.world.service.VoxelIngestService;
@@ -44,7 +44,7 @@ public class MixinRenderSectionManager {
       CommandList commandList,
       CallbackInfo ci) {
     if (level.levelRenderer != null) {
-      var system = ((VoxyRenderSystemAccess) (level.levelRenderer)).voxy$getRenderSystem();
+      var system = ((IVoxyRenderSystemHolder) (level.levelRenderer)).voxy$getRenderSystem();
       if (system != null) {
         system.onChunkTrackerReset();
       }
@@ -83,7 +83,7 @@ public class MixinRenderSectionManager {
   @Inject(method = "onChunkRemoved", at = @At("HEAD"))
   private void voxy$trackChunkRemove(int x, int z, CallbackInfo ci) {
       if (this.level.worldRenderer != null) {
-          var system = ((VoxyRenderSystemAccess)(this.level.worldRenderer)).getVoxyRenderSystem();
+          var system = ((IVoxyRenderSystemHolder)(this.level.worldRenderer)).getVoxyRenderSystem();
           if (system != null) {
               system.chunkBoundRenderer.removeSection(ChunkPos.toLong(x, z));
           }
@@ -116,7 +116,7 @@ public class MixinRenderSectionManager {
     return true;
 
     VoxyRenderSystem system =
-        ((VoxyRenderSystemAccess) (this.level.levelRenderer)).voxy$getRenderSystem();
+        ((IVoxyRenderSystemHolder) (this.level.levelRenderer)).voxy$getRenderSystem();
     if (system == null) {
       return true;
     }

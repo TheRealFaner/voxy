@@ -2,7 +2,7 @@ package me.cortex.voxy.client.iris;
 
 import java.util.function.IntSupplier;
 import me.cortex.voxy.client.core.VoxyRenderSystem;
-import me.cortex.voxy.client.core.VoxyRenderSystemAccess;
+import me.cortex.voxy.client.core.IVoxyRenderSystemHolder;
 import net.irisshaders.iris.gl.sampler.SamplerHolder;
 import net.irisshaders.iris.pipeline.IrisRenderingPipeline;
 import net.irisshaders.iris.targets.RenderTargets;
@@ -69,7 +69,7 @@ public class VoxySamplers {
   private static int voxyDistantDepthOr(
       boolean opaque, IntSupplier gl46Path, IntSupplier gl41MetalFallback) {
     try {
-      VoxyRenderSystem voxy = VoxyRenderSystemAccess.getNullable();
+      VoxyRenderSystem voxy = IVoxyRenderSystemHolder.getNullable();
       if (voxy == null) {
         return gl46Path.getAsInt();
       }

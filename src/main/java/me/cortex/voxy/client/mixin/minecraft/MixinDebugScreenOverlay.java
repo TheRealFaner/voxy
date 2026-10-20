@@ -3,7 +3,7 @@ package me.cortex.voxy.client.mixin.minecraft;
 import java.util.ArrayList;
 import java.util.List;
 import me.cortex.voxy.client.core.VoxyRenderSystem;
-import me.cortex.voxy.client.core.VoxyRenderSystemAccess;
+import me.cortex.voxy.client.core.IVoxyRenderSystemHolder;
 import me.cortex.voxy.common.platform.PlatformAccess;
 import me.cortex.voxy.commonImpl.VoxyCommon;
 import net.minecraft.ChatFormatting;
@@ -38,7 +38,7 @@ public abstract class MixinDebugScreenOverlay {
     }
     VoxyRenderSystem vrs = null;
     var wr = Minecraft.getInstance().levelRenderer;
-    if (wr != null) vrs = ((VoxyRenderSystemAccess) wr).voxy$getRenderSystem();
+    if (wr != null) vrs = ((IVoxyRenderSystemHolder) wr).voxy$getRenderSystem();
 
     // Voxy instance active
     voxyLines.add(

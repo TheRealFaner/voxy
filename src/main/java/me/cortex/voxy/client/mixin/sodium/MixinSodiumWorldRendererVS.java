@@ -1,6 +1,6 @@
 package me.cortex.voxy.client.mixin.sodium;
 
-import me.cortex.voxy.client.core.VoxyRenderSystemAccess;
+import me.cortex.voxy.client.core.IVoxyRenderSystemHolder;
 import me.cortex.voxy.client.core.rendering.backend.RenderFrameStageState;
 import me.cortex.voxy.client.core.rendering.backend.RenderStage;
 import me.cortex.voxy.client.core.util.IrisUtil;
@@ -55,7 +55,7 @@ public class MixinSodiumWorldRendererVS {
       ChunkRenderMatrices matrices, RenderType renderLayer, double x, double y, double z) {
     if (renderLayer == RenderType.solid()) {
       var renderer =
-          ((VoxyRenderSystemAccess) Minecraft.getInstance().levelRenderer).voxy$getRenderSystem();
+          ((IVoxyRenderSystemHolder) Minecraft.getInstance().levelRenderer).voxy$getRenderSystem();
       if (renderer != null) {
         boolean shaderPackActive = IrisUtil.irisShaderPackEnabled();
         var frame =
@@ -80,7 +80,7 @@ public class MixinSodiumWorldRendererVS {
   @Unique
   private void renderVoxyTranslucent(ChunkRenderMatrices matrices, double x, double y, double z) {
     var renderer =
-        ((VoxyRenderSystemAccess) Minecraft.getInstance().levelRenderer).voxy$getRenderSystem();
+        ((IVoxyRenderSystemHolder) Minecraft.getInstance().levelRenderer).voxy$getRenderSystem();
     if (renderer == null) {
       return;
     }

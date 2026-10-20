@@ -3,7 +3,7 @@ package me.cortex.voxy.client.config;
 import me.cortex.voxy.client.ClientSessionEvents;
 import me.cortex.voxy.client.compat.sable.SableClientRenderDistance;
 import me.cortex.voxy.client.config.SodiumConfigBuilder.*;
-import me.cortex.voxy.client.core.VoxyRenderSystemAccess;
+import me.cortex.voxy.client.core.IVoxyRenderSystemHolder;
 import me.cortex.voxy.client.core.rendering.post.SSAO;
 import me.cortex.voxy.client.core.util.IrisUtil;
 import me.cortex.voxy.common.platform.PlatformAccess;
@@ -77,7 +77,7 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
                             c -> {
                               if (!c) {
                                 var vrsh =
-                                    (VoxyRenderSystemAccess) Minecraft.getInstance().levelRenderer;
+                                    (IVoxyRenderSystemHolder) Minecraft.getInstance().levelRenderer;
                                 if (vrsh != null) {
                                   vrsh.voxy$shutdownRenderer();
                                 }
@@ -130,7 +130,7 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
                         .setPostChangeRunner(
                             c -> {
                               var vrsh =
-                                  (VoxyRenderSystemAccess) Minecraft.getInstance().levelRenderer;
+                                  (IVoxyRenderSystemHolder) Minecraft.getInstance().levelRenderer;
                               if (vrsh != null) {
                                 if (c) {
                                   vrsh.voxy$createRenderer();
@@ -167,7 +167,7 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
                         .setPostChangeRunner(
                             c -> {
                               var vrsh =
-                                  (VoxyRenderSystemAccess) Minecraft.getInstance().levelRenderer;
+                                  (IVoxyRenderSystemHolder) Minecraft.getInstance().levelRenderer;
                               if (vrsh != null) {
                                 var vrs = vrsh.voxy$getRenderSystem();
                                 if (vrs != null) {
