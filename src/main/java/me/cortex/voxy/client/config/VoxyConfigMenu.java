@@ -8,7 +8,7 @@ import me.cortex.voxy.client.core.rendering.post.SSAO;
 import me.cortex.voxy.client.core.util.IrisUtil;
 import me.cortex.voxy.common.platform.PlatformAccess;
 import me.cortex.voxy.common.util.cpu.CpuLayout;
-import me.cortex.voxy.impl.VoxyCommon;
+import me.cortex.voxy.commonImpl.VoxyCommon;
 import net.caffeinemc.mods.sodium.api.config.ConfigEntryPoint;
 import net.caffeinemc.mods.sodium.api.config.ConfigEntryPointForge;
 import net.caffeinemc.mods.sodium.api.config.ConfigState;

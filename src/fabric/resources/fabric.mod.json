@@ -27,7 +27,7 @@
       "me.cortex.voxy.client.config.ModMenuIntegration"
     ],
     "main": [
-      "me.cortex.voxy.impl.FabricVoxyCommon"
+      "me.cortex.voxy.commonImpl.FabricVoxyCommon"
     ]
   },
   "mixins": [

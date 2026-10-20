@@ -10,8 +10,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.LinkedHashMap;
 import java.util.function.Supplier;
-import me.cortex.voxy.impl.VoxyCommon;
-import me.cortex.voxy.impl.WorldIdentifier;
+import me.cortex.voxy.commonImpl.VoxyCommon;
+import me.cortex.voxy.commonImpl.WorldIdentifier;
 
 public class WorldConfigStorage<T> {
   private static final int FORMAT_VERSION = 1;

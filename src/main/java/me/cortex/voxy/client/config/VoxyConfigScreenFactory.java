@@ -1,6 +1,6 @@
 package me.cortex.voxy.client.config;
 
-import me.cortex.voxy.impl.VoxyCommon;
+import me.cortex.voxy.commonImpl.VoxyCommon;
 import net.caffeinemc.mods.sodium.client.config.ConfigManager;
 import net.caffeinemc.mods.sodium.client.config.structure.OptionPage;
 import net.caffeinemc.mods.sodium.client.gui.VideoSettingsScreen;

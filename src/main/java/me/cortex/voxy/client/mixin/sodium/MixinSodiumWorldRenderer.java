@@ -1,6 +1,6 @@
 package me.cortex.voxy.client.mixin.sodium;
 
-import me.cortex.voxy.impl.VoxyCommon;
+import me.cortex.voxy.commonImpl.VoxyCommon;
 import net.caffeinemc.mods.sodium.client.gl.device.CommandList;
 import net.caffeinemc.mods.sodium.client.render.SodiumWorldRenderer;
 import org.spongepowered.asm.mixin.Mixin;

@@ -10,7 +10,7 @@ import me.cortex.voxy.client.core.rendering.backend.RenderBackendId;
 import me.cortex.voxy.client.core.rendering.backend.RenderBackendSelection;
 import me.cortex.voxy.client.core.rendering.backend.RenderBackendSelector;
 import me.cortex.voxy.common.Logger;
-import me.cortex.voxy.impl.VoxyCommon;
+import me.cortex.voxy.commonImpl.VoxyCommon;
 import net.minecraft.client.Minecraft;
 
 public abstract class VoxyClient {

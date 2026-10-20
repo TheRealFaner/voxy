@@ -1,7 +1,7 @@
 package me.cortex.voxy.client.mixin.minecraft;
 
 import me.cortex.voxy.client.ClientSessionEvents;
-import me.cortex.voxy.impl.compat.sable.SableClientSkyLightCache;
+import me.cortex.voxy.commonImpl.compat.sable.SableClientSkyLightCache;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.multiplayer.ClientPacketListener;
 import net.minecraft.network.protocol.game.ClientboundLevelChunkWithLightPacket;

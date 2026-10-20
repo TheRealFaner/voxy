@@ -4,7 +4,7 @@ import java.util.concurrent.Semaphore;
 import me.cortex.voxy.client.compat.SemaphoreBlockImpersonator;
 import me.cortex.voxy.client.config.VoxyConfig;
 import me.cortex.voxy.common.thread.MultiThreadPrioritySemaphore;
-import me.cortex.voxy.impl.VoxyCommon;
+import me.cortex.voxy.commonImpl.VoxyCommon;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;

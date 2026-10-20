@@ -14,8 +14,8 @@ import me.cortex.voxy.client.core.rendering.post.SSAO;
 import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.common.platform.PlatformAccess;
 import me.cortex.voxy.common.util.cpu.CpuLayout;
-import me.cortex.voxy.impl.VoxyCommon;
-import me.cortex.voxy.impl.compat.sable.SableContraptionRenderDistance;
+import me.cortex.voxy.commonImpl.VoxyCommon;
+import me.cortex.voxy.commonImpl.compat.sable.SableContraptionRenderDistance;
 
 public class VoxyConfig {
   private static final Gson GSON =

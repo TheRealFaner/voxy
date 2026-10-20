@@ -5,7 +5,7 @@ import dev.ryanhcode.sable.api.sublevel.SubLevelContainer;
 import dev.ryanhcode.sable.sublevel.ClientSubLevel;
 import me.cortex.voxy.client.config.VoxyConfig;
 import me.cortex.voxy.common.Logger;
-import me.cortex.voxy.impl.compat.sable.SableContraptionRenderDistance;
+import me.cortex.voxy.commonImpl.compat.sable.SableContraptionRenderDistance;
 import net.minecraft.client.Minecraft;
 
 /** Client-side view of the simulated contraption render distance used by the Sable compat. */
