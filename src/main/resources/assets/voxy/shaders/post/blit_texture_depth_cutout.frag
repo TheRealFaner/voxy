@@ -15,7 +15,17 @@ layout(location = 8) uniform float fogDensity;
 #endif
 #endif
 
-#import <sodium:include/fog.glsl>
+// Sodium 0.8.12 fog helpers, inlined: Sodium 0.8.13 no longer ships this include.
+const int FOG_SHAPE_SPHERICAL = 0;
+const int FOG_SHAPE_CYLINDRICAL = 1;
+
+float getFragDistance(int fogShape, vec3 position) {
+    switch (fogShape) {
+        case FOG_SHAPE_SPHERICAL: return length(position);
+        case FOG_SHAPE_CYLINDRICAL: return max(length(position.xz), abs(position.y));
+        default: return length(position);
+    }
+}
 
 out vec4 colour;
 in vec2 UV;
