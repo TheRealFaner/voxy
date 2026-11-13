@@ -624,22 +624,42 @@ public class RenderDataFactory {
       int coreX = x + cdx;
       int coreZ = z + cdz;
       int coreBlockId;
-      if (coreX >= 0 && coreX < 32 && coreZ >= 0 && coreZ < 32) {
+      final boolean outX = coreX < 0 || coreX > 31;
+      final boolean outZ = coreZ < 0 || coreZ > 31;
+      if (!outX && !outZ) {
         coreBlockId = Mapper.getBlockId(rawSectionData[coreX + 32 * coreZ + 1024 * y]);
-      } else if (cdx == 0 || cdz == 0) {
-        // Cardinal core across a section border: the neighbour slice holds the same y layer.
-        Direction dir =
-            cdx < 0
-                ? Direction.WEST
-                : cdx > 0 ? Direction.EAST : cdz < 0 ? Direction.NORTH : Direction.SOUTH;
-        int id = this.getNeighborBlockId(rawSectionData, idx, dir, neighborMsk);
-        if (id == NEIGHBOR_UNAVAILABLE) {
-          continue;
-        }
-        coreBlockId = id;
-      } else {
-        // Diagonal core across a section border: no slice available, keep the cell empty.
+      } else if (outX && outZ) {
+        // Both core offsets point outside: only possible at a section corner, where no single
+        // face slice holds the core. Keep the cell empty.
         continue;
+      } else if (outX) {
+        // Diagonal or cardinal core with x outside: the ±x face slice spans the whole y/z face,
+        // so index it at the core's z (in range even when the shell cell's z differs).
+        if (cdx < 0) {
+          if ((neighborMsk & 1) == 0) {
+            continue;
+          }
+          coreBlockId = Mapper.getBlockId(this.neighboringFaces[y * 32 + coreZ]);
+        } else {
+          if ((neighborMsk & 2) == 0) {
+            continue;
+          }
+          coreBlockId = Mapper.getBlockId(this.neighboringFaces[32 * 32 + y * 32 + coreZ]);
+        }
+      } else {
+        // Diagonal or cardinal core with z outside: the ±z face slice spans the whole x/y face,
+        // so index it at the core's x (in range even when the shell cell's x differs).
+        if (cdz < 0) {
+          if ((neighborMsk & 16) == 0) {
+            continue;
+          }
+          coreBlockId = Mapper.getBlockId(this.neighboringFaces[4 * 32 * 32 + coreX + (y << 5)]);
+        } else {
+          if ((neighborMsk & 32) == 0) {
+            continue;
+          }
+          coreBlockId = Mapper.getBlockId(this.neighboringFaces[5 * 32 * 32 + coreX + (y << 5)]);
+        }
       }
       if (coreBlockId <= 0 || !this.modelMan.isThickBranchBlockId(coreBlockId)) {
         continue;
