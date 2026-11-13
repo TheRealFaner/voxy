@@ -5,13 +5,18 @@ import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.util.Arrays;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.StampedLock;
 import me.cortex.voxy.common.Logger;
+import me.cortex.voxy.common.world.other.DynamicTreesBranches;
 import me.cortex.voxy.common.world.other.Mapper;
 import org.jetbrains.annotations.Nullable;
 
 public class ActiveSectionTracker {
+
+  // One-shot so a repeated failure during shutdown cannot spam the log.
+  private static final AtomicBoolean NEIGHBOR_INVALIDATION_WARNED = new AtomicBoolean();
 
   // Deserialize into the supplied section, returns true on success, false on failure
   public interface SectionLoader {
@@ -155,6 +160,7 @@ public class ActiveSectionTracker {
     // If this thread was the one to create the reference then its the thread to load the section
     if (isLoader) {
       int status = 0;
+      boolean loadedFromStorage = false;
       if (section == null) { // Secondary cache miss
         section =
             new WorldSection(
@@ -165,6 +171,7 @@ public class ActiveSectionTracker {
                 this);
 
         status = this.loader.load(section);
+        loadedFromStorage = true;
 
         if (status < 0) {
           // TODO: Instead if throwing an exception do something better, like attempting to regen
@@ -192,6 +199,37 @@ public class ActiveSectionTracker {
       VarHandle.storeStoreFence(); // Do not reorder setting this object
       holder.obj = section;
       VarHandle.releaseFence();
+
+      if (loadedFromStorage && status == 0 && this.engine != null) {
+        // LOD0 border case: a section inserted from storage with real data can have neighbours
+        // whose meshes were built while this section had no data yet (the loader fills a missing
+        // entry with AIR). Those meshes read the shared border as air and are not rebuilt when
+        // the real data appears, leaving holes/phantom walls until an unrelated re-mesh. Reuse
+        // the normal dirty path so the render backends enqueue remeshes of all six face
+        // neighbours. This is a one-shot transition: it fires only for a freshly constructed
+        // section whose storage load succeeded, never for LRU reuse or later updates, so it
+        // cannot loop. DONT_SAVE keeps the read-only materialization out of the save queue; the
+        // section is published above first so a re-entrant acquire by the callback cannot spin.
+        // This neighbour remesh is a DT-only correctness fix (thick-trunk/root patches read
+        // across section borders); vanilla worlds never map DT states and skip it entirely.
+        if (DynamicTreesBranches.PRESENT) {
+          try {
+            this.engine.markDirty(
+                section,
+                WorldEngine.UPDATE_TYPE_BLOCK_BIT | WorldEngine.UPDATE_TYPE_DONT_SAVE,
+                WorldEngine.NEIGHBOR_MSK_ALL);
+          } catch (Throwable t) {
+            // Never let an invalidation failure leak the section refcount during shutdown.
+            if (NEIGHBOR_INVALIDATION_WARNED.compareAndSet(false, true)) {
+              Logger.warn(
+                  "Failed to enqueue neighbour remesh for "
+                      + WorldEngine.pprintPos(section.key),
+                  t);
+            }
+          }
+        }
+      }
+
       if (nullOnEmpty
           && status == 1) { // If its air return null as stated, release the section aswell
         section.release();

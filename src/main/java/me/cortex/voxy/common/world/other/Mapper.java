@@ -477,7 +477,17 @@ public class Mapper {
       this.id = id;
       this.state = state;
       this.mipPriority = isDynamicTreesBranch(state) ? 1 : 0;
-      this.mipSkip = DynamicTreesBranches.isSurfaceRoot(state);
+      boolean surfaceRoot = DynamicTreesBranches.isSurfaceRoot(state);
+      this.mipSkip = surfaceRoot;
+      // Latch DT presence for DT-only meshing work. This constructor runs once per distinct
+      // BlockState, so the class-hierarchy walks are cheap; isBranch already excludes
+      // BasicRootsBlock.
+      if (surfaceRoot
+          || DynamicTreesBranches.isBranch(state)
+          || DynamicTreesBranches.isTrunkShell(state)
+          || DynamicTreesBranches.isBranchBlockClass(state)) {
+        DynamicTreesBranches.PRESENT = true;
+      }
       // Override opacity of leaves to be solid
       if (state.getBlock() instanceof LeavesBlock) {
         this.opacity = 15;

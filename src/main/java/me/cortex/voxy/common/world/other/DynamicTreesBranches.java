@@ -28,6 +28,9 @@ public final class DynamicTreesBranches {
       "com.dtteam.dynamictrees.block.branch.SurfaceRootBlock";
   public static final String EXCLUDED_NAMESPACE = "dynamictreesplus";
 
+  /** Set once any Dynamic Trees block state is mapped; gates DT-only meshing work. */
+  public static volatile boolean PRESENT = false;
+
   /**
    * Largest radius whose baked model stays inside one block cell. Branches above this (Dynamic
    * Trees thick branches, radius 9..24) render their outer surface outside the cell, so Voxy's
