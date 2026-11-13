@@ -88,6 +88,9 @@ public class RenderDataFactory {
   private int rootPlaneBoundarySkipped = 0;
   private int shellPatchedCount = 0;
   private int shellUnavailableCount = 0;
+  // Branch cells whose section masks were patched to match a neighbour-aware variant (one-shot
+  // diag only).
+  private int branchMaskPatchedCount = 0;
   // Per-section shell skip reasons (one-shot diag only).
   private int shellSkippedCornerBothOutside = 0;
   private int shellSkippedMskBitMissing = 0;
@@ -531,8 +534,8 @@ public class RenderDataFactory {
   /**
    * Replaces the base model id of every recorded Dynamic Trees branch block with its per-position
    * variant model id. Must run after {@link #acquireNeighborData} (boundary neighbours) and before
-   * face generation (masks were built from the base model; branches are non-opaque and non-fluid in
-   * both cases).
+   * face generation. The section masks were built from the base model, so every installed variant
+   * patches the cell's opaque/non-opaque/fluid bits to match its own metadata.
    */
   private void resolveBranchVariants(long[] rawSectionData, int neighborMsk) {
     final var rawModelIds = this.modelMan._unsafeRawAccess();
@@ -549,36 +552,17 @@ public class RenderDataFactory {
       int south = this.getNeighborBlockId(rawSectionData, idx, Direction.SOUTH, neighborMsk);
       int west = this.getNeighborBlockId(rawSectionData, idx, Direction.WEST, neighborMsk);
       int east = this.getNeighborBlockId(rawSectionData, idx, Direction.EAST, neighborMsk);
+      if (down == NEIGHBOR_UNAVAILABLE
+          || up == NEIGHBOR_UNAVAILABLE
+          || north == NEIGHBOR_UNAVAILABLE
+          || south == NEIGHBOR_UNAVAILABLE
+          || west == NEIGHBOR_UNAVAILABLE
+          || east == NEIGHBOR_UNAVAILABLE) {
+        // A boundary slice was genuinely not acquired; keep the base model rather than guessing.
+        // Missing sections are AIR-filled, so this does not fire at normal LOD seams.
+        continue;
+      }
       final int blockId = Mapper.getBlockId(rawSectionData[idx]);
-      // LOD-level seam heuristic: NEIGHBOR_UNAVAILABLE means the section holding that face slice
-      // was not acquired. At the edge of the loaded LOD0 grid the neighbour section at the same
-      // LOD level does not exist, so skipping the cell leaves Dynamic Trees' connectionless base
-      // model (only the centre cube band y in [8-r, 8+r]): the upper/lower bands of a thin trunk
-      // lose their bark and a vertical slit opens.
-      // Assume the trunk continues vertically: substituting the cell's own state id for DOWN/UP
-      // makes DT bake a connected vertical continuation (full-height walls, no end caps on those
-      // sides). The four horizontal sides get air (0) instead so no phantom sideways sleeves
-      // appear. One cell of extension at a true seam is preferable to a hole. The substituted ids
-      // are part of the VariantKey, so these variants stay distinct from ones baked against real
-      // neighbours and no stale cache entry is reused.
-      if (down == NEIGHBOR_UNAVAILABLE) {
-        down = blockId;
-      }
-      if (up == NEIGHBOR_UNAVAILABLE) {
-        up = blockId;
-      }
-      if (north == NEIGHBOR_UNAVAILABLE) {
-        north = 0; // air
-      }
-      if (south == NEIGHBOR_UNAVAILABLE) {
-        south = 0;
-      }
-      if (west == NEIGHBOR_UNAVAILABLE) {
-        west = 0;
-      }
-      if (east == NEIGHBOR_UNAVAILABLE) {
-        east = 0;
-      }
       int variantModelId =
           this.modelMan.getVariantModelId(blockId, down, up, north, south, west, east);
       if (variantModelId == ModelFactory.VARIANT_MODEL_NOT_READY) {
@@ -597,20 +581,37 @@ public class RenderDataFactory {
 
       long block = rawSectionData[idx];
       long metadata = this.modelMan.getModelMetadataFromClientId(variantModelId);
-      // The opaque/fluid masks were built from the base model metadata. Dynamic Trees branches are
-      // non-opaque and non-fluid in both forms, but keep the base model if that invariant ever
-      // breaks so the face masks cannot disagree with the patched model id.
+      // The masks were built from the base model. A variant can legitimately flip opaque/non-opaque
+      // and fluid bits (capped ends, different faces), so patch this cell's bits to match the
+      // installed model instead of rejecting a valid variant and leaving the capped base bake in
+      // place: that rejection is what opened the vertical slit at thin-trunk section borders.
       long baseMetadata = this.modelMan.getModelMetadataFromClientId(rawModelIds[blockId]);
+      int maskIndex = idx >> 5;
+      int bit = 1 << (idx & 31);
+      this.opaqueMasks[maskIndex] &= ~bit;
+      this.nonOpaqueMasks[maskIndex] &= ~bit;
+      this.fluidMasks[maskIndex] &= ~bit;
+      boolean fullyOpaque = ModelQueries._isFullyOpaque(metadata) != 0;
+      boolean pureFluid = ModelQueries._isFluid(metadata) != 0;
+      boolean containsFluid = ModelQueries._containsFluid(metadata) != 0;
+      if (fullyOpaque) {
+        this.opaqueMasks[maskIndex] |= bit;
+      }
+      if (!fullyOpaque && !pureFluid) {
+        this.nonOpaqueMasks[maskIndex] |= bit;
+      }
+      if (pureFluid || containsFluid) {
+        this.fluidMasks[maskIndex] |= bit;
+      }
+      this.hasCutout |=
+          !ModelQueries.isTranslucent(metadata) && ModelQueries.needsAlphaDiscard(metadata);
       if (ModelQueries._isFullyOpaque(baseMetadata) != ModelQueries._isFullyOpaque(metadata)
           || ModelQueries._isFluid(baseMetadata) != ModelQueries._isFluid(metadata)
           || ModelQueries._containsFluid(baseMetadata) != ModelQueries._containsFluid(metadata)) {
-        // Only the bits that feed the already-built section masks (opaque/fluid) must agree.
-        // Per-face layout bits (double-sided, alpha discard) legitimately differ between the
-        // connectionless base model and the neighbour-aware variant; comparing them rejected
-        // every mid-trunk variant and reverted those cells to the capped base geometry.
-        if (VARIANT_MASK_REJECT_LOG.compareAndSet(false, true)) {
+        this.branchMaskPatchedCount++;
+        if (VARIANT_MASK_PATCH_LOG.compareAndSet(false, true)) {
           Logger.warn(
-              "Dynamic Trees variant skipped: opaque/fluid mask mismatch for block "
+              "Dynamic Trees variant masks patched: block "
                   + blockId
                   + " (base="
                   + baseMetadata
@@ -618,7 +619,6 @@ public class RenderDataFactory {
                   + metadata
                   + ")");
         }
-        continue;
       }
       this.sectionData[idx * 2] = packPartialQuadData(variantModelId, block, metadata);
       this.sectionData[idx * 2 + 1] = metadata;
@@ -1171,7 +1171,7 @@ public class RenderDataFactory {
     return Mapper.getBlockId(this.neighboringFaces[5 * area + px + (py << 5)]);
   }
 
-  private static final java.util.concurrent.atomic.AtomicBoolean VARIANT_MASK_REJECT_LOG =
+  private static final java.util.concurrent.atomic.AtomicBoolean VARIANT_MASK_PATCH_LOG =
       new java.util.concurrent.atomic.AtomicBoolean();
 
   private static final java.util.concurrent.atomic.AtomicBoolean ROOT_MASK_REJECT_LOG =
@@ -2899,6 +2899,7 @@ public class RenderDataFactory {
     this.rootPlaneBoundarySkipped = 0;
     this.shellPatchedCount = 0;
     this.shellUnavailableCount = 0;
+    this.branchMaskPatchedCount = 0;
     this.shellSkippedCornerBothOutside = 0;
     this.shellSkippedMskBitMissing = 0;
     this.shellSkippedCoreNotThick = 0;
@@ -2935,7 +2936,9 @@ public class RenderDataFactory {
             SectionPos.asLong(section.x, section.y, section.z), this.overlayRoots);
       }
       if (lod0
-          && (this.rootBlockCount != 0 || this.shellBlockCount != 0)
+          && (this.rootBlockCount != 0
+              || this.shellBlockCount != 0
+              || this.variantBlockCount != 0)
           && SECTION_DIAG_LOGS.getAndIncrement() < 24) {
         Logger.info(
             "DT LOD0 section diag @ "
@@ -2967,7 +2970,11 @@ public class RenderDataFactory {
                 + ",notThick:"
                 + this.shellSkippedCoreNotThick
                 + ",dirNull:"
-                + this.shellSkippedCoreDirNull);
+                + this.shellSkippedCoreDirNull
+                + " branches="
+                + this.variantBlockCount
+                + " maskPatched="
+                + this.branchMaskPatchedCount);
       }
       this.generateYZFaces();
       this.generateXFaces();
