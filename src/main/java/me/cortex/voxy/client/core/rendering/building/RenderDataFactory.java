@@ -71,6 +71,10 @@ public class RenderDataFactory {
   // LOD0 Dynamic Trees surface roots (3x3x3 neighbour context).
   private final int[] rootBlockIndices = new int[32 * 32 * 32];
   private int rootBlockCount = 0;
+  // Stage 2b-1: depth-band plane model ids per successfully patched root cell (same indexing as
+  // rootBlockIndices). Only populated when the multi-plane flag is on; cleared at the start of
+  // every mesh so entries never leak between sections.
+  private final int[][] rootCellPlanes = new int[32 * 32 * 32][];
   // True-geometry overlay: exact root cells captured for the vanilla render pass.
   private final java.util.List<DTRootGeometryCache.RootBlock> overlayRoots =
       new java.util.ArrayList<>();
@@ -80,6 +84,8 @@ public class RenderDataFactory {
   private int rootPatchedCount = 0;
   private int rootUnavailableCount = 0;
   private int rootMaskRejectedCount = 0;
+  private int rootPlaneQuadCount = 0;
+  private int rootPlaneBoundarySkipped = 0;
   private int shellPatchedCount = 0;
   private int shellUnavailableCount = 0;
   private static final java.util.concurrent.atomic.AtomicInteger SECTION_DIAG_LOGS =
@@ -230,6 +236,9 @@ public class RenderDataFactory {
 
   private final Mesher blockMesher = new Mesher();
   private final Mesher seondaryblockMesher = new Mesher(); // Used for dual non-opaque geometry
+  // Scratch mesher for isolated per-plane root quads. Used only via emitQuad (length/width 1), so
+  // its scanline state is never touched and it must not be finished/reset like the mesh loops.
+  private final Mesher rootPlaneMesher = new Mesher();
 
   public RenderDataFactory(WorldEngine world, ModelFactory modelManager, boolean emitMeshlets) {
     this(world, modelManager, emitMeshlets, false);
@@ -932,6 +941,14 @@ public class RenderDataFactory {
       long block = rawSectionData[idx];
       this.sectionData[idx * 2] = packPartialQuadData(rootModelId, block, metadata);
       this.sectionData[idx * 2 + 1] = metadata;
+      // Stage 2b-1: remember the extra depth-band planes so the mesher can emit them. Only
+      // successfully patched variants reach this point; overlay suppression returns above.
+      if (this.modelMan.isRootMultiplaneEnabled()) {
+        int[] planes = this.modelMan.getRootPlaneModelIds(rootModelId);
+        if (planes.length > 1) {
+          this.rootCellPlanes[idx] = planes;
+        }
+      }
       this.rootPatchedCount++;
     }
     if (anyNotReady) {
@@ -1075,6 +1092,12 @@ public class RenderDataFactory {
       new java.util.concurrent.atomic.AtomicBoolean();
 
   private static final java.util.concurrent.atomic.AtomicBoolean ROOT_MASK_REJECT_LOG =
+      new java.util.concurrent.atomic.AtomicBoolean();
+
+  private static final java.util.concurrent.atomic.AtomicBoolean ROOT_PLANE_CAPACITY_LOG =
+      new java.util.concurrent.atomic.AtomicBoolean();
+
+  private static final java.util.concurrent.atomic.AtomicBoolean ROOT_PLANE_DIAG_LOG =
       new java.util.concurrent.atomic.AtomicBoolean();
 
   private static final long LM = (0xFFL << 55);
@@ -2593,6 +2616,120 @@ public class RenderDataFactory {
     }
   }
 
+  /**
+   * Stage 2b-1: emits the extra depth-band planes (1..N-1) of multi-plane Dynamic Trees roots.
+   *
+   * <p>Plane 0 is the base root model, already emitted by the normal non-opaque passes. Extra
+   * planes are emitted only on INNER cells (coordinate 1..30 on every axis): section-boundary cells
+   * need the cross-section neighbour decision that Stage 2b-2 adds, and inner cells also guarantee
+   * that every neighbour index is in range. Runs after the face passes so its quads still count
+   * into quadCount/AABB before occupancy and BuiltSection finalization.
+   */
+  private void generateRootPlaneGeometry(long[] rawSectionData) {
+    if (!this.modelMan.isRootMultiplaneEnabled()
+        || this.rootBlockCount == 0
+        || !CHECK_NEIGHBOR_FACE_OCCLUSION) {
+      return;
+    }
+    for (int i = 0; i < this.rootBlockCount; i++) {
+      int idx = this.rootBlockIndices[i];
+      int[] planes = this.rootCellPlanes[idx];
+      if (planes == null || planes.length < 2) {
+        continue;
+      }
+      int x = idx & 31;
+      int z = (idx >> 5) & 31;
+      int y = idx >> 10;
+      if (x == 0 || x == 31 || y == 0 || y == 31 || z == 0 || z == 31) {
+        this.rootPlaneBoundarySkipped++;
+        continue;
+      }
+      long selfQuad = this.sectionData[idx * 2];
+      long selfMeta = this.sectionData[idx * 2 + 1];
+      // Planes outer, faces inner: model metadata is fetched once per plane and reused for all six
+      // face tests.
+      for (int p = 1; p < planes.length; p++) {
+        // Identical depth bands dedupe to the same model id; emitting a coplanar duplicate would
+        // only double overdraw, so skip consecutive repeats.
+        if (p > 1 && planes[p] == planes[p - 1]) {
+          continue;
+        }
+        long pmeta = this.modelMan.getModelMetadataFromClientId(planes[p]);
+        for (int face = 0; face < 6; face++) {
+          int nIdx =
+              switch (face) {
+                case 0 -> idx - 1024; // DOWN
+                case 1 -> idx + 1024; // UP
+                case 2 -> idx - 32; // NORTH
+                case 3 -> idx + 32; // SOUTH
+                case 4 -> idx - 1; // WEST
+                default -> idx + 1; // EAST
+              };
+          long neighborQuad = this.sectionData[nIdx * 2];
+          if (!shouldMeshNonOpaqueBlockFace(
+              face, selfQuad, selfMeta, neighborQuad, this.sectionData[nIdx * 2 + 1])) {
+            continue;
+          }
+          if (!ModelQueries.faceExists(pmeta, face)) {
+            continue;
+          }
+          // Same bucket emitQuad derives; type 2 is the six directional face buffers.
+          int type = ((int) (getQuadTyping(pmeta) >> 1)) & 3;
+          int bucket = type + (type == 2 ? face : 0);
+          if (this.quadCounters[bucket] + 1 >= (1 << 16)) {
+            if (ROOT_PLANE_CAPACITY_LOG.compareAndSet(false, true)) {
+              Logger.warn(
+                  "Dynamic Trees root plane quads dropped: geometry bucket "
+                      + bucket
+                      + " is at capacity ("
+                      + (1 << 16)
+                      + " quads)");
+            }
+            continue;
+          }
+          long planeQuad = packPartialQuadData(planes[p], rawSectionData[idx], pmeta);
+          // Mirrors meshNonOpaqueFace: recessed planes use their own light only when the face
+          // self-lights, otherwise the neighbour's light.
+          long lighter = ModelQueries.faceUsesSelfLighting(pmeta, face) ? planeQuad : neighborQuad;
+          long data = (planeQuad & ~LM) | (lighter & LM) | (face & 1);
+          this.emitRootPlaneQuad(face, x, y, z, data);
+          this.rootPlaneQuadCount++;
+        }
+      }
+    }
+    if ((this.rootPlaneQuadCount != 0 || this.rootPlaneBoundarySkipped != 0)
+        && ROOT_PLANE_DIAG_LOG.compareAndSet(false, true)) {
+      Logger.info(
+          "DT root multi-plane mesher: extraQuads="
+              + this.rootPlaneQuadCount
+              + " boundaryCellsSkipped="
+              + this.rootPlaneBoundarySkipped);
+    }
+  }
+
+  /**
+   * Emits one isolated quad through the scratch mesher using the same swizzle as the scanline
+   * loops: axis 0 (Y) takes (x,z), axis 1 (Z) takes (x,y), axis 2 (X) takes (z,y). emitQuad writes
+   * the owning block's coordinate as the auxiliary position, so the face offset is enabled only
+   * for positive faces (side 1), matching the {@code face & 1} bit the mesh loops putNext.
+   */
+  private void emitRootPlaneQuad(int face, int x, int y, int z, long data) {
+    int axis = face >> 1;
+    int side = face & 1;
+    this.rootPlaneMesher.axis = axis;
+    this.rootPlaneMesher.doAuxiliaryFaceOffset = side == 1;
+    if (axis == 0) {
+      this.rootPlaneMesher.auxiliaryPosition = y;
+      this.rootPlaneMesher.emitQuad(x, z, 1, 1, data);
+    } else if (axis == 1) {
+      this.rootPlaneMesher.auxiliaryPosition = z;
+      this.rootPlaneMesher.emitQuad(x, y, 1, 1, data);
+    } else {
+      this.rootPlaneMesher.auxiliaryPosition = x;
+      this.rootPlaneMesher.emitQuad(z, y, 1, 1, data);
+    }
+  }
+
   // Build the occupancy set (used for AO) from the set of fully opaque blocks (atm, this can change
   // in the future if needed to a special occupancy bitset)
   private final void buildOccupancy() {
@@ -2666,11 +2803,17 @@ public class RenderDataFactory {
     Arrays.fill(this.fluidMasks, 0);
     this.variantBlockCount = 0;
     this.shellBlockCount = 0;
+    // Drop references to the previous mesh's plane arrays before rootBlockIndices is reused.
+    for (int i = 0; i < this.rootBlockCount; i++) {
+      this.rootCellPlanes[this.rootBlockIndices[i]] = null;
+    }
     this.rootBlockCount = 0;
     this.overlayRoots.clear();
     this.rootPatchedCount = 0;
     this.rootUnavailableCount = 0;
     this.rootMaskRejectedCount = 0;
+    this.rootPlaneQuadCount = 0;
+    this.rootPlaneBoundarySkipped = 0;
     this.shellPatchedCount = 0;
     this.shellUnavailableCount = 0;
 
@@ -2733,6 +2876,7 @@ public class RenderDataFactory {
       }
       this.generateYZFaces();
       this.generateXFaces();
+      this.generateRootPlaneGeometry(section._unsafeGetRawDataArray());
     } catch (IdNotYetComputedException e) {
       e.auxBitMsk = neighborMsk;
       e.auxData = this.neighboringFaces;

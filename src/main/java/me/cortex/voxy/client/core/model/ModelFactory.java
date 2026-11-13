@@ -1333,9 +1333,11 @@ public class ModelFactory {
       return;
     }
     int base = publish.planeIds[0];
-    this.rootVariantModelIds.put(publish.rootKey, base);
+    // The variant id is the publish barrier: all plane registry writes must happen first, so a
+    // meshing thread that observes the variant id also observes the plane list.
     this.rootBaseModelIds.put(publish.rootKey, base);
     this.rootPlaneModelIds.put(base, publish.planeIds);
+    this.rootVariantModelIds.put(publish.rootKey, base);
     this.rootVariantSuccessCount.incrementAndGet();
     this.variantSuccessCount.incrementAndGet();
     if (this.rootMultiplaneLogged.compareAndSet(false, true)) {
