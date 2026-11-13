@@ -75,6 +75,11 @@ public class RenderDataFactory {
   // rootBlockIndices). Only populated when the multi-plane flag is on; cleared at the start of
   // every mesh so entries never leak between sections.
   private final int[][] rootCellPlanes = new int[32 * 32 * 32][];
+  // Trunk-facing root sides per patched root cell. Mirrors
+  // CompositeRootShellBakedModel.hiddenRootSides for the extra plane model ids, which the composite
+  // does not filter: their quads would protrude through / leave a gap at the thick-trunk shell
+  // wall. 6-bit per face: bit0 DOWN, bit1 UP, bit2 NORTH, bit3 SOUTH, bit4 WEST, bit5 EAST.
+  private final int[] rootCellHiddenSides = new int[32 * 32 * 32];
   // True-geometry overlay: exact root cells captured for the vanilla render pass.
   private final java.util.List<DTRootGeometryCache.RootBlock> overlayRoots =
       new java.util.ArrayList<>();
@@ -86,6 +91,7 @@ public class RenderDataFactory {
   private int rootMaskRejectedCount = 0;
   private int rootPlaneQuadCount = 0;
   private int rootPlaneBoundarySkipped = 0;
+  private int rootPlaneHiddenSkipped = 0;
   private int shellPatchedCount = 0;
   private int shellUnavailableCount = 0;
   // Branch cells whose section masks were patched to match a neighbour-aware variant (one-shot
@@ -1031,6 +1037,23 @@ public class RenderDataFactory {
         if (planes.length > 1) {
           this.rootCellPlanes[idx] = planes;
         }
+        // Mirrors ModelFactory.buildRootExactModel's hiddenRootSides: the extra plane ids are not
+        // filtered by the composite root model, so record which sides face an adjacent thick trunk
+        // core and skip their plane quads later.
+        int hiddenMask = 0;
+        if (coreBlockId != 0) {
+          if (coreDx > 0) {
+            hiddenMask |= 1 << 5; // EAST
+          } else if (coreDx < 0) {
+            hiddenMask |= 1 << 4; // WEST
+          }
+          if (coreDz > 0) {
+            hiddenMask |= 1 << 3; // SOUTH
+          } else if (coreDz < 0) {
+            hiddenMask |= 1 << 2; // NORTH
+          }
+        }
+        this.rootCellHiddenSides[idx] = hiddenMask;
       }
       this.rootPatchedCount++;
     }
@@ -2739,6 +2762,12 @@ public class RenderDataFactory {
         }
         long pmeta = this.modelMan.getModelMetadataFromClientId(planes[p]);
         for (int face = 0; face < 6; face++) {
+          // Trunk-facing sides are hidden inside the composite root model (plane 0); the extra
+          // plane ids have no such filtering, so skip them here as well.
+          if ((this.rootCellHiddenSides[idx] & (1 << face)) != 0) {
+            this.rootPlaneHiddenSkipped++;
+            continue;
+          }
           int nIdx =
               switch (face) {
                 case 0 -> idx - 1024; // DOWN
@@ -2780,13 +2809,17 @@ public class RenderDataFactory {
         }
       }
     }
-    if ((this.rootPlaneQuadCount != 0 || this.rootPlaneBoundarySkipped != 0)
+    if ((this.rootPlaneQuadCount != 0
+            || this.rootPlaneBoundarySkipped != 0
+            || this.rootPlaneHiddenSkipped != 0)
         && ROOT_PLANE_DIAG_LOG.compareAndSet(false, true)) {
       Logger.info(
           "DT root multi-plane mesher: extraQuads="
               + this.rootPlaneQuadCount
               + " boundaryCellsSkipped="
-              + this.rootPlaneBoundarySkipped);
+              + this.rootPlaneBoundarySkipped
+              + " hiddenFacesSkipped="
+              + this.rootPlaneHiddenSkipped);
     }
   }
 
@@ -2888,7 +2921,9 @@ public class RenderDataFactory {
     this.shellBlockCount = 0;
     // Drop references to the previous mesh's plane arrays before rootBlockIndices is reused.
     for (int i = 0; i < this.rootBlockCount; i++) {
-      this.rootCellPlanes[this.rootBlockIndices[i]] = null;
+      int rootIdx = this.rootBlockIndices[i];
+      this.rootCellPlanes[rootIdx] = null;
+      this.rootCellHiddenSides[rootIdx] = 0;
     }
     this.rootBlockCount = 0;
     this.overlayRoots.clear();
@@ -2897,6 +2932,7 @@ public class RenderDataFactory {
     this.rootMaskRejectedCount = 0;
     this.rootPlaneQuadCount = 0;
     this.rootPlaneBoundarySkipped = 0;
+    this.rootPlaneHiddenSkipped = 0;
     this.shellPatchedCount = 0;
     this.shellUnavailableCount = 0;
     this.branchMaskPatchedCount = 0;

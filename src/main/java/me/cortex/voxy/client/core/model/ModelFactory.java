@@ -662,18 +662,34 @@ public class ModelFactory {
   /**
    * Boundary-cap side mask for a branch variant bake. Bit {@code i} ({@code i =}
    * {@link Direction#get3DDataValue()}, matching the {@code neighbours} array order) is set when
-   * that neighbour resolves to a connected Dynamic Trees branch ({@code BranchBlock} subclasses,
-   * roots included), so the quad on that boundary plane is an internal face Voxy would drag into a
-   * visible fin. Air and unrelated blocks keep their caps, so exposed trunk tops and sides stay
-   * closed. A substituted UP/DOWN self id (LOD-level seam continuation) resolves to the branch
-   * state, so those seams drop their caps as internal continuations too.
+   * that neighbour resolves to a connected Dynamic Trees branch that actually covers the boundary
+   * plane, so the quad on that boundary plane is an internal face Voxy would drag into a visible
+   * fin. Air and unrelated blocks keep their caps, so exposed trunk tops and sides stay closed. A
+   * substituted UP/DOWN self id (LOD-level seam continuation) resolves to the branch state, so
+   * those seams drop their caps as internal continuations too.
+   *
+   * <p>Only real branches ({@link DynamicTreesBranches#isBranch}, roots excluded) whose radius is
+   * at least the self radius may drop a cap: roots and thinner neighbours don't reliably cover the
+   * boundary plane, and dropping the cap there would leave an open end, so the cap is kept.
    */
-  private static int computeDropCapSidesMask(BlockState[] neighbours) {
+  private static int computeDropCapSidesMask(BlockState self, BlockState[] neighbours) {
+    int selfRadius = DynamicTreesBranches.radiusOf(self);
+    if (selfRadius < 0) {
+      // No radius property: the neighbour coverage cannot be proven, keep every cap.
+      return 0;
+    }
+    int requiredRadius = Math.max(1, selfRadius);
     int mask = 0;
     for (int i = 0; i < 6; i++) {
-      if (DynamicTreesBranches.isBranchLike(neighbours[i])) {
-        mask |= 1 << i;
+      BlockState neighbour = neighbours[i];
+      if (!DynamicTreesBranches.isBranch(neighbour)) {
+        continue;
       }
+      int neighbourRadius = DynamicTreesBranches.radiusOf(neighbour);
+      if (neighbourRadius < 0 || neighbourRadius < requiredRadius) {
+        continue;
+      }
+      mask |= 1 << i;
     }
     return mask;
   }
@@ -682,7 +698,8 @@ public class ModelFactory {
     try {
       BlockState state = this.mapper.getBlockStateFromBlockId(key.blockId());
       BlockState[] neighbours = this.resolveVariantNeighbours(key);
-      int dropCapSidesMask = DROP_BRANCH_BOUNDARY_CAPS ? computeDropCapSidesMask(neighbours) : 0;
+      int dropCapSidesMask =
+          DROP_BRANCH_BOUNDARY_CAPS ? computeDropCapSidesMask(state, neighbours) : 0;
       BakedModel branchModel = null;
       if (DROP_BRANCH_BOUNDARY_CAPS) {
         try {
@@ -752,7 +769,8 @@ public class ModelFactory {
     try {
       BlockState state = this.mapper.getBlockStateFromBlockId(key.blockId());
       BlockState[] neighbours = this.resolveVariantNeighbours(key);
-      int dropCapSidesMask = DROP_BRANCH_BOUNDARY_CAPS ? computeDropCapSidesMask(neighbours) : 0;
+      int dropCapSidesMask =
+          DROP_BRANCH_BOUNDARY_CAPS ? computeDropCapSidesMask(state, neighbours) : 0;
       BakedModel branchModel = null;
       if (DROP_BRANCH_BOUNDARY_CAPS) {
         try {
