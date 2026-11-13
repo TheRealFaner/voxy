@@ -295,6 +295,7 @@ public class ModelFactory {
   private final AtomicInteger rootVariantActive = new AtomicInteger();
   private static final int MAX_ROOT_VARIANT_MODEL_COUNT = 1 << 14;
   private final AtomicBoolean rootVariantCapLogged = new AtomicBoolean();
+  private final AtomicBoolean rootMultiplaneCapLogged = new AtomicBoolean();
   private final AtomicBoolean rootVariantActiveLogged = new AtomicBoolean();
   private static final AtomicBoolean ROOT_FACE_DIAG = new AtomicBoolean();
   // Stage 2a multi-plane root diagnostics: number of bakes that took the band branch and the
@@ -2549,6 +2550,21 @@ public class ModelFactory {
   }
 
   /**
+   * Root variant key limit. With multi-plane roots each key may consume up to {@link
+   * #DT_ROOT_MAX_PLANES} model ids, so cap roots by the id budget left after the branch variant
+   * reserve and the base model reserve. Flag-off this is exactly {@link
+   * #MAX_ROOT_VARIANT_MODEL_COUNT}, so behaviour is unchanged without multi-plane.
+   */
+  private static int rootVariantLimit() {
+    if (!DT_ROOT_MULTIPLANE) {
+      return MAX_ROOT_VARIANT_MODEL_COUNT;
+    }
+    int branchReserve = MAX_VARIANT_MODEL_COUNT; // keep the branch budget intact
+    int available = MAX_MODEL_ID_COUNT - BASE_MODEL_ID_RESERVE - branchReserve;
+    return Math.min(MAX_ROOT_VARIANT_MODEL_COUNT, Math.max(1, available / DT_ROOT_MAX_PLANES));
+  }
+
+  /**
    * Looks up the synthetic crown model id for a surface root. {@code flags} bit 0..3 = connected to
    * north/east/south/west. Returns {@link #VARIANT_MODEL_NOT_READY} while queued, {@link
    * #VARIANT_MODEL_UNAVAILABLE} when the base model must be used.
@@ -2580,11 +2596,33 @@ public class ModelFactory {
         || this.modelIdCount.get() + requiredIds > MAX_MODEL_ID_COUNT - BASE_MODEL_ID_RESERVE) {
       return VARIANT_MODEL_UNAVAILABLE;
     }
-    if (this.rootVariantActive.get() >= MAX_ROOT_VARIANT_MODEL_COUNT) {
-      if (this.rootVariantCapLogged.compareAndSet(false, true)) {
+    int rootLimit = rootVariantLimit();
+    if (this.rootVariantActive.get() >= rootLimit) {
+      if (DT_ROOT_MULTIPLANE) {
+        if (this.rootMultiplaneCapLogged.compareAndSet(false, true)) {
+          Logger.warn(
+              "Dynamic Trees multi-plane surface-root variants capped at "
+                  + rootLimit
+                  + " distinct contexts by the id budget (roots up to "
+                  + (rootLimit * DT_ROOT_MAX_PLANES)
+                  + " ids + branch reserve "
+                  + MAX_VARIANT_MODEL_COUNT
+                  + " + base reserve "
+                  + BASE_MODEL_ID_RESERVE
+                  + " = "
+                  + (rootLimit * DT_ROOT_MAX_PLANES
+                      + MAX_VARIANT_MODEL_COUNT
+                      + BASE_MODEL_ID_RESERVE)
+                  + " of "
+                  + MAX_MODEL_ID_COUNT
+                  + "), modelIdCount="
+                  + this.modelIdCount.get()
+                  + "; further roots keep the base model");
+        }
+      } else if (this.rootVariantCapLogged.compareAndSet(false, true)) {
         Logger.warn(
             "Dynamic Trees surface-root variants capped at "
-                + MAX_ROOT_VARIANT_MODEL_COUNT
+                + rootLimit
                 + " distinct contexts; further roots keep the base model");
       }
       return VARIANT_MODEL_UNAVAILABLE;
