@@ -211,6 +211,76 @@ public class TextureUtils {
     return bands;
   }
 
+  /**
+   * Splits baked faces into depth-band plane sets for the multi-plane root impostor. Returns
+   * {planeCount x 6} faces; plane k keeps, per face, only pixels whose 24-bit depth is in
+   * [bands[f][k], bands[f][k+1]) (last band: &gt;=). Other pixels get alpha 0. Depth channels are
+   * shared with the source (read-only after bake); colour alpha is the absolute depth already
+   * written by encodeRootPixelDepth. Empty input -&gt; empty array.
+   */
+  public static ColourDepthTextureData[][] splitDepthBandPlanes(
+      ColourDepthTextureData[] faces, int checkMode, int maxBands) {
+    if (faces.length == 0) {
+      return new ColourDepthTextureData[0][];
+    }
+    final int[][] bandsPerFace = new int[faces.length][];
+    int planeCount = 0;
+    for (int f = 0; f < faces.length; f++) {
+      bandsPerFace[f] = computeDepthBands(faces[f], checkMode, maxBands);
+      planeCount = Math.max(planeCount, bandsPerFace[f].length);
+    }
+    if (planeCount == 0) {
+      return new ColourDepthTextureData[0][];
+    }
+    final ColourDepthTextureData[][] planes =
+        new ColourDepthTextureData[planeCount][faces.length];
+    for (int f = 0; f < faces.length; f++) {
+      final ColourDepthTextureData src = faces[f];
+      final int[] bands = bandsPerFace[f];
+      final int[] srcColour = src.colour();
+      // TODO(Stage 3): the depth/stencil channels are shared with the full source face, so every
+      // plane's face metadata still derives its MIN/bounds from that full face. Emission must not
+      // treat the flat face offset as the band minimum; if per-plane metadata precision matters,
+      // give each plane its own depth/stencil copy instead of sharing this array.
+      final int[] depth = src.depth(); // Read-only after bake; shared by every plane.
+      // Faces with fewer bands than the global plane count reuse one all-transparent copy.
+      ColourDepthTextureData empty = null;
+      for (int k = 0; k < planeCount; k++) {
+        if (k >= bands.length) {
+          if (empty == null) {
+            int[] colour = new int[srcColour.length];
+            for (int i = 0; i < colour.length; i++) {
+              colour[i] = srcColour[i] & 0x00FFFFFF;
+            }
+            empty = new ColourDepthTextureData(colour, depth, src.width(), src.height());
+          }
+          planes[k][f] = empty;
+          continue;
+        }
+        final int low = bands[k];
+        final boolean lastBand = k == bands.length - 1;
+        final int high = lastBand ? 0 : bands[k + 1];
+        int[] colour = new int[srcColour.length];
+        for (int i = 0; i < colour.length; i++) {
+          if (!wasPixelWritten(src, checkMode, i)) {
+            colour[i] = srcColour[i] & 0x00FFFFFF;
+            continue;
+          }
+          int d24 = depth[i] >>> 8;
+          if (d24 >= low && (lastBand || d24 < high)) {
+            colour[i] = srcColour[i];
+          } else {
+            // Keep rgb, drop alpha: non-band pixels must not render. Alpha is the absolute depth
+            // written by encodeRootPixelDepth (do not make it band-relative).
+            colour[i] = srcColour[i] & 0x00FFFFFF;
+          }
+        }
+        planes[k][f] = new ColourDepthTextureData(colour, depth, src.width(), src.height());
+      }
+    }
+    return planes;
+  }
+
   private static float u2fdepth(int depth, boolean halfDepthRange) {
     float depthF = (float) ((double) depth / ((1 << 24) - 1));
     // https://registry.khronos.org/OpenGL-Refpages/gl4/html/glDepthRange.xhtml
