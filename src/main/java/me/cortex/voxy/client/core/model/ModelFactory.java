@@ -253,7 +253,8 @@ public class ModelFactory {
 
   // Async-sink (gl41metal) publications are held until MaterialStore.drainUploads wrote the atlas
   // tiles; publishing earlier lets sections mesh against unwritten slots (black/white cells).
-  private final ConcurrentLinkedDeque<ModelPublishUpload> pendingSinkVariantPublishes =
+  // Holds ModelPublishUpload entries and multi-plane RootPlanePublish owners.
+  private final ConcurrentLinkedDeque<ResultUploader> pendingSinkVariantPublishes =
       new ConcurrentLinkedDeque<>();
 
   private volatile boolean variantsCapped = false;
@@ -296,6 +297,11 @@ public class ModelFactory {
   private final AtomicBoolean rootVariantCapLogged = new AtomicBoolean();
   private final AtomicBoolean rootVariantActiveLogged = new AtomicBoolean();
   private static final AtomicBoolean ROOT_FACE_DIAG = new AtomicBoolean();
+  // Stage 2a multi-plane root diagnostics: number of bakes that took the band branch and the
+  // total planes they produced. Flag-gated: stays at 0 when DT_ROOT_MULTIPLANE is off.
+  private final AtomicInteger rootMultiplaneBakes = new AtomicInteger();
+  private final AtomicInteger rootMultiplanePlanes = new AtomicInteger();
+  private final AtomicBoolean rootMultiplaneLogged = new AtomicBoolean();
 
   /**
    * gl46 only: encode the per-pixel indentation of root faces into the model-texture alpha and flag
@@ -707,6 +713,8 @@ public class ModelFactory {
               FALLBACK_NONE,
               key,
               null,
+              null,
+              null,
               null);
       if (upload != null) {
         this.uploadResults.add(upload);
@@ -776,6 +784,8 @@ public class ModelFactory {
               result.fallbackReason(),
               key,
               null,
+              null,
+              null,
               null);
       if (upload != null) {
         this.uploadResults.add(upload);
@@ -819,6 +829,21 @@ public class ModelFactory {
       if (PER_PIXEL_ROOT_DEPTH && layer != RenderType.translucent()) {
         TextureUtils.encodeRootPixelDepth(textureData, checkMode);
       }
+      // Stage 2a: one plane per depth band. Depth is unaffected by the alpha encoding, so the
+      // bands can be computed after it; maxBands also feeds the diagnostic log.
+      int[] bandsPerFace = new int[textureData.length];
+      int maxBands = 1;
+      for (int f = 0; f < textureData.length; f++) {
+        bandsPerFace[f] =
+            TextureUtils.computeDepthBands(textureData[f], checkMode, DT_ROOT_MAX_PLANES).length;
+        maxBands = Math.max(maxBands, bandsPerFace[f]);
+      }
+      boolean multiplane =
+          DT_ROOT_MULTIPLANE
+              && this.gl41OffscreenBakery == null
+              && PER_PIXEL_ROOT_DEPTH
+              && layer != RenderType.translucent()
+              && maxBands >= 2;
       if (ROOT_FACE_DIAG.compareAndSet(false, true)) {
         StringBuilder sb = new StringBuilder("DT root variant face pixels");
         for (int f = 0; f < textureData.length; f++) {
@@ -827,6 +852,9 @@ public class ModelFactory {
               .append('=')
               .append(TextureUtils.getWrittenPixelCount(textureData[f], checkMode));
         }
+        sb.append(" bands=").append(java.util.Arrays.toString(bandsPerFace));
+        sb.append(" planes=").append(maxBands);
+        sb.append(" multiplane=").append(multiplane);
         Logger.info(sb.append(" key=").append(key).toString());
       }
       int writtenPixels = 0;
@@ -837,6 +865,48 @@ public class ModelFactory {
         this.variantNoPixelCount.incrementAndGet();
         this.failRootVariant(key, "surface root variant bake produced no pixels");
         return;
+      }
+      if (multiplane) {
+        var planes =
+            TextureUtils.splitDepthBandPlanes(textureData, checkMode, DT_ROOT_MAX_PLANES);
+        if (planes.length >= 2) {
+          this.rootMultiplaneBakes.incrementAndGet();
+          RootPlanePublish pending = new RootPlanePublish(key, new int[planes.length]);
+          RootPlaneBakeContext ctx = new RootPlaneBakeContext(key);
+          for (int p = 0; p < planes.length; p++) {
+            var upload =
+                this.processTextureBakeResult(
+                    key.blockId(),
+                    state,
+                    planes[p],
+                    (flags & 1) != 0,
+                    (flags & 2) != 0,
+                    layer,
+                    FALLBACK_NONE,
+                    null,
+                    null,
+                    key,
+                    ctx,
+                    pending);
+            if (ctx.failed) {
+              this.failRootVariant(key, ctx.failure);
+              return;
+            }
+            if (upload != null) {
+              this.uploadResults.add(upload);
+            }
+          }
+          if (ctx.planeCount != planes.length) {
+            this.failRootVariant(key, "surface root plane bake produced an incomplete plane set");
+            return;
+          }
+          System.arraycopy(ctx.planeIds, 0, pending.planeIds, 0, ctx.planeCount);
+          // Queued after every plane upload: processUploads publishes the whole set atomically,
+          // and only after the FIFO drained all of its planes.
+          this.uploadResults.add(pending);
+          this.rootMultiplanePlanes.addAndGet(planes.length);
+          return;
+        }
       }
       var upload =
           this.processTextureBakeResult(
@@ -849,7 +919,9 @@ public class ModelFactory {
               FALLBACK_NONE,
               null,
               null,
-              key);
+              key,
+              null,
+              null);
       if (upload != null) {
         this.uploadResults.add(upload);
       }
@@ -885,6 +957,8 @@ public class ModelFactory {
         return;
       }
       RenderType layer = PlantRenderLayerResolver.resolve(state);
+      // TODO(Stage 3): add the depth-band plane split for the GL41 offscreen bakery. Stage 2a
+      // keeps the GL41 root path single-plane; only the software (gl46) bakery emits planes.
       int checkMode =
           layer == RenderType.solid()
               ? TextureUtils.WRITE_CHECK_STENCIL
@@ -919,7 +993,9 @@ public class ModelFactory {
               result.fallbackReason(),
               null,
               null,
-              key);
+              key,
+              null,
+              null);
       if (upload != null) {
         this.uploadResults.add(upload);
       }
@@ -1129,7 +1205,7 @@ public class ModelFactory {
   }
 
   public void processUploads() {
-    List<ModelPublishUpload> readyPublishes = new ArrayList<>();
+    List<ResultUploader> readyPublishes = new ArrayList<>();
     var upload = this.uploadResults.poll();
     if (upload != null) {
       if (this.storage != null) {
@@ -1149,6 +1225,11 @@ public class ModelFactory {
           // The bake already inserted its ModelEntry->id mapping, so a retry would dedupe to an
           // entry whose upload never happened. Fail terminal instead.
           if (upload instanceof ModelBakeResultUpload result) {
+            if (result.owner != null) {
+              // A multi-plane root plane failed to upload: never publish a partial plane set. The
+              // owner publication is still queued behind the planes and fails the whole key.
+              result.owner.uploadFailed = true;
+            }
             if (result.variantKey != null) {
               this.failVariant(result.variantKey, t);
             } else if (result.shellModelKey != null) {
@@ -1165,19 +1246,26 @@ public class ModelFactory {
           continue;
         }
         if (upload instanceof ModelBakeResultUpload result) {
-          if (result.variantKey != null) {
-            readyPublishes.add(
-                new ModelPublishUpload(
-                    result.variantKey, null, null, result.variantModelId, false));
-          } else if (result.shellModelKey != null) {
-            readyPublishes.add(
-                new ModelPublishUpload(
-                    null, result.shellModelKey, null, result.shellModelId, false));
-          } else if (result.rootVariantKey != null) {
-            readyPublishes.add(
-                new ModelPublishUpload(
-                    null, null, result.rootVariantKey, result.rootVariantModelId, false));
+          // Plane bakes carry an owner instead of a per-key publication: the owner entry that
+          // follows them in the FIFO queue publishes the whole plane set at once.
+          if (result.owner == null) {
+            if (result.variantKey != null) {
+              readyPublishes.add(
+                  new ModelPublishUpload(
+                      result.variantKey, null, null, result.variantModelId, false));
+            } else if (result.shellModelKey != null) {
+              readyPublishes.add(
+                  new ModelPublishUpload(
+                      null, result.shellModelKey, null, result.shellModelId, false));
+            } else if (result.rootVariantKey != null) {
+              readyPublishes.add(
+                  new ModelPublishUpload(
+                      null, null, result.rootVariantKey, result.rootVariantModelId, false));
+            }
           }
+        } else if (upload instanceof RootPlanePublish publish) {
+          // The owner's plane uploads were drained earlier in this FIFO batch.
+          readyPublishes.add(publish);
         } else if (upload instanceof ModelPublishUpload publish) {
           // The deduplicated model's upload was drained earlier in this FIFO queue.
           readyPublishes.add(publish);
@@ -1194,7 +1282,7 @@ public class ModelFactory {
     if (this.outputSink != null) {
       this.pendingSinkVariantPublishes.addAll(readyPublishes);
     } else {
-      for (ModelPublishUpload publish : readyPublishes) {
+      for (ResultUploader publish : readyPublishes) {
         this.publishModel(publish);
       }
     }
@@ -1202,28 +1290,65 @@ public class ModelFactory {
     this.maybeLogVariantSummary();
   }
 
-  private void publishModel(ModelPublishUpload publish) {
-    if (publish.variantKey != null) {
-      this.variantModelIds.put(publish.variantKey, publish.modelId);
+  private void publishModel(ResultUploader publish) {
+    if (publish instanceof RootPlanePublish rootPlanePublish) {
+      this.publishRootPlanes(rootPlanePublish);
+      return;
+    }
+    if (!(publish instanceof ModelPublishUpload modelPublish)) {
+      return;
+    }
+    if (modelPublish.variantKey != null) {
+      this.variantModelIds.put(modelPublish.variantKey, modelPublish.modelId);
       // A dedupe to an existing (non-air) model still resolves the branch position correctly.
       this.branchVariantSuccessCount.incrementAndGet();
-      if (publish.dedupedToBase) {
+      if (modelPublish.dedupedToBase) {
         this.variantDedupeBaseCount.incrementAndGet();
       } else {
         this.variantSuccessCount.incrementAndGet();
-        this.logVariantActive(publish.variantKey, publish.modelId);
+        this.logVariantActive(modelPublish.variantKey, modelPublish.modelId);
       }
-    } else if (publish.shellKey != null) {
-      this.shellModelIds.put(publish.shellKey, publish.modelId);
-    } else if (publish.rootKey != null) {
-      this.rootVariantModelIds.put(publish.rootKey, publish.modelId);
+    } else if (modelPublish.shellKey != null) {
+      this.shellModelIds.put(modelPublish.shellKey, modelPublish.modelId);
+    } else if (modelPublish.rootKey != null) {
+      this.rootVariantModelIds.put(modelPublish.rootKey, modelPublish.modelId);
       this.rootVariantSuccessCount.incrementAndGet();
       this.variantSuccessCount.incrementAndGet();
       if (DT_ROOT_MULTIPLANE) {
         // Stage 1: exactly one plane per key. Stage 2 will register the per-face band ids here.
-        this.rootBaseModelIds.put(publish.rootKey, publish.modelId);
-        this.rootPlaneModelIds.put(publish.modelId, new int[] {publish.modelId});
+        this.rootBaseModelIds.put(modelPublish.rootKey, modelPublish.modelId);
+        this.rootPlaneModelIds.put(modelPublish.modelId, new int[] {modelPublish.modelId});
       }
+    }
+  }
+
+  /**
+   * Publishes a multi-plane root once every one of its plane uploads drained. The base model id
+   * (and the {@code IdNotYetComputedException} retry resolution) stays {@link
+   * #VARIANT_MODEL_NOT_READY} until this point, so meshing can never observe a partial plane set.
+   */
+  private void publishRootPlanes(RootPlanePublish publish) {
+    if (publish.uploadFailed) {
+      this.failRootVariant(publish.rootKey, "plane upload failed");
+      return;
+    }
+    int base = publish.planeIds[0];
+    this.rootVariantModelIds.put(publish.rootKey, base);
+    this.rootBaseModelIds.put(publish.rootKey, base);
+    this.rootPlaneModelIds.put(base, publish.planeIds);
+    this.rootVariantSuccessCount.incrementAndGet();
+    this.variantSuccessCount.incrementAndGet();
+    if (this.rootMultiplaneLogged.compareAndSet(false, true)) {
+      Logger.info(
+          "Dynamic Trees multi-plane root active, first root "
+              + publish.rootKey
+              + " planes "
+              + java.util.Arrays.toString(publish.planeIds)
+              + " (bakes="
+              + this.rootMultiplaneBakes.get()
+              + ", planes="
+              + this.rootMultiplanePlanes.get()
+              + ")");
     }
   }
 
@@ -1232,7 +1357,7 @@ public class ModelFactory {
     if (this.outputSink == null || this.outputSink.hasPendingUploads()) {
       return;
     }
-    ModelPublishUpload publish;
+    ResultUploader publish;
     while ((publish = this.pendingSinkVariantPublishes.poll()) != null) {
       this.publishModel(publish);
     }
@@ -1275,6 +1400,49 @@ public class ModelFactory {
     void upload(ModelOutputSink sink);
 
     void free();
+  }
+
+  /**
+   * Bake-scope state for the Stage 2a multi-plane root path. One instance spans all plane bakes of
+   * a single root key: {@code planeIds} collects each plane's model id in plane order, while
+   * {@code failed}/{@code failure} abort the whole key (from the bake loop, once) instead of
+   * publishing a partial plane set.
+   */
+  private static final class RootPlaneBakeContext {
+    final RootCrownKey key;
+    final int[] planeIds = new int[DT_ROOT_MAX_PLANES];
+    int planeCount;
+    boolean failed;
+    Object failure;
+
+    RootPlaneBakeContext(RootCrownKey key) {
+      this.key = key;
+    }
+  }
+
+  /**
+   * Publication-only queue entry for a multi-plane root. Each plane bake uploads its own atlas
+   * slot but publishes nothing; this owner is enqueued after every plane, so when it drains the
+   * whole plane set is in the atlas and can be published atomically for the key.
+   */
+  private static final class RootPlanePublish implements ResultUploader {
+    final RootCrownKey rootKey;
+    final int[] planeIds;
+    volatile boolean uploadFailed;
+
+    RootPlanePublish(RootCrownKey rootKey, int[] planeIds) {
+      this.rootKey = rootKey;
+      this.planeIds = planeIds;
+    }
+
+    @Override
+    public void upload(ModelStore store) {}
+
+    @Override
+    public void upload(ModelOutputSink sink) {}
+
+    @Override
+    public void free() {}
   }
 
   /**
@@ -1335,6 +1503,10 @@ public class ModelFactory {
     public int shellModelId = -1;
     public @Nullable RootCrownKey rootVariantKey;
     public int rootVariantModelId = -1;
+    // Multi-plane roots: non-null on every plane upload. Planes never publish themselves; the
+    // RootPlanePublish owner queued after them installs the whole plane set. A failed plane upload
+    // sets owner.uploadFailed so publication fails the key instead of installing a partial set.
+    public @Nullable RootPlanePublish owner;
 
     public void upload(ModelStore store) { // Uploads and resets for reuse
       this.upload(store.modelBuffer, store.modelColourBuffer, store.textures);
@@ -1423,6 +1595,8 @@ public class ModelFactory {
         fallbackReason,
         null,
         null,
+        null,
+        null,
         null);
   }
 
@@ -1448,9 +1622,14 @@ public class ModelFactory {
         fallbackReason,
         variantKey,
         null,
+        null,
+        null,
         null);
   }
 
+  // planeContext is non-null only for Stage 2a multi-plane root plane bakes; owner is the pending
+  // RootPlanePublish those planes belong to (set on the returned upload so processUploads does not
+  // publish an individual plane).
   private ModelBakeResultUpload processTextureBakeResult(
       int blockId,
       BlockState blockState,
@@ -1461,7 +1640,9 @@ public class ModelFactory {
       int fallbackReason,
       @Nullable VariantKey variantKey,
       @Nullable ShellModelKey shellKey,
-      @Nullable RootCrownKey rootKey) {
+      @Nullable RootCrownKey rootKey,
+      @Nullable RootPlaneBakeContext planeContext,
+      @Nullable RootPlanePublish owner) {
     if (variantKey == null && shellKey == null && rootKey == null) {
       if (this.idMappings[blockId] != -1) {
         // This should be impossible to reach as it means that multiple bakes for the same blockId
@@ -1583,7 +1764,20 @@ public class ModelFactory {
         }
         if (rootKey != null) {
           if (possibleDuplicate == 0) {
-            this.failRootVariant(rootKey, "surface root deduplicated to the empty/air model");
+            if (planeContext != null) {
+              // Fail the whole multi-plane key once, from the bake loop.
+              planeContext.failed = true;
+              planeContext.failure = "surface root plane deduplicated to the empty/air model";
+            } else {
+              this.failRootVariant(rootKey, "surface root deduplicated to the empty/air model");
+            }
+            return null;
+          }
+          if (planeContext != null) {
+            // Multi-plane plane: collect the duplicate's model id for the owner publication. Its
+            // atlas upload was drained earlier (FIFO), and the owner is queued after every plane,
+            // so no per-plane marker is needed.
+            planeContext.planeIds[planeContext.planeCount++] = possibleDuplicate;
             return null;
           }
           this.uploadResults.add(
@@ -1609,6 +1803,10 @@ public class ModelFactory {
             this.markVariantUnavailable(variantKey);
           } else if (shellKey != null) {
             this.shellModelIds.put(shellKey, VARIANT_MODEL_UNAVAILABLE);
+          } else if (planeContext != null) {
+            // Fail the multi-plane key once from the bake loop; do not fail it per plane here.
+            planeContext.failed = true;
+            planeContext.failure = "16-bit model id space exhausted";
           } else {
             this.failRootVariant(rootKey, "16-bit model id space exhausted");
           }
@@ -1733,6 +1931,10 @@ public class ModelFactory {
     // Root crowns and thick-trunk shell pieces are synthetic impostors with irregular footprints;
     // their occlusion/discard flags must not be derived from the normal full-block heuristics.
     final boolean synthetic = rootKey != null || shellKey != null;
+    // Stage 2a multi-plane plane bakes (planeContext != null) carry out-of-band pixels as alpha 0
+    // while the shared depth/stencil channel still reports them as written, so the writeCount
+    // heuristic below cannot see them.
+    final boolean planeSlice = planeContext != null && rootKey != null;
 
     // TODO: FIXME faces that have the same "alignment depth" e.g. (sizes[0]+sizes[1])~=1 can be
     // merged into a double faced single quad
@@ -1847,6 +2049,13 @@ public class ModelFactory {
         // with a single unwritten pixel must discard.
         needsAlphaDiscard |= writeCount < MODEL_TEXTURE_SIZE * MODEL_TEXTURE_SIZE;
       }
+      if (planeSlice) {
+        // splitDepthBandPlanes stores every out-of-band pixel as alpha 0 but shares the source
+        // depth/stencil array, so writeCount still equals the full-face count and the heuristic
+        // above can miss planes whose band leaves transparent holes. Discard is mandatory for
+        // every plane face; the single-plane/flag-off path is unaffected (planeSlice == false).
+        needsAlphaDiscard = true;
+      }
       faceModelData |= needsAlphaDiscard ? 1 << 22 : 0;
       anyFaceNeedsDiscard |= needsAlphaDiscard;
 
@@ -1956,8 +2165,15 @@ public class ModelFactory {
       uploadResult.shellModelKey = shellKey;
       uploadResult.shellModelId = modelId;
     } else if (rootKey != null) {
-      uploadResult.rootVariantKey = rootKey;
-      uploadResult.rootVariantModelId = modelId;
+      if (planeContext != null) {
+        // Multi-plane plane: record the plane id in plane order and defer publication to the
+        // owner. rootVariantModelIds stays NOT_READY until the owner is published.
+        planeContext.planeIds[planeContext.planeCount++] = modelId;
+        uploadResult.owner = owner;
+      } else {
+        uploadResult.rootVariantKey = rootKey;
+        uploadResult.rootVariantModelId = modelId;
+      }
     } else {
       this.idMappings[blockId] = modelId;
 
@@ -2374,8 +2590,11 @@ public class ModelFactory {
     if (existing != null) {
       return existing;
     }
+    // A multi-plane root may consume DT_ROOT_MAX_PLANES ids at once, so reserve room for all of
+    // them up front. With the flag off this is exactly the original single-id check.
+    int requiredIds = DT_ROOT_MULTIPLANE ? DT_ROOT_MAX_PLANES : 1;
     if (this.variantsCapped
-        || this.modelIdCount.get() >= MAX_MODEL_ID_COUNT - BASE_MODEL_ID_RESERVE) {
+        || this.modelIdCount.get() + requiredIds > MAX_MODEL_ID_COUNT - BASE_MODEL_ID_RESERVE) {
       return VARIANT_MODEL_UNAVAILABLE;
     }
     if (this.rootVariantActive.get() >= MAX_ROOT_VARIANT_MODEL_COUNT) {
@@ -2416,7 +2635,8 @@ public class ModelFactory {
    */
   public int[] getRootPlaneModelIds(int baseModelId) {
     int[] planes = this.rootPlaneModelIds.get(baseModelId);
-    return planes != null ? planes : new int[] {baseModelId};
+    // Defensive copy: Stage 3 callers must never be able to mutate the registered plane list.
+    return planes != null ? planes.clone() : new int[] {baseModelId};
   }
 
   /** Upper bound on depth bands per root face (1..3), used by later multi-plane stages. */
@@ -2589,6 +2809,8 @@ public class ModelFactory {
                     FALLBACK_NONE,
                     null,
                     key,
+                    null,
+                    null,
                     null);
             if (upload != null) {
               this.uploadResults.add(upload);
