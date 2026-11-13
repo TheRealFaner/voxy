@@ -111,11 +111,13 @@ import me.cortex.voxy.client.core.gl.shader.Shader;
 import me.cortex.voxy.client.core.gl.shader.ShaderLoader;
 import me.cortex.voxy.client.core.gl.shader.ShaderType;
 import me.cortex.voxy.client.core.model.ColourDepthTextureData;
+import me.cortex.voxy.client.core.model.ModelQuadsAccess;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.ItemBlockRenderTypes;
 import net.minecraft.client.renderer.RenderType;
 import net.minecraft.client.renderer.block.model.BakedQuad;
 import net.minecraft.client.renderer.texture.TextureAtlas;
+import net.minecraft.client.resources.model.BakedModel;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.util.RandomSource;
@@ -263,6 +265,46 @@ public final class Gl41OffscreenModelTextureBakery implements AutoCloseable {
   }
 
   public Result bake(BlockState state) {
+    return this.bake(state, null);
+  }
+
+  /**
+   * @param neighbours optional six neighbour states in Direction.get3DDataValue order, used for
+   *     per-position Dynamic Trees branch ModelData; null keeps the normal single-state bake
+   */
+  public Result bake(BlockState state, @Nullable BlockState[] neighbours) {
+    return this.bake(state, neighbours, null);
+  }
+
+  /**
+   * @param modelOverride optional synthetic model baked instead of the block's registered model
+   *     (Dynamic Trees thick branches use a full bark cube because their real 3x3x1-cell model
+   *     cannot be captured by a per-cell bake)
+   */
+  public Result bake(
+      BlockState state, @Nullable BlockState[] neighbours, @Nullable BakedModel modelOverride) {
+    return this.bake(state, neighbours, modelOverride, null);
+  }
+
+  /**
+   * Bakes a model that reads a full 3x3x3 neighbourhood (Dynamic Trees surface roots).
+   *
+   * @param cube 27 block states indexed {@code (dx+1) + 3*(dy+1) + 9*(dz+1)}
+   */
+  public Result bakeCube(BlockState state, BlockState[] cube) {
+    return this.bake(state, null, null, cube);
+  }
+
+  /** Cube-context bake with a synthetic composite model (root + thick-trunk prism piece). */
+  public Result bakeCube(BlockState state, BlockState[] cube, @Nullable BakedModel modelOverride) {
+    return this.bake(state, null, modelOverride, cube);
+  }
+
+  private Result bake(
+      BlockState state,
+      @Nullable BlockState[] neighbours,
+      @Nullable BakedModel modelOverride,
+      @Nullable BlockState[] cube) {
     ColourDepthTextureData[] emptyFaces = emptyFaces();
     // Fluids MUST be checked before the INVISIBLE guard: LiquidBlock.getRenderShape() is INVISIBLE
     // (fluids are not drawn through the block-model system), so an INVISIBLE-first check returned
@@ -275,7 +317,7 @@ public final class Gl41OffscreenModelTextureBakery implements AutoCloseable {
       }
       return new Result(emptyFaces, false, false, FALLBACK_FLUID_ONLY);
     }
-    if (state.getRenderShape() == RenderShape.INVISIBLE) {
+    if (modelOverride == null && state.getRenderShape() == RenderShape.INVISIBLE) {
       return new Result(emptyFaces, false, false, FALLBACK_INVISIBLE);
     }
 
@@ -284,7 +326,7 @@ public final class Gl41OffscreenModelTextureBakery implements AutoCloseable {
             ? RenderType.solid()
             : ItemBlockRenderTypes.getChunkRenderType(state);
     this.vertexConsumer.reset();
-    this.collectBlockModelQuads(state, layer);
+    this.collectBlockModelQuads(state, layer, neighbours, modelOverride, cube);
     if (this.vertexConsumer.isEmpty()) {
       return new Result(
           emptyFaces,
@@ -301,10 +343,18 @@ public final class Gl41OffscreenModelTextureBakery implements AutoCloseable {
         FALLBACK_NONE);
   }
 
-  private void collectBlockModelQuads(BlockState state, RenderType layer) {
+  private void collectBlockModelQuads(
+      BlockState state,
+      RenderType layer,
+      @Nullable BlockState[] neighbours,
+      @Nullable BakedModel modelOverride,
+      @Nullable BlockState[] cube) {
     int meta = ModelTextureBakery.getMetaFromLayer(layer);
     var model =
-        Minecraft.getInstance().getModelManager().getBlockModelShaper().getBlockModel(state);
+        modelOverride != null
+            ? modelOverride
+            : Minecraft.getInstance().getModelManager().getBlockModelShaper().getBlockModel(state);
+    var modelQuads = ModelQuadsAccess.get();
 
     RandomSource random = new SingleThreadedRandomSource(42L);
     for (Direction direction :
@@ -317,7 +367,11 @@ public final class Gl41OffscreenModelTextureBakery implements AutoCloseable {
           Direction.EAST,
           null
         }) {
-      for (BakedQuad quad : model.getQuads(state, direction, random)) {
+      var quads =
+          cube != null
+              ? modelQuads.getQuadsCube(model, state, direction, random, cube)
+              : modelQuads.getQuads(model, state, direction, random, neighbours);
+      for (BakedQuad quad : quads) {
         this.vertexConsumer.quad(quad, meta | (quad.isTinted() ? 4 : 0));
       }
     }

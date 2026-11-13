@@ -32,6 +32,8 @@ struct QuadData {
     vec3 basePoint;
     vec2 quadSizeAddin;
     vec2 uvCorner;
+    uint face;
+    float baseIndent;
 };
 
 uint makeQuadFlags(uint faceData, uint modelId, ivec2 quadSize, const in BlockModel model, uint face) {
@@ -51,6 +53,7 @@ uint makeQuadFlags(uint faceData, uint modelId, ivec2 quadSize, const in BlockMo
 
     flags |= faceTintState(faceData)<<2;
     flags |= face<<4;//Face
+    flags |= faceHasPerPixelDepth(faceData)<<7;//bit7: per-pixel model-texture depth
 
     return flags;
 }
@@ -89,10 +92,11 @@ uvec3 makeRemainingAttributes(const in BlockModel model, const in Quad quad, uin
 
     vec4 tinting = getLighting(lighting);
 
-    uint conditionalTinting = 0;
-    if (tintColour != uint(-1)) {
-        conditionalTinting = tintColour;
-    }
+    //-1 means "no tint", which must multiply as white, not as zero. Mapping it to 0 here renders anything
+    // that reaches the tint path with an unresolved tint as solid black (e.g. a biome LUT slot that could
+    // not be resolved, or a colour provider that returned -1). 0xFFFFFFFF unpacks to white, so this is an
+    // identity multiply and the block keeps its texture colour.
+    uint conditionalTinting = tintColour;
 
     uint addin = 0;
     if (!isTranslucent) {
@@ -121,6 +125,7 @@ void setupQuad(out QuadData quad, const in Quad rawQuad, uvec2 sPos, bool genera
     ivec3 baseSection = (getLoDPosition(sPos)<<lodLevel) - baseSectionPos;
 
     uint face = extractFace(rawQuad);
+    quad.face = face;
     uint modelId = extractStateId(rawQuad);
     BlockModel model = modelData[modelId];
     uint faceData = model.faceData[face];
@@ -137,6 +142,7 @@ void setupQuad(out QuadData quad, const in Quad rawQuad, uvec2 sPos, bool genera
     #endif
     vec3 quadStart = extractPos(rawQuad);
     float depthOffset = extractFaceIndentation(faceData);
+    quad.baseIndent = depthOffset;
     quadStart += swizzelDataAxis(face>>1, vec3(faceSize.xz, mix(depthOffset, 1-depthOffset, float(face&1u))));
 
     quad.lodScale = lodScale;

@@ -8,10 +8,12 @@ import com.mojang.blaze3d.vertex.PoseStack;
 import com.mojang.blaze3d.vertex.VertexConsumer;
 import java.util.concurrent.CompletableFuture;
 import me.cortex.voxy.client.core.model.ModelFactory;
+import me.cortex.voxy.client.core.model.ModelQuadsAccess;
 import me.cortex.voxy.common.util.UnsafeUtil;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.ItemBlockRenderTypes;
 import net.minecraft.client.renderer.RenderType;
+import net.minecraft.client.resources.model.BakedModel;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.resources.ResourceLocation;
@@ -83,12 +85,21 @@ public class SoftwareModelTextureBakery {
     this.rasterizer.setSamplerTexture(pixels, width, height);
   }
 
-  private void bakeBlockModel(BlockState state, RenderType layer) {
-    if (state.getRenderShape() == RenderShape.INVISIBLE) {
-      return; // Dont bake if invisible
+  private void bakeBlockModel(
+      BlockState state,
+      RenderType layer,
+      @Nullable BlockState[] neighbours,
+      @Nullable BakedModel modelOverride,
+      @Nullable BlockState[] cube) {
+    if (modelOverride == null && state.getRenderShape() == RenderShape.INVISIBLE) {
+      return; // Dont bake if invisible (a synthetic override is baked regardless)
     }
     var model =
-        Minecraft.getInstance().getModelManager().getBlockModelShaper().getBlockModel(state);
+        modelOverride != null
+            ? modelOverride
+            : Minecraft.getInstance().getModelManager().getBlockModelShaper().getBlockModel(state);
+    var modelQuads = ModelQuadsAccess.get();
+    var random = new SingleThreadedRandomSource(42L);
 
     for (Direction direction :
         new Direction[] {
@@ -100,7 +111,10 @@ public class SoftwareModelTextureBakery {
           Direction.EAST,
           null
         }) {
-      var quads = model.getQuads(state, direction, new SingleThreadedRandomSource(42L));
+      var quads =
+          cube != null
+              ? modelQuads.getQuadsCube(model, state, direction, random, cube)
+              : modelQuads.getQuads(model, state, direction, random, neighbours);
       for (var quad : quads) {
         (layer == RenderType.translucent() ? this.translucentVC : this.opaqueVC)
             .quad(quad, state.is(BlockTags.LEAVES), layer);
@@ -218,6 +232,52 @@ public class SoftwareModelTextureBakery {
   // (0,0),(1,0),(2,0),(0,1),(1,1),(2,1)
 
   public int renderToOutput(BlockState state, long outputBuffer) {
+    return this.renderToOutput(state, outputBuffer, null);
+  }
+
+  /**
+   * @param neighbours optional six neighbour states in Direction.get3DDataValue order, used for
+   *     per-position Dynamic Trees branch ModelData; null keeps the normal single-state bake
+   */
+  public int renderToOutput(
+      BlockState state, long outputBuffer, @Nullable BlockState[] neighbours) {
+    return this.renderToOutput(state, outputBuffer, neighbours, null);
+  }
+
+  /**
+   * @param modelOverride optional synthetic model baked instead of the block's registered model
+   *     (Dynamic Trees thick branches use a full bark cube because their real 3x3x1-cell model
+   *     cannot be captured by a per-cell bake)
+   */
+  public int renderToOutput(
+      BlockState state,
+      long outputBuffer,
+      @Nullable BlockState[] neighbours,
+      @Nullable BakedModel modelOverride) {
+    return this.renderToOutput(state, outputBuffer, neighbours, modelOverride, null);
+  }
+
+  /**
+   * Bakes a model that reads a full 3x3x3 neighbourhood (Dynamic Trees surface roots).
+   *
+   * @param cube 27 block states indexed {@code (dx+1) + 3*(dy+1) + 9*(dz+1)}
+   */
+  public int renderToOutputCube(BlockState state, long outputBuffer, BlockState[] cube) {
+    return this.renderToOutput(state, outputBuffer, null, null, cube);
+  }
+
+  /** Cube-context bake with a synthetic composite model (root + thick-trunk prism piece). */
+  public int renderToOutputCube(
+      BlockState state, long outputBuffer, BlockState[] cube, @Nullable BakedModel modelOverride) {
+    return this.renderToOutput(state, outputBuffer, null, modelOverride, cube);
+  }
+
+  private int renderToOutput(
+      BlockState state,
+      long outputBuffer,
+      @Nullable BlockState[] neighbours,
+      @Nullable BakedModel modelOverride,
+      @Nullable BlockState[] cube) {
     MemoryUtil.memSet(outputBuffer, 0, 16 * 16 * 8 * 6);
 
     boolean isBlock = true;
@@ -249,7 +309,7 @@ public class SoftwareModelTextureBakery {
     if (isBlock) {
       this.opaqueVC.reset();
       this.translucentVC.reset();
-      this.bakeBlockModel(state, blockRenderLayer);
+      this.bakeBlockModel(state, blockRenderLayer, neighbours, modelOverride, cube);
       isAnyShaded |= this.opaqueVC.anyShaded | this.translucentVC.anyShaded;
       isAnyDarkend |= this.opaqueVC.anyDarkendTex | this.translucentVC.anyDarkendTex;
       anyTranslucent |= !this.translucentVC.isEmpty();

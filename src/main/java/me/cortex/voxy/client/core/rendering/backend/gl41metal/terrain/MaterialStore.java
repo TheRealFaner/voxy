@@ -137,6 +137,11 @@ public final class MaterialStore implements ModelOutputSink {
     }
   }
 
+  @Override
+  public synchronized boolean hasPendingUploads() {
+    return !this.pendingModels.isEmpty() || !this.pendingBiomes.isEmpty();
+  }
+
   synchronized int pendingModelUploads() {
     return this.pendingModels.size();
   }

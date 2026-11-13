@@ -27,6 +27,11 @@ uint faceHasAlphaCuttoutOverride(uint faceData) {
     return (faceData>>23)&1u;
 }
 
+// Root impostors only (gl46): the model-texture alpha stores the per-pixel indentation.
+uint faceHasPerPixelDepth(uint faceData) {
+    return (faceData>>26)&1u;
+}
+
 uint faceTintState(uint faceData) {
     return (faceData>>24)&3u;
 }

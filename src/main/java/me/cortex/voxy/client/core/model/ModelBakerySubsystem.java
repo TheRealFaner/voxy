@@ -91,6 +91,20 @@ public class ModelBakerySubsystem {
       glBindFramebuffer(GL_FRAMEBUFFER, fbBinding);
       this.blockIdCount.addAndGet(-j);
     }
+
+    // Sink mode: Dynamic Trees LOD0 variant bakes are GL work, so they must also run on the
+    // render thread. They are drained within the same frame budget as normal block bakes; the
+    // software bakery path drains variants on its own processor thread instead.
+    if (this.storage == null && this.factory.hasQueuedVariantBakes()) {
+      int j = 0;
+      int fbBinding = glGetInteger(GL_FRAMEBUFFER_BINDING);
+      do {
+        if (!this.factory.processVariantBakeOnRenderThread()) break;
+        j++;
+        if (4 < j && (totalBudget < (System.nanoTime() - start) + 50_000)) break;
+      } while (this.factory.hasQueuedVariantBakes());
+      glBindFramebuffer(GL_FRAMEBUFFER, fbBinding);
+    }
   }
 
   public void shutdown() {
@@ -154,6 +168,29 @@ public class ModelBakerySubsystem {
             this.factory.getInflightCount(),
             this.factory.getBakedCount())); // Model bake queue/in flight/model baked count
     debug.add("MB mode: " + this.factory.getBakeryMode());
+    debug.add(
+        "DT variants req/baked/same-base/failed: "
+            + this.factory.getVariantRequestCount()
+            + "/"
+            + this.factory.getVariantSuccessCount()
+            + "/"
+            + this.factory.getVariantDedupeBaseCount()
+            + "/"
+            + this.factory.getVariantFailureCount());
+    debug.add(
+        "DT branch variants req/baked: "
+            + this.factory.getBranchVariantRequestCount()
+            + "/"
+            + this.factory.getBranchVariantSuccessCount()
+            + " active="
+            + this.factory.getVariantActiveCount()
+            + " ids="
+            + this.factory.getModelIdCount());
+    debug.add(
+        "DT root variants req/baked: "
+            + this.factory.getRootVariantRequestCount()
+            + "/"
+            + this.factory.getRootVariantSuccessCount());
   }
 
   public ModelStore getStore() {

@@ -21,10 +21,14 @@ import me.cortex.voxy.common.world.other.Mapper.StateEntry;
 import net.minecraft.SharedConstants;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Holder;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.core.registries.Registries;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.NbtAccounter;
 import net.minecraft.nbt.NbtIo;
 import net.minecraft.nbt.NbtOps;
+import net.minecraft.resources.ResourceLocation;
+import net.minecraft.tags.TagKey;
 import net.minecraft.util.datafix.DataFixers;
 import net.minecraft.util.datafix.fixes.References;
 import net.minecraft.world.level.BlockGetter;
@@ -34,6 +38,7 @@ import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.LeavesBlock;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.block.state.properties.IntegerProperty;
 import net.minecraft.world.level.material.FluidState;
 import org.lwjgl.system.MemoryUtil;
 
@@ -47,6 +52,14 @@ public class Mapper {
   private final IMappingStorage storage;
   public static final long UNKNOWN_MAPPING = -1;
   public static final long AIR = 0;
+
+  private static final TagKey<Block> DYNAMICTREES_BRANCHES =
+      TagKey.create(
+          Registries.BLOCK, ResourceLocation.fromNamespaceAndPath("dynamictrees", "branches"));
+
+  private static final boolean DT_MIP_PRIORITY =
+      "true".equals(System.getProperty("voxy.dtMipPriority", "false"));
+  private static final int DT_MIP_MIN_RADIUS = Integer.getInteger("voxy.dtMipMinRadius", 0);
 
   private final ReentrantLock blockLock = new ReentrantLock();
   private final ConcurrentHashMap<BlockState, StateEntry> block2stateEntry =
@@ -283,12 +296,81 @@ public class Mapper {
     return mapping.id;
   }
 
+  public boolean isMipSkipped(long mappingId) {
+    return this.isMipSkipped(getBlockId(mappingId));
+  }
+
+  public boolean isMipSkipped(int blockId) {
+    return this.blockId2stateEntry.get(blockId).mipSkip;
+  }
+
   public int getBlockStateOpacity(long mappingId) {
     return this.getBlockStateOpacity(getBlockId(mappingId));
   }
 
   public int getBlockStateOpacity(int blockId) {
     return this.blockId2stateEntry.get(blockId).opacity;
+  }
+
+  /**
+   * Packed mip representative priority and opacity. Dynamic Trees branches have a tiny light-block
+   * (opacity 0/1) while leaves are forced to 15 above, so a plain max-opacity mip drops trunks and
+   * branches from any 2x2x2 cell that also contains leaves. A priority bit above the opacity makes
+   * branch blocks win the representative selection without changing the key for any other block
+   * (priority 0 keeps the previous value).
+   */
+  public int getBlockStateMipBase(long mappingId) {
+    var entry = this.blockId2stateEntry.get(getBlockId(mappingId));
+    return (entry.mipPriority << 4) | entry.opacity;
+  }
+
+  private static boolean isDynamicTreesBranch(BlockState state) {
+    if (!DT_MIP_PRIORITY) {
+      return false;
+    }
+    var id = BuiltInRegistries.BLOCK.getKey(state.getBlock());
+    if (id != null) {
+      String namespace = id.getNamespace();
+      String path = id.getPath();
+      // DTP mushrooms/cacti have caps that must not be displaced by their stems; cacti have no
+      // leaves and do not need trunk priority.
+      if (namespace.equals("dynamictreesplus")
+          || path.contains("mushroom")
+          || path.contains("fungus")) {
+        return false;
+      }
+    }
+    if (DT_MIP_MIN_RADIUS > 0) {
+      int radius = radiusOf(state);
+      if (radius < DT_MIP_MIN_RADIUS) {
+        return false;
+      }
+    }
+    if (state.is(DYNAMICTREES_BRANCHES)) {
+      return true;
+    }
+    // Addon blocks may reference a tag that is not bound yet; fall back to the class hierarchy.
+    for (Class<?> cls = state.getBlock().getClass();
+        cls != null && cls != Object.class;
+        cls = cls.getSuperclass()) {
+      String name = cls.getName();
+      if (name.equals("com.dtteam.dynamictrees.block.branch.BasicRootsBlock")) {
+        return false;
+      }
+      if (name.equals("com.dtteam.dynamictrees.block.branch.BranchBlock")) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private static int radiusOf(BlockState state) {
+    for (var property : state.getProperties()) {
+      if (property instanceof IntegerProperty integer && property.getName().equals("radius")) {
+        return state.getValue(integer);
+      }
+    }
+    return -1;
   }
 
   public int getIdForBiome(Holder<Biome> biome) {
@@ -386,10 +468,16 @@ public class Mapper {
     public final int id;
     public final BlockState state;
     public final int opacity;
+    public final int mipPriority;
+    // Decorative surface roots must not become the representative block of a mip cell: their
+    // per-cell model is a small rock-like box, which showed up as loose cubes at LOD>0.
+    public final boolean mipSkip;
 
     public StateEntry(int id, BlockState state) {
       this.id = id;
       this.state = state;
+      this.mipPriority = isDynamicTreesBranch(state) ? 1 : 0;
+      this.mipSkip = DynamicTreesBranches.isSurfaceRoot(state);
       // Override opacity of leaves to be solid
       if (state.getBlock() instanceof LeavesBlock) {
         this.opacity = 15;

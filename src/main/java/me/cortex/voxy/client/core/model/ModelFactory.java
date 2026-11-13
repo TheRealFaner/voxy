@@ -16,7 +16,10 @@ import it.unimi.dsi.fastutil.objects.ObjectOpenHashSet;
 import it.unimi.dsi.fastutil.objects.ObjectSet;
 import java.lang.invoke.VarHandle;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedDeque;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReentrantLock;
 import me.cortex.voxy.client.core.gl.GlBuffer;
 import me.cortex.voxy.client.core.gl.GlTexture;
@@ -26,11 +29,14 @@ import me.cortex.voxy.client.core.rendering.util.UploadStream;
 import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.common.util.MemoryBuffer;
 import me.cortex.voxy.common.util.Pair;
+import me.cortex.voxy.common.world.other.DynamicTreesBranches;
 import me.cortex.voxy.common.world.other.Mapper;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.color.block.BlockColor;
 import net.minecraft.client.renderer.ItemBlockRenderTypes;
 import net.minecraft.client.renderer.RenderType;
+import net.minecraft.client.renderer.texture.TextureAtlasSprite;
+import net.minecraft.client.resources.model.BakedModel;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.registries.Registries;
@@ -67,6 +73,43 @@ import org.lwjgl.system.MemoryUtil;
 public class ModelFactory {
   public static final int MODEL_TEXTURE_SIZE = 16;
   public static final int LAYERS = Integer.numberOfTrailingZeros(MODEL_TEXTURE_SIZE);
+
+  /** Model ids are packed into 16 bits of the per-quad data and index a 256x256 model atlas. */
+  public static final int MAX_MODEL_ID_COUNT = 1 << 16;
+
+  // Dynamic Trees LOD0 variants are capped so a world with many species/connections cannot exhaust
+  // the 16-bit model id space used by every other block. Once capped, meshing keeps the base model.
+  // Radius keys collapse most branch contexts to one key per (state, connection radii) shape, which
+  // covers large forests within this cap.
+  private static final int MAX_VARIANT_MODEL_COUNT = 1 << 15; // 32768 distinct variants
+  private static final int BASE_MODEL_ID_RESERVE = 1 << 13; // 8192 ids kept for normal blocks
+
+  /** Returned by {@link #getVariantModelId} while the variant bake is queued/running. */
+  public static final int VARIANT_MODEL_NOT_READY = -1;
+
+  /** Returned by {@link #getVariantModelId} when the caller must fall back to the base model. */
+  public static final int VARIANT_MODEL_UNAVAILABLE = -2;
+
+  /**
+   * Per-position model key for Dynamic Trees branches: the six neighbour block state ids in {@link
+   * Direction#get3DDataValue()} order (DOWN, UP, NORTH, SOUTH, WEST, EAST).
+   */
+  private record VariantKey(
+      int blockId, int down, int up, int north, int south, int west, int east) {}
+
+  /** A thick-trunk shell cell: core block state id plus the cell offset (x/z in -1..1). */
+  /** {@code capBits} bit0 = UP end cap, bit1 = DOWN end cap. */
+  private record ShellModelKey(int coreBlockId, int dx, int dz, int capBits) {}
+
+  /**
+   * A Dynamic Trees surface-root variant. {@code sideRadii} packs the four connection radii into
+   * 4-bit fields (DT radii reach 8; 3 bits collapsed 8 into 7) and {@code sideLevels} the four DT
+   * connection levels (2 bits each, 0=none, 1=MID, 2=LOW, 3=HIGH); the remaining fields describe an
+   * adjacent thick-trunk core whose per-cell prism bark must be composited back. The exact DT root
+   * model is baked from a captured 3x3x3 state cube stored per key.
+   */
+  private record RootCrownKey(
+      int blockId, int sideRadii, int sideLevels, int coreBlockId, int coreDx, int coreDz) {}
 
   // TODO: replace the fluid BlockState with a client model id integer of the fluidState, requires
   // looking up
@@ -181,6 +224,125 @@ public class ModelFactory {
   private final ConcurrentLinkedDeque<BlockBake> bakeQueue = new ConcurrentLinkedDeque<>();
 
   private final ConcurrentLinkedDeque<ResultUploader> uploadResults = new ConcurrentLinkedDeque<>();
+
+  // Dynamic Trees LOD0 variants. The map is the single source of truth for a variant's state:
+  // absent => never requested, VARIANT_MODEL_NOT_READY => queued/in flight,
+  // VARIANT_MODEL_UNAVAILABLE
+  // => permanent fallback to the base model, any other value => baked model id.
+  private final ConcurrentHashMap<VariantKey, Integer> variantModelIds = new ConcurrentHashMap<>();
+  private final ConcurrentLinkedDeque<VariantKey> variantBakeQueue = new ConcurrentLinkedDeque<>();
+  private final AtomicInteger variantInflightCount = new AtomicInteger();
+  private final AtomicInteger variantActiveCount = new AtomicInteger();
+  private final AtomicInteger variantRequestCount = new AtomicInteger();
+  private final AtomicInteger variantFailureCount = new AtomicInteger();
+  private final AtomicInteger variantSuccessCount = new AtomicInteger();
+  private final AtomicInteger branchVariantRequestCount = new AtomicInteger();
+  private final AtomicInteger branchVariantSuccessCount = new AtomicInteger();
+  private final AtomicInteger rootVariantRequestCount = new AtomicInteger();
+  private final AtomicInteger rootVariantSuccessCount = new AtomicInteger();
+  private final AtomicInteger variantDedupeBaseCount = new AtomicInteger();
+  private final AtomicInteger variantNoPixelCount = new AtomicInteger();
+  private final AtomicInteger variantNoQuadCount = new AtomicInteger();
+  private final AtomicInteger variantExceptionCount = new AtomicInteger();
+  private final AtomicBoolean variantBakeActiveLogged = new AtomicBoolean();
+  private final AtomicBoolean variantSummaryLogged = new AtomicBoolean();
+  // Bounded retries for transient variant bake exceptions (key -> attempts).
+  private final ConcurrentHashMap<VariantKey, Integer> variantAttempts = new ConcurrentHashMap<>();
+  // Upload-loop failure logging is rate limited so a broken atlas cannot spam the log.
+  private final AtomicInteger uploadFailureLogCount = new AtomicInteger();
+  private final AtomicInteger shellFailureLogCount = new AtomicInteger();
+
+  // Async-sink (gl41metal) publications are held until MaterialStore.drainUploads wrote the atlas
+  // tiles; publishing earlier lets sections mesh against unwritten slots (black/white cells).
+  private final ConcurrentLinkedDeque<ModelPublishUpload> pendingSinkVariantPublishes =
+      new ConcurrentLinkedDeque<>();
+
+  private volatile boolean variantsCapped = false;
+
+  // Cached per-block-id Dynamic Trees branch classification (0 unknown, 1 branch, 2 not a branch).
+  // Confined to the 20-bit Mapper block id space, same bound as idMappings.
+  private final byte[] dynamicTreesBranchCache = new byte[1 << 20];
+  private final byte[] thickBranchCache = new byte[1 << 20];
+  private final byte[] trunkShellCache = new byte[1 << 20];
+
+  // Synthetic full-bark-cube models for Dynamic Trees thick branch states (radius > 8), see
+  // thickBranchModelFor. Optional.empty() caches a failed sprite lookup so it is attempted once.
+  private final ConcurrentHashMap<BlockState, Optional<BakedModel>> thickBranchSolidModels =
+      new ConcurrentHashMap<>();
+
+  // Per-shell-cell models of the thick-trunk prism, keyed by core state + cell offset. Baked
+  // together with the core's solid cube and patched into trunk_shell cells at LOD0 meshing time.
+  private final ConcurrentHashMap<ShellModelKey, Integer> shellModelIds = new ConcurrentHashMap<>();
+
+  // Dynamic Trees surface-root variants (3x3x3 neighbour context). Patched into LOD0 sections.
+  private final ConcurrentHashMap<RootCrownKey, Integer> rootVariantModelIds =
+      new ConcurrentHashMap<>();
+  // Representative 3x3x3 state cube per root key, captured on the first request. The exact DT
+  // root model recomputes RootConnections from it; any context with the same key is geometrically
+  // identical.
+  private final ConcurrentHashMap<RootCrownKey, BlockState[]> rootCubes = new ConcurrentHashMap<>();
+  private final ConcurrentLinkedDeque<RootCrownKey> rootVariantBakeQueue =
+      new ConcurrentLinkedDeque<>();
+  private final AtomicInteger rootVariantInflight = new AtomicInteger();
+  private final AtomicInteger rootVariantActive = new AtomicInteger();
+  private static final int MAX_ROOT_VARIANT_MODEL_COUNT = 1 << 14;
+  private final AtomicBoolean rootVariantCapLogged = new AtomicBoolean();
+  private final AtomicBoolean rootVariantActiveLogged = new AtomicBoolean();
+  private static final AtomicBoolean ROOT_FACE_DIAG = new AtomicBoolean();
+
+  /**
+   * gl46 only: encode the per-pixel indentation of root faces into the model-texture alpha and flag
+   * the face, so the terrain shader can displace those fragments. Other models and the GL41 backend
+   * keep the old single-indentation path. Disable for A/B with {@code
+   * -Dvoxy.dtRootPerPixelDepth=false}.
+   */
+  private static final boolean PER_PIXEL_ROOT_DEPTH =
+      !"false".equalsIgnoreCase(System.getProperty("voxy.dtRootPerPixelDepth", "true"));
+
+  /**
+   * Root model source. Default: Dynamic Trees' exact SurfaceRootBlockBakedModel, which only works
+   * because the per-pixel depth map keeps its multiple planes apart. {@code
+   * -Dvoxy.dtRootModel=synthetic} switches back to the single-level plus pad for A/B and rollback.
+   */
+  private static final boolean SYNTHETIC_ROOT_PAD =
+      "synthetic".equalsIgnoreCase(System.getProperty("voxy.dtRootModel", "exact"));
+
+  /**
+   * Branch variants drop the small twig sleeve end caps lying on a cell boundary plane (the
+   * neighbour covers them, but Voxy's per-face depth turns them into fins). Disable for A/B with
+   * {@code -Dvoxy.dtBranchCapFilter=false}.
+   */
+  private static final boolean DROP_BRANCH_BOUNDARY_CAPS =
+      !"false".equalsIgnoreCase(System.getProperty("voxy.dtBranchCapFilter", "true"));
+
+  /**
+   * Branch variants use MAX face depth: at radius tapers/junctions AVG smears the mixed planes and
+   * opens see-through wedges between adjacent cells. MAX is computed once at bake time and is
+   * static (no per-pixel depth). Roll back with {@code -Dvoxy.dtBranchDepthMode=avg} (or {@code
+   * min}).
+   */
+  private static final int BRANCH_DEPTH_MODE = branchDepthMode();
+
+  private static int branchDepthMode() {
+    String mode =
+        System.getProperty("voxy.dtBranchDepthMode", "max").toLowerCase(java.util.Locale.ROOT);
+    return switch (mode) {
+      case "avg" -> TextureUtils.DEPTH_MODE_AVG;
+      case "min" -> TextureUtils.DEPTH_MODE_MIN;
+      default -> TextureUtils.DEPTH_MODE_MAX;
+    };
+  }
+
+  private final ConcurrentHashMap<RootCrownKey, Integer> rootVariantAttempts =
+      new ConcurrentHashMap<>();
+  private final byte[] surfaceRootCache = new byte[1 << 20];
+
+  // Non-capping model id high-water mark; read by worker threads for the variant id reserve check.
+  private final AtomicInteger modelIdCount = new AtomicInteger();
+
+  // Fabric (and any loader without per-position ModelData) cannot change geometry from neighbours;
+  // variant bakes would only waste ids/CPU and dedupe back to the base model.
+  private final boolean variantBakingSupported = ModelQuadsAccess.get().supportsNeighbourContext();
 
   private Object2IntMap<BlockState> customBlockStateIdMapping;
 
@@ -325,7 +487,8 @@ public class ModelFactory {
       }
     }
 
-    var result = this.gl41OffscreenBakery.bake(blockState);
+    BakedModel thickBranchModel = this.thickBranchModelFor(blockState);
+    var result = this.gl41OffscreenBakery.bake(blockState, null, thickBranchModel);
     var upload =
         this.processTextureBakeResult(
             blockId,
@@ -338,65 +501,557 @@ public class ModelFactory {
     if (upload != null) {
       this.uploadResults.add(upload);
     }
+    if (thickBranchModel != null) {
+      this.bakeThickShells(blockId, blockState);
+    }
     return true;
   }
 
-  private boolean processModelResult() {
-    var bake = this.bakeQueue.poll();
-    if (bake == null) return false;
+  private ColourDepthTextureData[] readSoftwareBakeTextures() {
     ColourDepthTextureData[] textureData = new ColourDepthTextureData[6];
+    long ptr = this.bakeScratchBuffer;
+    final int FACE_SIZE = MODEL_TEXTURE_SIZE * MODEL_TEXTURE_SIZE;
+    for (int face = 0; face < 6; face++) {
+      long faceDataPtr = ptr + (FACE_SIZE * 4) * face * 2;
+      int[] colour = new int[FACE_SIZE];
+      int[] depth = new int[FACE_SIZE];
 
-    int flags = this.bakery2.renderToOutput(bake.state, this.bakeScratchBuffer);
+      // Copy out colour
+      for (int i = 0; i < FACE_SIZE; i++) {
+        //// De-interpolate results
+        // colour[i] = MemoryUtil.memGetInt(faceDataPtr + (i * 4 * 2));
+        // depth[i] = MemoryUtil.memGetInt(faceDataPtr + (i * 4 * 2) + 4);
 
-    boolean hasDarkenedTextures = (flags & 2) != 0;
-    boolean isShaded = (flags & 1) != 0;
+        long value = MemoryUtil.memGetLong(faceDataPtr + i * 8);
+        colour[i] = (int) value;
+        depth[i] = (int) (value >>> 32);
+      }
+      textureData[face] =
+          new ColourDepthTextureData(colour, depth, MODEL_TEXTURE_SIZE, MODEL_TEXTURE_SIZE);
+    }
+    return textureData;
+  }
+
+  private static RenderType layerFromSoftwareFlags(BlockState state, int flags) {
     RenderType layer = RenderType.solid();
     if ((flags & 4) != 0) {
       layer = RenderType.translucent();
     } else if ((flags & 8) != 0) {
       layer = RenderType.cutout();
     }
-    if (bake.state.is(BlockTags.LEAVES)) {
+    if (state.is(BlockTags.LEAVES)) {
       layer = RenderType.solid();
     }
+    return layer;
+  }
 
-    { // Create texture data
-      long ptr = this.bakeScratchBuffer;
-      // long ptr = result.rawData.address;
-      final int FACE_SIZE = MODEL_TEXTURE_SIZE * MODEL_TEXTURE_SIZE;
-      for (int face = 0; face < 6; face++) {
-        long faceDataPtr = ptr + (FACE_SIZE * 4) * face * 2;
-        int[] colour = new int[FACE_SIZE];
-        int[] depth = new int[FACE_SIZE];
+  private boolean processModelResult() {
+    var bake = this.bakeQueue.poll();
+    if (bake == null) return false;
 
-        // Copy out colour
-        for (int i = 0; i < FACE_SIZE; i++) {
-          //// De-interpolate results
-          // colour[i] = MemoryUtil.memGetInt(faceDataPtr + (i * 4 * 2));
-          // depth[i] = MemoryUtil.memGetInt(faceDataPtr + (i * 4 * 2) + 4);
-
-          long value = MemoryUtil.memGetLong(faceDataPtr + i * 8);
-          colour[i] = (int) value;
-          depth[i] = (int) (value >>> 32);
-        }
-        textureData[face] =
-            new ColourDepthTextureData(colour, depth, MODEL_TEXTURE_SIZE, MODEL_TEXTURE_SIZE);
-      }
-    }
+    BakedModel thickBranchModel = this.thickBranchModelFor(bake.state);
+    int flags =
+        thickBranchModel == null
+            ? this.bakery2.renderToOutput(bake.state, this.bakeScratchBuffer)
+            : this.bakery2.renderToOutput(
+                bake.state, this.bakeScratchBuffer, null, thickBranchModel);
 
     var bakeResult =
         this.processTextureBakeResult(
             bake.blockId,
             bake.state,
-            textureData,
-            isShaded,
-            hasDarkenedTextures,
-            layer,
+            this.readSoftwareBakeTextures(),
+            (flags & 1) != 0,
+            (flags & 2) != 0,
+            layerFromSoftwareFlags(bake.state, flags),
             FALLBACK_NONE);
     if (bakeResult != null) {
       this.uploadResults.add(bakeResult);
     }
+    if (thickBranchModel != null) {
+      this.bakeThickShells(bake.blockId, bake.state);
+    }
     return !this.bakeQueue.isEmpty();
+  }
+
+  // Software bakery path: the model factory processor thread drains variant bakes alongside base
+  // bakes. The sink (GL41) path must run variants on the render thread instead, see
+  // processVariantBakeOnRenderThread.
+  private boolean processVariantResult() {
+    if (this.gl41OffscreenBakery != null) {
+      return false;
+    }
+    VariantKey key = this.variantBakeQueue.poll();
+    if (key != null) {
+      this.bakeVariantSoftware(key);
+      return true;
+    }
+    RootCrownKey rootKey = this.rootVariantBakeQueue.poll();
+    if (rootKey != null) {
+      this.bakeRootVariantSoftware(rootKey);
+      return true;
+    }
+    return false;
+  }
+
+  /** Sink (gl41metal) path: called from ModelBakerySubsystem.tick on the render thread. */
+  public boolean processVariantBakeOnRenderThread() {
+    if (this.bakery2 != null) {
+      return false;
+    }
+    VariantKey key = this.variantBakeQueue.poll();
+    if (key != null) {
+      this.bakeVariantGl41(key);
+      return true;
+    }
+    RootCrownKey rootKey = this.rootVariantBakeQueue.poll();
+    if (rootKey != null) {
+      this.bakeRootVariantGl41(rootKey);
+      return true;
+    }
+    return false;
+  }
+
+  private BlockState[] resolveVariantNeighbours(VariantKey key) {
+    BlockState[] neighbours = new BlockState[6];
+    neighbours[0] = this.mapper.getBlockStateFromBlockId(key.down());
+    neighbours[1] = this.mapper.getBlockStateFromBlockId(key.up());
+    neighbours[2] = this.mapper.getBlockStateFromBlockId(key.north());
+    neighbours[3] = this.mapper.getBlockStateFromBlockId(key.south());
+    neighbours[4] = this.mapper.getBlockStateFromBlockId(key.west());
+    neighbours[5] = this.mapper.getBlockStateFromBlockId(key.east());
+    return neighbours;
+  }
+
+  private void bakeVariantSoftware(VariantKey key) {
+    try {
+      BlockState state = this.mapper.getBlockStateFromBlockId(key.blockId());
+      BlockState[] neighbours = this.resolveVariantNeighbours(key);
+      BakedModel branchModel = null;
+      if (DROP_BRANCH_BOUNDARY_CAPS) {
+        try {
+          BakedModel raw =
+              Minecraft.getInstance().getModelManager().getBlockModelShaper().getBlockModel(state);
+          if (raw != null) {
+            branchModel = new RootVertFilterBakedModel(raw, 16.0f, true);
+          }
+        } catch (Throwable t) {
+          branchModel = null;
+        }
+      }
+      if (DROP_BRANCH_BOUNDARY_CAPS && branchModel == null) {
+        this.failVariant(key, "missing the branch model for the boundary-cap filter");
+        return;
+      }
+      int flags =
+          this.bakery2.renderToOutput(state, this.bakeScratchBuffer, neighbours, branchModel);
+      RenderType layer = layerFromSoftwareFlags(state, flags);
+      ColourDepthTextureData[] textureData = this.readSoftwareBakeTextures();
+      int checkMode =
+          layer == RenderType.solid()
+              ? TextureUtils.WRITE_CHECK_STENCIL
+              : TextureUtils.WRITE_CHECK_ALPHA;
+      int writtenPixels = 0;
+      for (ColourDepthTextureData face : textureData) {
+        writtenPixels += TextureUtils.getWrittenPixelCount(face, checkMode);
+      }
+      if (writtenPixels == 0) {
+        // Never install an empty variant model: the branch would disappear instead of falling back
+        // to its base geometry.
+        this.variantNoPixelCount.incrementAndGet();
+        this.failVariant(
+            key,
+            "variant bake produced no pixels state="
+                + state
+                + " neighbours="
+                + java.util.Arrays.toString(neighbours));
+        return;
+      }
+      var upload =
+          this.processTextureBakeResult(
+              key.blockId(),
+              state,
+              textureData,
+              (flags & 1) != 0,
+              (flags & 2) != 0,
+              layer,
+              FALLBACK_NONE,
+              key,
+              null,
+              null);
+      if (upload != null) {
+        this.uploadResults.add(upload);
+      }
+    } catch (Throwable t) {
+      this.variantExceptionCount.incrementAndGet();
+      this.failVariantTransient(key, t);
+    } finally {
+      this.variantInflightCount.decrementAndGet();
+    }
+  }
+
+  private void bakeVariantGl41(VariantKey key) {
+    try {
+      BlockState state = this.mapper.getBlockStateFromBlockId(key.blockId());
+      BlockState[] neighbours = this.resolveVariantNeighbours(key);
+      BakedModel branchModel = null;
+      if (DROP_BRANCH_BOUNDARY_CAPS) {
+        try {
+          BakedModel raw =
+              Minecraft.getInstance().getModelManager().getBlockModelShaper().getBlockModel(state);
+          if (raw != null) {
+            branchModel = new RootVertFilterBakedModel(raw, 16.0f, true);
+          }
+        } catch (Throwable t) {
+          branchModel = null;
+        }
+      }
+      if (DROP_BRANCH_BOUNDARY_CAPS && branchModel == null) {
+        this.failVariant(key, "missing the branch model for the boundary-cap filter");
+        return;
+      }
+      var result = this.gl41OffscreenBakery.bake(state, neighbours, branchModel);
+      if (result.fallbackReason() != FALLBACK_NONE) {
+        this.variantNoQuadCount.incrementAndGet();
+        this.failVariant(
+            key, "variant bake failed with fallback reason " + result.fallbackReason());
+        return;
+      }
+      RenderType layer = ItemBlockRenderTypes.getChunkRenderType(state);
+      if (state.getBlock() instanceof LeavesBlock) {
+        layer = RenderType.solid();
+      }
+      int checkMode =
+          layer == RenderType.solid()
+              ? TextureUtils.WRITE_CHECK_STENCIL
+              : TextureUtils.WRITE_CHECK_ALPHA;
+      int writtenPixels = 0;
+      for (ColourDepthTextureData face : result.faces()) {
+        writtenPixels += TextureUtils.getWrittenPixelCount(face, checkMode);
+      }
+      if (writtenPixels == 0) {
+        this.variantNoPixelCount.incrementAndGet();
+        this.failVariant(
+            key,
+            "variant bake produced no pixels state="
+                + state
+                + " neighbours="
+                + java.util.Arrays.toString(neighbours));
+        return;
+      }
+      var upload =
+          this.processTextureBakeResult(
+              key.blockId(),
+              state,
+              result.faces(),
+              result.shaded(),
+              result.darkenedTextures(),
+              null,
+              result.fallbackReason(),
+              key,
+              null,
+              null);
+      if (upload != null) {
+        this.uploadResults.add(upload);
+      }
+    } catch (Throwable t) {
+      this.variantExceptionCount.incrementAndGet();
+      this.failVariantTransient(key, t);
+    } finally {
+      this.variantInflightCount.decrementAndGet();
+    }
+  }
+
+  private void bakeRootVariantSoftware(RootCrownKey key) {
+    try {
+      BlockState state = this.mapper.getBlockStateFromBlockId(key.blockId());
+      BlockState[] cube = this.rootCubes.get(key);
+      BakedModel model = this.buildRootExactModel(key, state, cube);
+      if (model == null || cube == null) {
+        this.failRootVariant(key, "missing the surface-root model or 3x3x3 context");
+        return;
+      }
+      // Always pass the built model as the override. The non-composite branch used to omit it,
+      // so the bakery re-fetched the raw DT model and never applied the RootVertFilterBakedModel
+      // wrapper (HIGH verts and boundary sleeve caps stayed in the bake and MIN turned them into
+      // posts/plates). This is the wiring roots12 was supposed to have.
+      int flags = this.bakery2.renderToOutputCube(state, this.bakeScratchBuffer, cube, model);
+      RenderType layer = layerFromSoftwareFlags(state, flags);
+      ColourDepthTextureData[] textureData = this.readSoftwareBakeTextures();
+      int checkMode =
+          layer == RenderType.solid()
+              ? TextureUtils.WRITE_CHECK_STENCIL
+              : TextureUtils.WRITE_CHECK_ALPHA;
+      // gl46 per-pixel depth: the alpha channel carries the per-pixel indentation for root
+      // faces. Must happen before processTextureBakeResult because the ModelEntry hash covers
+      // the colour arrays. The GL41 bakery keeps the old flat path (see the faceData bit gate).
+      if (PER_PIXEL_ROOT_DEPTH && layer != RenderType.translucent()) {
+        TextureUtils.encodeRootPixelDepth(textureData, checkMode);
+      }
+      if (ROOT_FACE_DIAG.compareAndSet(false, true)) {
+        StringBuilder sb = new StringBuilder("DT root variant face pixels");
+        for (int f = 0; f < textureData.length; f++) {
+          sb.append(' ')
+              .append(f)
+              .append('=')
+              .append(TextureUtils.getWrittenPixelCount(textureData[f], checkMode));
+        }
+        Logger.info(sb.append(" key=").append(key).toString());
+      }
+      int writtenPixels = 0;
+      for (ColourDepthTextureData face : textureData) {
+        writtenPixels += TextureUtils.getWrittenPixelCount(face, checkMode);
+      }
+      if (writtenPixels == 0) {
+        this.variantNoPixelCount.incrementAndGet();
+        this.failRootVariant(key, "surface root variant bake produced no pixels");
+        return;
+      }
+      var upload =
+          this.processTextureBakeResult(
+              key.blockId(),
+              state,
+              textureData,
+              (flags & 1) != 0,
+              (flags & 2) != 0,
+              layer,
+              FALLBACK_NONE,
+              null,
+              null,
+              key);
+      if (upload != null) {
+        this.uploadResults.add(upload);
+      }
+    } catch (Throwable t) {
+      this.variantExceptionCount.incrementAndGet();
+      this.failRootVariantTransient(key, t);
+    } finally {
+      this.rootVariantInflight.decrementAndGet();
+    }
+  }
+
+  private void bakeRootVariantGl41(RootCrownKey key) {
+    try {
+      BlockState state = this.mapper.getBlockStateFromBlockId(key.blockId());
+      BlockState[] cube = this.rootCubes.get(key);
+      BakedModel model = this.buildRootExactModel(key, state, cube);
+      if (model == null || cube == null) {
+        this.failRootVariant(key, "missing the surface-root model or 3x3x3 context");
+        return;
+      }
+      // Same wiring fix as the software path: always bake the model returned by
+      // buildRootExactModel so the RootVertFilterBakedModel is actually applied.
+      var result = this.gl41OffscreenBakery.bakeCube(state, cube, model);
+      if (result.fallbackReason() != FALLBACK_NONE) {
+        this.variantNoQuadCount.incrementAndGet();
+        this.failRootVariant(
+            key, "surface root variant failed with fallback reason " + result.fallbackReason());
+        return;
+      }
+      RenderType layer = ItemBlockRenderTypes.getChunkRenderType(state);
+      int checkMode =
+          layer == RenderType.solid()
+              ? TextureUtils.WRITE_CHECK_STENCIL
+              : TextureUtils.WRITE_CHECK_ALPHA;
+      if (ROOT_FACE_DIAG.compareAndSet(false, true)) {
+        StringBuilder sb = new StringBuilder("DT root variant face pixels");
+        for (int f = 0; f < result.faces().length; f++) {
+          sb.append(' ')
+              .append(f)
+              .append('=')
+              .append(TextureUtils.getWrittenPixelCount(result.faces()[f], checkMode));
+        }
+        Logger.info(sb.append(" key=").append(key).toString());
+      }
+      int writtenPixels = 0;
+      for (ColourDepthTextureData face : result.faces()) {
+        writtenPixels += TextureUtils.getWrittenPixelCount(face, checkMode);
+      }
+      if (writtenPixels == 0) {
+        this.variantNoPixelCount.incrementAndGet();
+        this.failRootVariant(key, "surface root variant bake produced no pixels");
+        return;
+      }
+      var upload =
+          this.processTextureBakeResult(
+              key.blockId(),
+              state,
+              result.faces(),
+              result.shaded(),
+              result.darkenedTextures(),
+              null,
+              result.fallbackReason(),
+              null,
+              null,
+              key);
+      if (upload != null) {
+        this.uploadResults.add(upload);
+      }
+    } catch (Throwable t) {
+      this.variantExceptionCount.incrementAndGet();
+      this.failRootVariantTransient(key, t);
+    } finally {
+      this.rootVariantInflight.decrementAndGet();
+    }
+  }
+
+  /**
+   * Builds the model used for a surface-root variant: the exact Dynamic Trees {@code
+   * SurfaceRootBlockBakedModel} driven by the captured 3x3x3 state cube. Root cells that replaced a
+   * {@code trunk_shell} are composited with the trunk's per-cell prism bark so the trunk wall has
+   * no notch.
+   */
+  private @Nullable BakedModel buildRootExactModel(
+      RootCrownKey key, BlockState rootState, BlockState[] cube) {
+    BakedModel rootModel;
+    try {
+      rootModel =
+          Minecraft.getInstance().getModelManager().getBlockModelShaper().getBlockModel(rootState);
+    } catch (Throwable t) {
+      Logger.warn("Could not resolve the model for surface root " + rootState, t);
+      return null;
+    }
+    if (rootModel == null || cube == null) {
+      return null;
+    }
+    BakedModel bakedRoot = rootModel;
+    int rootRadius = DynamicTreesBranches.radiusOf(rootState);
+    boolean grounded = DynamicTreesBranches.isGrounded(rootState);
+    if (!SYNTHETIC_ROOT_PAD) {
+      // Exact DT model. The per-pixel depth map (gl46) keeps its multiple planes apart, so the
+      // real core, sleeves, boundary caps and DOWN faces can be baked. The filter only removes
+      // the part of the HIGH vert columns above the cell top: quads with a vertex above y=16
+      // are dropped, while the in-cell vert piece (max y=16) and all other geometry stay. Applied
+      // to ungrounded roots too, which can keep the same out-of-cell HIGH vert geometry.
+      bakedRoot = new RootVertFilterBakedModel(rootModel, 16.0f, false);
+    } else if (grounded && rootRadius > 0) {
+      TextureAtlasSprite sprite = rootModel.getParticleIcon();
+      if (sprite != null) {
+        int north = key.sideRadii() & 15;
+        int east = (key.sideRadii() >> 4) & 15;
+        int south = (key.sideRadii() >> 8) & 15;
+        int west = (key.sideRadii() >> 12) & 15;
+        bakedRoot = new SyntheticRootPadBakedModel(sprite, rootRadius, north, east, south, west);
+      }
+    }
+    if (key.coreBlockId() == 0) {
+      return bakedRoot;
+    }
+    BlockState coreState = this.mapper.getBlockStateFromBlockId(key.coreBlockId());
+    BakedModel solid = this.thickBranchModelFor(coreState);
+    if (solid instanceof SolidBarkBakedModel bark) {
+      int coreRadius = DynamicTreesBranches.radiusOf(coreState);
+      if (coreRadius > DynamicTreesBranches.MAX_CELL_RADIUS) {
+        EnumSet<Direction> hiddenRootSides = EnumSet.noneOf(Direction.class);
+        if (SYNTHETIC_ROOT_PAD) {
+          // Only the single-level pad needs its trunk-facing quads hidden; the exact model under
+          // the per-pixel depth map keeps the root and the wall at their own depths.
+          if (key.coreDx() > 0) {
+            hiddenRootSides.add(Direction.EAST);
+          } else if (key.coreDx() < 0) {
+            hiddenRootSides.add(Direction.WEST);
+          }
+          if (key.coreDz() > 0) {
+            hiddenRootSides.add(Direction.SOUTH);
+          } else if (key.coreDz() < 0) {
+            hiddenRootSides.add(Direction.NORTH);
+          }
+        }
+        return new CompositeRootShellBakedModel(
+            bakedRoot,
+            new ThickTrunkShellBakedModel(
+                bark.sprite(), coreRadius, key.coreDx(), key.coreDz(), false, false),
+            hiddenRootSides);
+      }
+    }
+    return bakedRoot;
+  }
+
+  private void failRootVariant(RootCrownKey key, Object cause) {
+    Integer previous = this.rootVariantModelIds.put(key, VARIANT_MODEL_UNAVAILABLE);
+    if (previous != null && previous == VARIANT_MODEL_NOT_READY) {
+      this.rootVariantActive.decrementAndGet();
+    }
+    // A terminally failed key never bakes; drop its captured cube and retry counter. Failed keys
+    // are not bounded by the variant cap, so keeping them would leak a BlockState[27] per context.
+    this.rootCubes.remove(key);
+    this.rootVariantAttempts.remove(key);
+    if (this.variantFailureCount.incrementAndGet() <= 32) {
+      Logger.warn("Failed to bake Dynamic Trees surface root variant " + key, cause);
+    }
+  }
+
+  /** Mirrors the branch transient retry: up to 3 attempts before the key becomes permanent. */
+  private void failRootVariantTransient(RootCrownKey key, Throwable cause) {
+    int attempt = this.rootVariantAttempts.merge(key, 1, Integer::sum);
+    if (attempt < 3) {
+      if (this.rootVariantModelIds.remove(key, VARIANT_MODEL_NOT_READY)) {
+        this.rootVariantActive.decrementAndGet();
+      }
+      if (this.variantFailureCount.incrementAndGet() <= 32) {
+        Logger.warn(
+            "Surface root variant attempt " + attempt + " failed for " + key + ", will retry",
+            cause);
+      }
+    } else {
+      this.failRootVariant(key, cause);
+    }
+  }
+
+  private void logVariantActive(VariantKey key, int modelId) {
+    if (this.variantBakeActiveLogged.compareAndSet(false, true)) {
+      Logger.info(
+          "Dynamic Trees LOD0 branch variants active, first variant "
+              + key
+              + " -> model id "
+              + modelId);
+    }
+  }
+
+  /**
+   * Marks a variant as permanently unavailable. Deterministic failures (empty bake, no quads) use
+   * this; transient exceptions go through {@link #failVariantTransient}.
+   */
+  private void failVariant(VariantKey key, Object cause) {
+    this.markVariantUnavailable(key);
+    if (this.variantFailureCount.incrementAndGet() <= 32) {
+      Logger.warn(
+          "Failed to bake Dynamic Trees branch variant " + key + ", using the base model", cause);
+    }
+  }
+
+  /**
+   * Retries a variant a few times before giving up: exception failures are frequently transient
+   * (allocation hiccups, model-manager races), and a permanent -2 for the whole session would
+   * silently degrade that branch position. The variant key is removed while retries remain, so the
+   * next section meshing attempt re-requests it.
+   */
+  private void failVariantTransient(VariantKey key, Throwable cause) {
+    int attempt = this.variantAttempts.merge(key, 1, Integer::sum);
+    if (attempt < 3) {
+      if (this.variantModelIds.remove(key, VARIANT_MODEL_NOT_READY)) {
+        this.variantActiveCount.decrementAndGet();
+      }
+      if (this.variantFailureCount.incrementAndGet() <= 32) {
+        Logger.warn(
+            "Variant bake attempt "
+                + attempt
+                + " failed for "
+                + key
+                + ", will retry (base model meanwhile)",
+            cause);
+      }
+    } else {
+      this.failVariant(key, cause);
+    }
+  }
+
+  /** Sets -2 and keeps the active-variant counter accurate (only NOT_READY entries count). */
+  private void markVariantUnavailable(VariantKey key) {
+    Integer previous = this.variantModelIds.put(key, VARIANT_MODEL_UNAVAILABLE);
+    if (previous != null && previous == VARIANT_MODEL_NOT_READY) {
+      this.variantActiveCount.decrementAndGet();
+    }
   }
 
   private final ConcurrentLinkedDeque<Mapper.BiomeEntry> biomeQueue = new ConcurrentLinkedDeque<>();
@@ -421,32 +1076,150 @@ public class ModelFactory {
       biomeEntry = this.biomeQueue.poll();
     }
 
-    while (this.processModelResult())
-      ;
+    // Alternate base and variant bakes so a large base-model backlog cannot starve LOD0 variants.
+    while (true) {
+      boolean processedBase = this.processModelResult();
+      boolean processedVariant = this.processVariantResult();
+      if (!processedBase && !processedVariant) {
+        break;
+      }
+    }
   }
 
   public void processUploads() {
+    List<ModelPublishUpload> readyPublishes = new ArrayList<>();
     var upload = this.uploadResults.poll();
-    if (upload == null) return;
-
-    if (this.storage != null) {
-      glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
-      glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
-      glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
-      glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-    }
-    do {
+    if (upload != null) {
       if (this.storage != null) {
-        upload.upload(this.storage);
-      } else {
-        upload.upload(this.outputSink);
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+        glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
+        glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
       }
-      upload.free();
-      upload = this.uploadResults.poll();
-    } while (upload != null);
-    if (this.storage != null) {
-      UploadStream.INSTANCE.commit();
+      do {
+        try {
+          if (this.storage != null) {
+            upload.upload(this.storage);
+          } else {
+            upload.upload(this.outputSink);
+          }
+        } catch (Throwable t) {
+          // The bake already inserted its ModelEntry->id mapping, so a retry would dedupe to an
+          // entry whose upload never happened. Fail terminal instead.
+          if (upload instanceof ModelBakeResultUpload result) {
+            if (result.variantKey != null) {
+              this.failVariant(result.variantKey, t);
+            } else if (result.shellModelKey != null) {
+              this.shellModelIds.put(result.shellModelKey, VARIANT_MODEL_UNAVAILABLE);
+            } else if (result.rootVariantKey != null) {
+              this.failRootVariant(result.rootVariantKey, t);
+            }
+          }
+          if (this.uploadFailureLogCount.incrementAndGet() <= 8) {
+            Logger.warn("Model texture upload failed", t);
+          }
+          upload.free();
+          upload = this.uploadResults.poll();
+          continue;
+        }
+        if (upload instanceof ModelBakeResultUpload result) {
+          if (result.variantKey != null) {
+            readyPublishes.add(
+                new ModelPublishUpload(
+                    result.variantKey, null, null, result.variantModelId, false));
+          } else if (result.shellModelKey != null) {
+            readyPublishes.add(
+                new ModelPublishUpload(
+                    null, result.shellModelKey, null, result.shellModelId, false));
+          } else if (result.rootVariantKey != null) {
+            readyPublishes.add(
+                new ModelPublishUpload(
+                    null, null, result.rootVariantKey, result.rootVariantModelId, false));
+          }
+        } else if (upload instanceof ModelPublishUpload publish) {
+          // The deduplicated model's upload was drained earlier in this FIFO queue.
+          readyPublishes.add(publish);
+        }
+        upload.free();
+        upload = this.uploadResults.poll();
+      } while (upload != null);
+      if (this.storage != null) {
+        UploadStream.INSTANCE.commit();
+      }
     }
+    // Publish only after the synchronous batch is committed (and, for async sinks, only once the
+    // sink reports its own queue drained).
+    if (this.outputSink != null) {
+      this.pendingSinkVariantPublishes.addAll(readyPublishes);
+    } else {
+      for (ModelPublishUpload publish : readyPublishes) {
+        this.publishModel(publish);
+      }
+    }
+    this.publishSinkVariantsIfDrained();
+    this.maybeLogVariantSummary();
+  }
+
+  private void publishModel(ModelPublishUpload publish) {
+    if (publish.variantKey != null) {
+      this.variantModelIds.put(publish.variantKey, publish.modelId);
+      // A dedupe to an existing (non-air) model still resolves the branch position correctly.
+      this.branchVariantSuccessCount.incrementAndGet();
+      if (publish.dedupedToBase) {
+        this.variantDedupeBaseCount.incrementAndGet();
+      } else {
+        this.variantSuccessCount.incrementAndGet();
+        this.logVariantActive(publish.variantKey, publish.modelId);
+      }
+    } else if (publish.shellKey != null) {
+      this.shellModelIds.put(publish.shellKey, publish.modelId);
+    } else if (publish.rootKey != null) {
+      this.rootVariantModelIds.put(publish.rootKey, publish.modelId);
+      this.rootVariantSuccessCount.incrementAndGet();
+      this.variantSuccessCount.incrementAndGet();
+    }
+  }
+
+  /** Async sink backends only expose completion through their pending queue. */
+  private void publishSinkVariantsIfDrained() {
+    if (this.outputSink == null || this.outputSink.hasPendingUploads()) {
+      return;
+    }
+    ModelPublishUpload publish;
+    while ((publish = this.pendingSinkVariantPublishes.poll()) != null) {
+      this.publishModel(publish);
+    }
+  }
+
+  /** One-shot settle summary; runs on the render thread after the upload queue drained. */
+  private void maybeLogVariantSummary() {
+    if (this.variantSummaryLogged.get()
+        || this.variantRequestCount.get() == 0
+        || !this.variantBakeQueue.isEmpty()
+        || !this.rootVariantBakeQueue.isEmpty()
+        || this.variantInflightCount.get() != 0
+        || this.rootVariantInflight.get() != 0
+        || !this.uploadResults.isEmpty()
+        || !this.pendingSinkVariantPublishes.isEmpty()) {
+      return;
+    }
+    this.variantSummaryLogged.set(true);
+    Logger.info(
+        "Dynamic Trees LOD0 variants settled: "
+            + this.variantRequestCount.get()
+            + " requested, "
+            + this.variantSuccessCount.get()
+            + " baked, "
+            + this.variantDedupeBaseCount.get()
+            + " identical to base, "
+            + this.variantFailureCount.get()
+            + " failed ("
+            + this.variantNoPixelCount.get()
+            + " no pixels, "
+            + this.variantNoQuadCount.get()
+            + " no quads, "
+            + this.variantExceptionCount.get()
+            + " exceptions)");
   }
 
   private interface ResultUploader {
@@ -455,6 +1228,40 @@ public class ModelFactory {
     void upload(ModelOutputSink sink);
 
     void free();
+  }
+
+  /**
+   * Publication-only queue entry for a model that deduplicated to an existing model id. It rides
+   * the same FIFO upload queue so the duplicate's atlas upload (enqueued earlier) completes first.
+   */
+  private static final class ModelPublishUpload implements ResultUploader {
+    final @Nullable VariantKey variantKey;
+    final @Nullable ShellModelKey shellKey;
+    final @Nullable RootCrownKey rootKey;
+    final int modelId;
+    final boolean dedupedToBase;
+
+    ModelPublishUpload(
+        @Nullable VariantKey variantKey,
+        @Nullable ShellModelKey shellKey,
+        @Nullable RootCrownKey rootKey,
+        int modelId,
+        boolean dedupedToBase) {
+      this.variantKey = variantKey;
+      this.shellKey = shellKey;
+      this.rootKey = rootKey;
+      this.modelId = modelId;
+      this.dedupedToBase = dedupedToBase;
+    }
+
+    @Override
+    public void upload(ModelStore store) {}
+
+    @Override
+    public void upload(ModelOutputSink sink) {}
+
+    @Override
+    public void free() {}
   }
 
   private static final class ModelBakeResultUpload implements ResultUploader {
@@ -469,6 +1276,18 @@ public class ModelFactory {
 
     public int biomeUploadIndex = -1;
     public @Nullable MemoryBuffer biomeUpload;
+
+    // Non-null for a Dynamic Trees variant. The variant id is published to variantModelIds only
+    // after the atlas upload below, so section meshing can never reference an unwritten slot (which
+    // would bake the section against an empty/white texture).
+    public @Nullable VariantKey variantKey;
+    public int variantModelId = -1;
+
+    // Same deferral for a thick-trunk shell cell / surface-root variant model.
+    public @Nullable ShellModelKey shellModelKey;
+    public int shellModelId = -1;
+    public @Nullable RootCrownKey rootVariantKey;
+    public int rootVariantModelId = -1;
 
     public void upload(ModelStore store) { // Uploads and resets for reuse
       this.upload(store.modelBuffer, store.modelColourBuffer, store.textures);
@@ -546,20 +1365,76 @@ public class ModelFactory {
       boolean darkenedTinting,
       RenderType layer,
       int fallbackReason) {
-    if (this.idMappings[blockId] != -1) {
-      // This should be impossible to reach as it means that multiple bakes for the same blockId
-      // happened and where inflight at the same time!
-      throw new IllegalStateException(
-          "Block id already added: " + blockId + " for state: " + blockState);
-    }
+    return this.processTextureBakeResult(
+        blockId,
+        blockState,
+        textureData,
+        isShaded,
+        darkenedTinting,
+        layer,
+        fallbackReason,
+        null,
+        null,
+        null);
+  }
 
-    this.blockStatesInFlightLock.lock();
-    if (!this.blockStatesInFlight.contains(blockId)) {
+  // variantKey/shellKey/rootKey == null is the normal per-block bake. A non-null key installs the
+  // result into the corresponding registry instead of idMappings[blockId], so base ids are never
+  // overwritten.
+  private ModelBakeResultUpload processTextureBakeResult(
+      int blockId,
+      BlockState blockState,
+      ColourDepthTextureData[] textureData,
+      boolean isShaded,
+      boolean darkenedTinting,
+      RenderType layer,
+      int fallbackReason,
+      @Nullable VariantKey variantKey) {
+    return this.processTextureBakeResult(
+        blockId,
+        blockState,
+        textureData,
+        isShaded,
+        darkenedTinting,
+        layer,
+        fallbackReason,
+        variantKey,
+        null,
+        null);
+  }
+
+  private ModelBakeResultUpload processTextureBakeResult(
+      int blockId,
+      BlockState blockState,
+      ColourDepthTextureData[] textureData,
+      boolean isShaded,
+      boolean darkenedTinting,
+      RenderType layer,
+      int fallbackReason,
+      @Nullable VariantKey variantKey,
+      @Nullable ShellModelKey shellKey,
+      @Nullable RootCrownKey rootKey) {
+    if (variantKey == null && shellKey == null && rootKey == null) {
+      if (this.idMappings[blockId] != -1) {
+        // This should be impossible to reach as it means that multiple bakes for the same blockId
+        // happened and where inflight at the same time!
+        throw new IllegalStateException(
+            "Block id already added: " + blockId + " for state: " + blockState);
+      }
+
+      this.blockStatesInFlightLock.lock();
+      if (!this.blockStatesInFlight.contains(blockId)) {
+        this.blockStatesInFlightLock.unlock();
+        throw new IllegalStateException(
+            "processing a texture bake result but the block state was not in flight!!");
+      }
       this.blockStatesInFlightLock.unlock();
+    } else if (variantKey != null
+        && !Integer.valueOf(VARIANT_MODEL_NOT_READY).equals(this.variantModelIds.get(variantKey))) {
       throw new IllegalStateException(
-          "processing a texture bake result but the block state was not in flight!!");
+          "processing a variant texture bake result but the variant was not in flight!! "
+              + variantKey);
     }
-    this.blockStatesInFlightLock.unlock();
 
     // TODO: add thing for `blockState.hasEmissiveLighting()` and `blockState.getLuminance()`
 
@@ -596,8 +1471,24 @@ public class ModelFactory {
     var colourProvider = getColourProvider(blockState.getBlock());
 
     boolean isBiomeColourDependent = false;
+    int constantTint = -1;
     if (colourProvider != null) {
-      isBiomeColourDependent = isBiomeDependentColour(colourProvider, blockState);
+      try {
+        isBiomeColourDependent = isBiomeDependentColour(colourProvider, blockState);
+        if (!isBiomeColourDependent) {
+          constantTint =
+              captureColourConstant(colourProvider, blockState, DEFAULT_BIOME) | 0xFF000000;
+        }
+      } catch (Throwable t) {
+        Logger.warn(
+            "Colour provider for "
+                + blockState
+                + " threw while being probed, treating the block as untinted",
+            t);
+        colourProvider = null;
+        isBiomeColourDependent = false;
+        constantTint = -1;
+      }
     }
     int customBlockStateId = this.getCustomBlockStateId(blockState);
 
@@ -612,16 +1503,51 @@ public class ModelFactory {
           new ModelEntry(
               textureData,
               clientFluidStateId,
-              isBiomeColourDependent || colourProvider == null
-                  ? -1
-                  : captureColourConstant(colourProvider, blockState, DEFAULT_BIOME) | 0xFF000000,
+              constantTint,
               dedupeRenderLayer,
               dedupeFallbackReason,
               dedupeCustomBlockStateId);
       int possibleDuplicate = this.modelTexture2id.getInt(entry);
       if (possibleDuplicate != -1) { // Duplicate found
-        this.idMappings[blockId] = possibleDuplicate;
         modelId = possibleDuplicate;
+        if (variantKey != null) {
+          if (possibleDuplicate == 0) {
+            // Model id 0 is the empty/air model; a variant must never resolve to it or the branch
+            // would disappear.
+            this.failVariant(variantKey, "variant deduplicated to the empty/air model");
+            return null;
+          }
+          // Publish only after the duplicate's own upload has been drained. The upload queue is
+          // FIFO and model bakes are single-threaded per backend, so enqueuing this marker after
+          // the duplicate's uploader guarantees the atlas slot is written first.
+          this.uploadResults.add(
+              new ModelPublishUpload(
+                  variantKey,
+                  null,
+                  null,
+                  possibleDuplicate,
+                  possibleDuplicate == this.idMappings[blockId]));
+          return null;
+        }
+        if (shellKey != null) {
+          if (possibleDuplicate == 0) {
+            this.shellModelIds.put(shellKey, VARIANT_MODEL_UNAVAILABLE);
+            return null;
+          }
+          this.uploadResults.add(
+              new ModelPublishUpload(null, shellKey, null, possibleDuplicate, false));
+          return null;
+        }
+        if (rootKey != null) {
+          if (possibleDuplicate == 0) {
+            this.failRootVariant(rootKey, "surface root deduplicated to the empty/air model");
+            return null;
+          }
+          this.uploadResults.add(
+              new ModelPublishUpload(null, null, rootKey, possibleDuplicate, false));
+          return null;
+        }
+        this.idMappings[blockId] = possibleDuplicate;
         // Remove from flight
         this.blockStatesInFlightLock.lock();
         if (!this.blockStatesInFlight.remove(blockId)) {
@@ -632,10 +1558,24 @@ public class ModelFactory {
         return null;
       } else { // Not a duplicate so create a new entry
         modelId = this.modelTexture2id.size();
+        if ((variantKey != null || shellKey != null || rootKey != null)
+            && modelId >= MAX_MODEL_ID_COUNT) {
+          // Never exceed the 16-bit id space. The derived model falls back to the base model/air.
+          this.capVariants("16-bit model id space exhausted");
+          if (variantKey != null) {
+            this.markVariantUnavailable(variantKey);
+          } else if (shellKey != null) {
+            this.shellModelIds.put(shellKey, VARIANT_MODEL_UNAVAILABLE);
+          } else {
+            this.failRootVariant(rootKey, "16-bit model id space exhausted");
+          }
+          return null;
+        }
         // NOTE: we set the mapping at the very end so that race conditions with this and
         // getMetadata dont occur
         // this.idMappings[blockId] = modelId;
         this.modelTexture2id.put(entry, modelId);
+        this.modelIdCount.lazySet(modelId + 1);
       }
     }
 
@@ -683,9 +1623,15 @@ public class ModelFactory {
         computeModelDepth(
             textureData,
             checkMode,
-            (isFluid || layer != RenderType.solid())
+            // Roots still expose several planes per view at junctions (sleeve end at the cell
+            // boundary plus perpendicular sleeve fronts deeper in). AVG recesses the whole face
+            // and creates plates/gaps; MIN keeps the frontmost plane. Branch variants use MAX:
+            // AVG smears the two planes at radius tapers/junctions and opens see-through wedges
+            // between adjacent cells. MAX is computed at bake time and stays static (no per-pixel
+            // depth). Roll back with -Dvoxy.dtBranchDepthMode=avg.
+            (isFluid || layer != RenderType.solid() || rootKey != null)
                 ? TextureUtils.DEPTH_MODE_MIN
-                : TextureUtils.DEPTH_MODE_AVG,
+                : (variantKey != null ? BRANCH_DEPTH_MODE : TextureUtils.DEPTH_MODE_AVG),
             this.gl41OffscreenBakery != null);
 
     // TODO: THIS, note this can be tested for in 2 ways, re render the model with quad culling
@@ -741,6 +1687,9 @@ public class ModelFactory {
 
     boolean fullyOpaque = true;
     boolean anyFaceNeedsDiscard = false;
+    // Root crowns and thick-trunk shell pieces are synthetic impostors with irregular footprints;
+    // their occlusion/discard flags must not be derived from the normal full-block heuristics.
+    final boolean synthetic = rootKey != null || shellKey != null;
 
     // TODO: FIXME faces that have the same "alignment depth" e.g. (sizes[0]+sizes[1])~=1 can be
     // merged into a double faced single quad
@@ -785,9 +1734,11 @@ public class ModelFactory {
               < 0.1; // If the face is rendered far away from the other face, then it doesnt occlude
 
       if (occludesFace) {
-        occludesFace &=
-            ((float) writeCount) / (MODEL_TEXTURE_SIZE * MODEL_TEXTURE_SIZE)
-                > 0.9; // only occlude if the face covers more than 90% of the face
+        // A face may occlude only when it is genuinely flush and covers the entire cell face.
+        // The old 90%-coverage heuristic marked partial blocks such as dirt_path (15/16 high,
+        // side coverage 93.75%) as occluding; the neighbouring full block's side face was then
+        // culled and the 1/16 slit showed the sky as a thin blue line along every path edge.
+        occludesFace &= offset <= 0.0f && writeCount == MODEL_TEXTURE_SIZE * MODEL_TEXTURE_SIZE;
       }
       metadata |= occludesFace ? 1 : 0;
       fullyOpaque &= occludesFace;
@@ -799,6 +1750,18 @@ public class ModelFactory {
       // occluded
 
       metadata |= canBeOccluded ? 4 : 0;
+
+      if (rootKey != null) {
+        // Root impostors are closed synthetic prisms. Their faces must survive neighbour culling
+        // even when they sit at a depth the mesher would treat as occludable; otherwise only the
+        // top face is emitted and the root is not wrapped. Adjacent root cells may also differ in
+        // radius, so a shared face is still a visible step.
+        occludesFace = false;
+        canBeOccluded = false;
+        metadata &= ~1;
+        metadata &= ~4;
+        fullyOpaque = false;
+      }
 
       // Face uses its own lighting if its not flat against the adjacent block & isnt traslucent
       metadata |= (offset > 0.01 || layer == RenderType.translucent()) ? 0b1000 : 0;
@@ -817,6 +1780,10 @@ public class ModelFactory {
       // the end)
       int enc = Math.round(offset * 64);
       faceModelData |= Math.min(enc, 62) << 16;
+      if (PER_PIXEL_ROOT_DEPTH && rootKey != null && this.gl41OffscreenBakery == null) {
+        // gl46 only: the model-texture alpha of this face carries the per-pixel indentation.
+        faceModelData |= 1 << 26;
+      }
       // Still have 11 bits free
 
       // Stuff like fences are solid, however they have extra side piece that mean it needs to have
@@ -830,6 +1797,13 @@ public class ModelFactory {
       needsAlphaDiscard |= layer != RenderType.solid();
       needsAlphaDiscard &=
           layer != RenderType.translucent(); // Translucent doesnt have alpha discard
+      if (synthetic) {
+        // Synthetic root/shell impostors have irregular silhouettes (plus-shaped top, L-shaped
+        // side). The bounds-relative 0.9 test above misses junctions whose bounding box is nearly
+        // full, so their empty corners were solidified into opaque bark plates. Any synthetic face
+        // with a single unwritten pixel must discard.
+        needsAlphaDiscard |= writeCount < MODEL_TEXTURE_SIZE * MODEL_TEXTURE_SIZE;
+      }
       faceModelData |= needsAlphaDiscard ? 1 << 22 : 0;
       anyFaceNeedsDiscard |= needsAlphaDiscard;
 
@@ -839,7 +1813,11 @@ public class ModelFactory {
               : 0; // Alpha discard override, translucency doesnt have alpha discard
 
       // Bits 24,25 are tint metadata
-      if (colourProvider != null) { // We have a colour provider
+      // A provider returning -1 means "no tint". Marking those faces as tinted makes the shader
+      // multiply the texture by -1 (mapped to zero) => solid black leaves (Dynamic Trees species
+      // whose primitive leaves have no vanilla BlockColors entry, e.g. cherry/azalea/fir).
+      if (colourProvider != null
+          && (isBiomeColourDependent || entry.tintingColour != -1)) { // We have a real tint
         int tintState = TextureUtils.computeFaceTint(textureData[face], checkMode);
         if (tintState == 2) { // Partial tint
           faceModelData |= 1 << 24;
@@ -885,19 +1863,26 @@ public class ModelFactory {
           uploadPtr, -1); // Set the default to nothing so that its faster on the gpu
     } else if (!isBiomeColourDependent) {
       MemoryUtil.memPutInt(uploadPtr, entry.tintingColour);
-    } else if (!this.biomes.isEmpty()) {
-      // Populate the list of biomes for the model state
+    } else {
+      // Register the model even when no biome is known yet: it is flagged as biome-dependent
+      // regardless, and addBiome0 can only fill its colours if it is in this list. Otherwise the
+      // model permanently reads LUT slot 0 (zeroed buffer) => black leaves.
       int biomeIndex = this.modelsRequiringBiomeColours.size() * this.biomes.size();
       MemoryUtil.memPutInt(uploadPtr, biomeIndex);
       this.modelsRequiringBiomeColours.add(new Pair<>(modelId, blockState));
 
-      uploadResult.biomeUploadIndex = biomeIndex;
-      long clrUploadPtr =
-          (uploadResult.biomeUpload = new MemoryBuffer(4L * this.biomes.size())).address;
-      for (var biome : this.biomes) {
-        MemoryUtil.memPutInt(
-            clrUploadPtr, captureColourConstant(colourProvider, blockState, biome) | 0xFF000000);
-        clrUploadPtr += 4;
+      if (!this.biomes.isEmpty()) {
+        uploadResult.biomeUploadIndex = biomeIndex;
+        long clrUploadPtr =
+            (uploadResult.biomeUpload = new MemoryBuffer(4L * this.biomes.size())).address;
+        for (var biome : this.biomes) {
+          int colour =
+              biome == null
+                  ? -1
+                  : captureColourConstant(colourProvider, blockState, biome) | 0xFF000000;
+          MemoryUtil.memPutInt(clrUploadPtr, colour);
+          clrUploadPtr += 4;
+        }
       }
     }
     uploadPtr += 4;
@@ -919,15 +1904,28 @@ public class ModelFactory {
     // glGenerateTextureMipmap(this.textures.id);
 
     // Set the mapping at the very end
-    this.idMappings[blockId] = modelId;
+    if (variantKey != null) {
+      // Publish after the GPU upload, not here: a worker that reads this id would otherwise patch
+      // the section against an atlas slot that has not been written yet.
+      uploadResult.variantKey = variantKey;
+      uploadResult.variantModelId = modelId;
+    } else if (shellKey != null) {
+      uploadResult.shellModelKey = shellKey;
+      uploadResult.shellModelId = modelId;
+    } else if (rootKey != null) {
+      uploadResult.rootVariantKey = rootKey;
+      uploadResult.rootVariantModelId = modelId;
+    } else {
+      this.idMappings[blockId] = modelId;
 
-    this.blockStatesInFlightLock.lock();
-    if (!this.blockStatesInFlight.remove(blockId)) {
+      this.blockStatesInFlightLock.lock();
+      if (!this.blockStatesInFlight.remove(blockId)) {
+        this.blockStatesInFlightLock.unlock();
+        throw new IllegalStateException(
+            "processing a texture bake result but the block state was not in flight!!");
+      }
       this.blockStatesInFlightLock.unlock();
-      throw new IllegalStateException(
-          "processing a texture bake result but the block state was not in flight!!");
     }
-    this.blockStatesInFlightLock.unlock();
 
     return uploadResult;
   }
@@ -1028,13 +2026,15 @@ public class ModelFactory {
           Integer.toUnsignedLong(entry.left()) | (Integer.toUnsignedLong(biomeIndex) << 32));
       modelUpPtr += 8;
       long clrUploadPtr = result.biomeColourBuffer.address + biomeIndex * 4L;
+      // The shader indexes this LUT by raw biome id, and the biome list is sparse (null for ids
+      // not seen yet). Skipping nulls without advancing the pointer compacts the table and leaves
+      // its tail unwritten (black), so every id keeps its own slot.
       for (var biomeE : this.biomes) {
-        if (biomeE == null) {
-          continue; // If null, ignore
-        }
-        MemoryUtil.memPutInt(
-            clrUploadPtr,
-            captureColourConstant(colourProvider, entry.right(), biomeE) | 0xFF000000);
+        int colour =
+            biomeE == null
+                ? -1
+                : captureColourConstant(colourProvider, entry.right(), biomeE) | 0xFF000000;
+        MemoryUtil.memPutInt(clrUploadPtr, colour);
         clrUploadPtr += 4;
       }
     }
@@ -1219,6 +2219,409 @@ public class ModelFactory {
     return this.idMappings[blockId] != -1;
   }
 
+  /**
+   * Classifies a Mapper block id as a Dynamic Trees branch whose model fits one Voxy cell. Results
+   * are cached per block id; the underlying check is loader-agnostic (class hierarchy + optional
+   * {@code dynamictrees:branches} tag) and safe to call from meshing worker threads.
+   *
+   * <p>Thick branches (radius &gt; 8) are excluded: their baked model renders the trunk surface
+   * outside the block cell, so the per-cell rasterizer clips every face and the bake is empty.
+   */
+  public boolean isVariantEligibleBranchBlockId(int blockId) {
+    if (blockId <= 0 || blockId >= this.dynamicTreesBranchCache.length) {
+      return false;
+    }
+    byte cached = this.dynamicTreesBranchCache[blockId];
+    if (cached != 0) {
+      return cached == 1;
+    }
+    boolean result =
+        DynamicTreesBranches.isVariantSupported(this.mapper.getBlockStateFromBlockId(blockId));
+    this.dynamicTreesBranchCache[blockId] = result ? (byte) 1 : (byte) 2;
+    return result;
+  }
+
+  /** Cached per-block-id check: is this a thick (radius &gt; 8) Dynamic Trees branch? */
+  public boolean isThickBranchBlockId(int blockId) {
+    if (blockId <= 0 || blockId >= this.thickBranchCache.length) {
+      return false;
+    }
+    byte cached = this.thickBranchCache[blockId];
+    if (cached != 0) {
+      return cached == 1;
+    }
+    boolean result =
+        DynamicTreesBranches.isThickBranch(this.mapper.getBlockStateFromBlockId(blockId));
+    this.thickBranchCache[blockId] = result ? (byte) 1 : (byte) 2;
+    return result;
+  }
+
+  /** Resolves a Mapper block id to its BlockState (used by LOD0 shell patching). */
+  public BlockState getBlockStateForId(int blockId) {
+    return this.mapper.getBlockStateFromBlockId(blockId);
+  }
+
+  /** Cached per-block-id check for {@code dynamictrees:trunk_shell}. */
+  public boolean isTrunkShellBlockId(int blockId) {
+    if (blockId <= 0 || blockId >= this.trunkShellCache.length) {
+      return false;
+    }
+    byte cached = this.trunkShellCache[blockId];
+    if (cached != 0) {
+      return cached == 1;
+    }
+    boolean result =
+        DynamicTreesBranches.isTrunkShell(this.mapper.getBlockStateFromBlockId(blockId));
+    this.trunkShellCache[blockId] = result ? (byte) 1 : (byte) 2;
+    return result;
+  }
+
+  /**
+   * Model id of the thick-trunk prism piece inside the cell at {@code (dx, dz)} from the core.
+   * Returns {@link #VARIANT_MODEL_NOT_READY} while the bake is queued, or {@link
+   * #VARIANT_MODEL_UNAVAILABLE} when the piece does not exist / failed to bake.
+   */
+  public int getShellModelId(int coreBlockId, int dx, int dz, int capBits) {
+    Integer id = this.shellModelIds.get(new ShellModelKey(coreBlockId, dx, dz, capBits));
+    return id == null ? VARIANT_MODEL_UNAVAILABLE : id;
+  }
+
+  /** Cached per-block-id check for Dynamic Trees surface roots. */
+  public boolean isSurfaceRootBlockId(int blockId) {
+    if (blockId <= 0 || blockId >= this.surfaceRootCache.length) {
+      return false;
+    }
+    byte cached = this.surfaceRootCache[blockId];
+    if (cached != 0) {
+      return cached == 1;
+    }
+    boolean result =
+        DynamicTreesBranches.isSurfaceRoot(this.mapper.getBlockStateFromBlockId(blockId));
+    this.surfaceRootCache[blockId] = result ? (byte) 1 : (byte) 2;
+    return result;
+  }
+
+  /**
+   * Looks up the synthetic crown model id for a surface root. {@code flags} bit 0..3 = connected to
+   * north/east/south/west. Returns {@link #VARIANT_MODEL_NOT_READY} while queued, {@link
+   * #VARIANT_MODEL_UNAVAILABLE} when the base model must be used.
+   */
+  public int getRootVariantModelId(
+      int blockId,
+      int sideRadii,
+      int sideLevels,
+      int coreBlockId,
+      int coreDx,
+      int coreDz,
+      BlockState[] cube) {
+    if (!this.variantBakingSupported || cube == null) {
+      // The exact DT model can only be baked from a captured context cube. A null cube would
+      // poison the key (the first caller wins the stored cube) and every later request would
+      // reuse that failure, so reject it up front.
+      return VARIANT_MODEL_UNAVAILABLE;
+    }
+    RootCrownKey key =
+        new RootCrownKey(blockId, sideRadii, sideLevels, coreBlockId, coreDx, coreDz);
+    Integer existing = this.rootVariantModelIds.get(key);
+    if (existing != null) {
+      return existing;
+    }
+    if (this.variantsCapped
+        || this.modelIdCount.get() >= MAX_MODEL_ID_COUNT - BASE_MODEL_ID_RESERVE) {
+      return VARIANT_MODEL_UNAVAILABLE;
+    }
+    if (this.rootVariantActive.get() >= MAX_ROOT_VARIANT_MODEL_COUNT) {
+      if (this.rootVariantCapLogged.compareAndSet(false, true)) {
+        Logger.warn(
+            "Dynamic Trees surface-root variants capped at "
+                + MAX_ROOT_VARIANT_MODEL_COUNT
+                + " distinct contexts; further roots keep the base model");
+      }
+      return VARIANT_MODEL_UNAVAILABLE;
+    }
+    existing = this.rootVariantModelIds.putIfAbsent(key, VARIANT_MODEL_NOT_READY);
+    if (existing != null) {
+      return existing;
+    }
+    // Replace rather than putIfAbsent: after a transient bake failure the key is removed but the
+    // old cube would survive, and the retry must bake the context seen now, not a stale one.
+    this.rootCubes.put(key, cube);
+    this.rootVariantActive.incrementAndGet();
+    this.variantRequestCount.incrementAndGet();
+    this.rootVariantRequestCount.incrementAndGet();
+    this.rootVariantInflight.incrementAndGet();
+    this.rootVariantBakeQueue.add(key);
+    if (this.rootVariantActiveLogged.compareAndSet(false, true)) {
+      Logger.info(
+          "Dynamic Trees surface-root variants active, first request "
+              + key
+              + " state "
+              + this.mapper.getBlockStateFromBlockId(blockId));
+    }
+    return VARIANT_MODEL_NOT_READY;
+  }
+
+  /**
+   * Dynamic Trees thick branches (radius &gt; 8) paint their bark in the eight neighbouring block
+   * cells (a 3x3x1 prism); a per-cell rasterizer cannot capture that, and the branch's own cell
+   * contains at most a thin cap. Substitute a full bark cube so the trunk column stays solid at
+   * every LOD. Returns null for every other block.
+   */
+  private @Nullable BakedModel thickBranchModelFor(BlockState state) {
+    if (!DynamicTreesBranches.isThickBranch(state)) {
+      return null;
+    }
+    Optional<BakedModel> cached = this.thickBranchSolidModels.get(state);
+    if (cached == null || cached.isEmpty()) {
+      // Never cache an empty Optional permanently: the particle-sprite lookup can fail
+      // transiently during a resource reload, and computeIfAbsent used to make the trunk prism
+      // and every composite root shell disappear for the rest of the session.
+      cached = this.createThickBranchModel(state);
+      if (cached.isPresent()) {
+        this.thickBranchSolidModels.put(state, cached);
+      }
+    }
+    return cached.orElse(null);
+  }
+
+  private Optional<BakedModel> createThickBranchModel(BlockState thickState) {
+    try {
+      TextureAtlasSprite sprite =
+          Minecraft.getInstance()
+              .getModelManager()
+              .getBlockModelShaper()
+              .getBlockModel(thickState)
+              .getParticleIcon();
+      if (sprite == null) {
+        Logger.warn("No particle sprite for Dynamic Trees thick branch " + thickState);
+        return Optional.empty();
+      }
+      return Optional.of(new SolidBarkBakedModel(sprite));
+    } catch (Throwable t) {
+      Logger.warn("Could not build the bark cube for Dynamic Trees thick branch " + thickState, t);
+      return Optional.empty();
+    }
+  }
+
+  /**
+   * Bakes the eight prism pieces that surround a thick trunk core. Their models are patched into
+   * {@code trunk_shell} cells at LOD0 meshing time so the trunk keeps DT's real width (2x2/3x3)
+   * instead of a single block. Runs right after the core's solid-cube bake.
+   */
+  private void bakeThickShells(int coreBlockId, BlockState coreState) {
+    Optional<BakedModel> solid = this.thickBranchSolidModels.get(coreState);
+    if (solid == null || solid.isEmpty()) {
+      solid = this.createThickBranchModel(coreState);
+      if (solid.isPresent()) {
+        this.thickBranchSolidModels.put(coreState, solid);
+      }
+    }
+    if (solid.isEmpty() || !(solid.get() instanceof SolidBarkBakedModel bark)) {
+      return;
+    }
+    int radius = DynamicTreesBranches.radiusOf(coreState);
+    if (radius <= DynamicTreesBranches.MAX_CELL_RADIUS) {
+      return;
+    }
+    if (this.variantsCapped
+        || this.modelIdCount.get() >= MAX_MODEL_ID_COUNT - BASE_MODEL_ID_RESERVE) {
+      // Shell models are derived variants and must respect the same id-space guard as branches
+      // and roots; 4 cap variants per cell multiply their consumption.
+      for (int dx = -1; dx <= 1; dx++) {
+        for (int dz = -1; dz <= 1; dz++) {
+          if (dx == 0 && dz == 0) {
+            continue;
+          }
+          for (int capBits = 0; capBits < 4; capBits++) {
+            this.shellModelIds.putIfAbsent(
+                new ShellModelKey(coreBlockId, dx, dz, capBits), VARIANT_MODEL_UNAVAILABLE);
+          }
+        }
+      }
+      return;
+    }
+    for (int dx = -1; dx <= 1; dx++) {
+      for (int dz = -1; dz <= 1; dz++) {
+        if (dx == 0 && dz == 0) {
+          continue;
+        }
+        for (int capBits = 0; capBits < 4; capBits++) {
+          ShellModelKey key = new ShellModelKey(coreBlockId, dx, dz, capBits);
+          if (this.shellModelIds.putIfAbsent(key, VARIANT_MODEL_NOT_READY) != null) {
+            continue;
+          }
+          try {
+            BakedModel shellModel =
+                new ThickTrunkShellBakedModel(
+                    bark.sprite(), radius, dx, dz, (capBits & 1) != 0, (capBits & 2) != 0);
+            ColourDepthTextureData[] textureData;
+            boolean shaded;
+            boolean darkened;
+            if (this.bakery2 != null) {
+              int flags =
+                  this.bakery2.renderToOutput(coreState, this.bakeScratchBuffer, null, shellModel);
+              textureData = this.readSoftwareBakeTextures();
+              shaded = (flags & 1) != 0;
+              darkened = (flags & 2) != 0;
+            } else {
+              var result = this.gl41OffscreenBakery.bake(coreState, null, shellModel);
+              if (result.fallbackReason() != FALLBACK_NONE) {
+                this.shellModelIds.put(key, VARIANT_MODEL_UNAVAILABLE);
+                continue;
+              }
+              textureData = result.faces();
+              shaded = result.shaded();
+              darkened = result.darkenedTextures();
+            }
+            int writtenPixels = 0;
+            for (ColourDepthTextureData face : textureData) {
+              writtenPixels +=
+                  TextureUtils.getWrittenPixelCount(face, TextureUtils.WRITE_CHECK_STENCIL);
+            }
+            if (writtenPixels == 0) {
+              // Degenerate sliver (tiny radius in a far cell): leave the cell air rather than
+              // installing an invisible model.
+              this.shellModelIds.put(key, VARIANT_MODEL_UNAVAILABLE);
+              continue;
+            }
+            var upload =
+                this.processTextureBakeResult(
+                    coreBlockId,
+                    coreState,
+                    textureData,
+                    shaded,
+                    darkened,
+                    RenderType.solid(),
+                    FALLBACK_NONE,
+                    null,
+                    key,
+                    null);
+            if (upload != null) {
+              this.uploadResults.add(upload);
+            }
+          } catch (Throwable t) {
+            this.shellModelIds.put(key, VARIANT_MODEL_UNAVAILABLE);
+            if (this.shellFailureLogCount.incrementAndGet() <= 8) {
+              Logger.warn("Failed to bake thick trunk shell " + key, t);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * Looks up the per-position model id for a Dynamic Trees branch. The six ints are the neighbour
+   * block state ids in Direction.get3DDataValue order (DOWN, UP, NORTH, SOUTH, WEST, EAST).
+   *
+   * @return the variant model id, {@link #VARIANT_MODEL_NOT_READY} if a bake was requested and the
+   *     caller must retry, or {@link #VARIANT_MODEL_UNAVAILABLE} if the base model must be used
+   */
+  public int getVariantModelId(
+      int blockId, int down, int up, int north, int south, int west, int east) {
+    if (!this.variantBakingSupported) {
+      return VARIANT_MODEL_UNAVAILABLE;
+    }
+    VariantKey key = new VariantKey(blockId, down, up, north, south, west, east);
+    // Existing entries stay usable even after the cap fired: disabling only new requests avoids
+    // silently reverting already-baked geometry to the base model on remesh.
+    Integer existing = this.variantModelIds.get(key);
+    if (existing != null) {
+      return existing;
+    }
+    if (this.variantsCapped || !this.canRequestVariantModel()) {
+      return VARIANT_MODEL_UNAVAILABLE;
+    }
+    existing = this.variantModelIds.putIfAbsent(key, VARIANT_MODEL_NOT_READY);
+    if (existing != null) {
+      return existing;
+    }
+    this.variantActiveCount.incrementAndGet();
+    this.variantRequestCount.incrementAndGet();
+    this.branchVariantRequestCount.incrementAndGet();
+    this.variantInflightCount.incrementAndGet();
+    this.variantBakeQueue.add(key);
+    return VARIANT_MODEL_NOT_READY;
+  }
+
+  private boolean canRequestVariantModel() {
+    if (this.modelIdCount.get() >= MAX_MODEL_ID_COUNT - BASE_MODEL_ID_RESERVE) {
+      this.capVariants("16-bit model id space is nearly full");
+      return false;
+    }
+    // Failed (-2) entries do not consume a slot; only live/in-flight variants count toward the
+    // soft cap, otherwise a burst of failures would disable the feature for the session.
+    if (this.variantActiveCount.get() >= MAX_VARIANT_MODEL_COUNT) {
+      this.capVariants("variant model cap (" + MAX_VARIANT_MODEL_COUNT + ") reached");
+      return false;
+    }
+    return true;
+  }
+
+  private synchronized void capVariants(String reason) {
+    if (!this.variantsCapped) {
+      this.variantsCapped = true;
+      Logger.warn(
+          "Dynamic Trees LOD0 branch variants disabled, falling back to base models: " + reason);
+    }
+  }
+
+  /** True when the active loader can bake neighbour-dependent block models. */
+  public boolean supportsVariantModels() {
+    return this.variantBakingSupported;
+  }
+
+  /** True while variant bake requests are queued for the render-thread/sink bakery. */
+  public boolean hasQueuedVariantBakes() {
+    return !this.variantBakeQueue.isEmpty() || !this.rootVariantBakeQueue.isEmpty();
+  }
+
+  public int getVariantInflightCount() {
+    return this.variantInflightCount.get() + this.rootVariantInflight.get();
+  }
+
+  public int getVariantSuccessCount() {
+    return this.variantSuccessCount.get();
+  }
+
+  public int getVariantFailureCount() {
+    return this.variantFailureCount.get();
+  }
+
+  public int getVariantRequestCount() {
+    return this.variantRequestCount.get();
+  }
+
+  public int getVariantDedupeBaseCount() {
+    return this.variantDedupeBaseCount.get();
+  }
+
+  public int getBranchVariantRequestCount() {
+    return this.branchVariantRequestCount.get();
+  }
+
+  public int getBranchVariantSuccessCount() {
+    return this.branchVariantSuccessCount.get();
+  }
+
+  public int getRootVariantRequestCount() {
+    return this.rootVariantRequestCount.get();
+  }
+
+  public int getRootVariantSuccessCount() {
+    return this.rootVariantSuccessCount.get();
+  }
+
+  /** Live branch + root variant entries currently holding a model id slot. */
+  public int getVariantActiveCount() {
+    return this.variantActiveCount.get() + this.rootVariantActive.get();
+  }
+
+  /** High-water mark of the shared model id space (base, variant and root models). */
+  public int getModelIdCount() {
+    return this.modelIdCount.get();
+  }
+
   public int getFluidClientStateId(int clientBlockStateId) {
     int map = this.fluidStateLUT[clientBlockStateId];
     if (map == -1) {
@@ -1254,6 +2657,8 @@ public class ModelFactory {
     size += this.uploadResults.size();
     size += this.biomeQueue.size();
     size += this.bakeQueue.size();
+    size += this.variantInflightCount.get();
+    size += this.rootVariantInflight.get();
     return size;
   }
 

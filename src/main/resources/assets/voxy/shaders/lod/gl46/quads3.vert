@@ -25,6 +25,13 @@ layout(location = 0) out flat uvec4 interData;
 layout(location = 1) out vec2 uv;
 #endif
 
+#if !defined(PATCHED_SHADER) && !defined(TRANSLUCENT)
+layout(location = 2) out flat float vBaseIndent;
+layout(location = 3) out flat float vDepthA;
+layout(location = 4) out flat float vDepthB;
+layout(location = 5) out float vClipW;
+#endif
+
 #ifdef USE_NV_JANK
 #ifdef GL_NV_gpu_shader5
 out gl_PerVertex {
@@ -58,6 +65,17 @@ void main() {
     #endif
     #endif
     (getQuadCornerPos(quad, cornerId));
+
+    #if !defined(PATCHED_SHADER) && !defined(TRANSLUCENT)
+    float sgn = (quad.face & 1u) == 0u ? 1.0 : -1.0;
+    vec3 inward = swizzelDataAxis(quad.face >> 1, vec3(0.0, 0.0, sgn));
+    vBaseIndent = quad.baseIndent;
+    vDepthA = dot(MVP[2].xyz, inward) * quad.lodScale;
+    vDepthB = dot(MVP[3].xyz, inward) * quad.lodScale;
+    // Compute from the source vec4, not gl_Position: the USE_NV_JANK path redeclares it as
+    // f16vec4 and reading .w from it would change the precision of the depth correction.
+    vClipW = getQuadCornerPos(quad, cornerId).w;
+    #endif
 
 
     #ifndef USE_NV_BARRY

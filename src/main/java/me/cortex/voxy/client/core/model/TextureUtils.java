@@ -72,6 +72,7 @@ public class TextureUtils {
   public static final int DEPTH_MODE_AVG = 1;
   public static final int DEPTH_MODE_MAX = 2;
   public static final int DEPTH_MODE_MIN = 3;
+  public static final int DEPTH_MODE_MEDIAN = 4;
 
   // Computes depth info based on written pixel data
   public static float computeDepth(ColourDepthTextureData texture, int mode, int checkMode) {
@@ -94,6 +95,8 @@ public class TextureUtils {
     if (mode == DEPTH_MODE_MAX) {
       a = Long.MIN_VALUE;
     }
+    int[] samples = mode == DEPTH_MODE_MEDIAN ? new int[16 * 16] : null;
+    int sampleCount = 0;
     for (int i = 0; i < colourData.length; i++) {
       if (!wasPixelWritten(texture, checkMode, i)) {
         continue;
@@ -106,6 +109,8 @@ public class TextureUtils {
         a = Math.max(a, depth);
       } else if (mode == DEPTH_MODE_MIN) {
         a = Math.min(a, depth);
+      } else if (mode == DEPTH_MODE_MEDIAN) {
+        samples[sampleCount++] = depth;
       }
     }
 
@@ -124,6 +129,12 @@ public class TextureUtils {
         return -1;
       }
       return u2fdepth((int) a, halfDepthRange);
+    } else if (mode == DEPTH_MODE_MEDIAN) {
+      if (sampleCount == 0) {
+        return -1;
+      }
+      Arrays.sort(samples, 0, sampleCount);
+      return u2fdepth(samples[sampleCount / 2], halfDepthRange);
     }
     throw new IllegalArgumentException();
   }
@@ -140,6 +151,33 @@ public class TextureUtils {
       }
     }
     return depthF;
+  }
+
+  /**
+   * Encodes the per-pixel indentation of a root model into the texture alpha channel.
+   *
+   * <p>Written pixels become {@code 128 + round(depth * 127)} (7-bit depth in 0..1), transparent
+   * pixels stay 0. The gl46 shader decodes this only for faces flagged with the per-pixel-depth bit
+   * and displaces those fragments along the face normal; every other model keeps the old
+   * single-indentation behaviour and its alpha semantics.
+   */
+  public static void encodeRootPixelDepth(ColourDepthTextureData[] faces, int checkMode) {
+    for (int f = 0; f < faces.length; f++) {
+      ColourDepthTextureData src = faces[f];
+      int[] colour = src.colour().clone();
+      int[] depth = src.depth();
+      for (int i = 0; i < colour.length; i++) {
+        int rgb = colour[i] & 0x00FFFFFF;
+        if (!wasPixelWritten(src, checkMode, i)) {
+          colour[i] = rgb;
+          continue;
+        }
+        int d24 = depth[i] >>> 8;
+        int enc = 128 + (int) (((long) d24 * 127L + (1 << 23)) >>> 24);
+        colour[i] = rgb | (enc << 24);
+      }
+      faces[f] = new ColourDepthTextureData(colour, depth, src.width(), src.height());
+    }
   }
 
   public static long[] generateMask(ColourDepthTextureData data, int checkMode) {

@@ -1,6 +1,7 @@
 package me.cortex.voxy.client.core.rendering.building;
 
 import java.util.Arrays;
+import me.cortex.voxy.client.core.model.DTRootGeometryCache;
 import me.cortex.voxy.client.core.model.IdNotYetComputedException;
 import me.cortex.voxy.client.core.model.ModelFactory;
 import me.cortex.voxy.client.core.model.ModelQueries;
@@ -10,7 +11,11 @@ import me.cortex.voxy.common.util.MemoryBuffer;
 import me.cortex.voxy.common.util.UnsafeUtil;
 import me.cortex.voxy.common.world.WorldEngine;
 import me.cortex.voxy.common.world.WorldSection;
+import me.cortex.voxy.common.world.other.DynamicTreesBranches;
 import me.cortex.voxy.common.world.other.Mapper;
+import net.minecraft.core.Direction;
+import net.minecraft.core.SectionPos;
+import net.minecraft.world.level.block.state.BlockState;
 import org.lwjgl.system.MemoryUtil;
 
 public class RenderDataFactory {
@@ -55,6 +60,30 @@ public class RenderDataFactory {
   private final long[] sectionData = new long[32 * 32 * 32 * 2];
   private final long[] neighboringFaces = new long[32 * 32 * 6];
   // private final int[] neighboringOpaqueMasks = new int[32*6];
+
+  // LOD0 Dynamic Trees branch blocks, recorded during prepareSectionData and resolved to a
+  // per-position variant model id after acquireNeighborData has filled neighboringFaces.
+  private final int[] variantBlockIndices = new int[32 * 32 * 32];
+  private int variantBlockCount = 0;
+  // LOD0 thick-trunk shell cells (dynamictrees:trunk_shell next to a thick branch core).
+  private final int[] shellBlockIndices = new int[32 * 32 * 32];
+  private int shellBlockCount = 0;
+  // LOD0 Dynamic Trees surface roots (3x3x3 neighbour context).
+  private final int[] rootBlockIndices = new int[32 * 32 * 32];
+  private int rootBlockCount = 0;
+  // True-geometry overlay: exact root cells captured for the vanilla render pass.
+  private final java.util.List<DTRootGeometryCache.RootBlock> overlayRoots =
+      new java.util.ArrayList<>();
+
+  // One-shot LOD0 diagnostics: prove from the log whether root/shell variants are actually
+  // applied in a section and which fallback dominates.
+  private int rootPatchedCount = 0;
+  private int rootUnavailableCount = 0;
+  private int rootMaskRejectedCount = 0;
+  private int shellPatchedCount = 0;
+  private int shellUnavailableCount = 0;
+  private static final java.util.concurrent.atomic.AtomicInteger SECTION_DIAG_LOGS =
+      new java.util.concurrent.atomic.AtomicInteger();
 
   private final int[] opaqueMasks = new int[32 * 32];
   private final int[] nonOpaqueMasks = new int[32 * 32];
@@ -244,9 +273,11 @@ public class RenderDataFactory {
     return quadData;
   }
 
-  private int prepareSectionData(final long[] rawSectionData) {
+  private int prepareSectionData(final long[] rawSectionData, boolean lod0) {
     final var sectionData = this.sectionData;
     final var rawModelIds = this.modelMan._unsafeRawAccess();
+    final long airMetadata = this.modelMan.getModelMetadataFromClientId(0);
+    final boolean collectVariants = lod0 && this.modelMan.supportsVariantModels();
     long opaque = 0;
     long notEmpty = 0;
     long pureFluid = 0;
@@ -261,13 +292,40 @@ public class RenderDataFactory {
           sectionData[i * 2] = (block & (0xFFL << 56)) >>> 1;
           sectionData[i * 2 + 1] = 0;
         } else {
-          int modelId = rawModelIds[Mapper.getBlockId(block)];
+          int blockId = Mapper.getBlockId(block);
+          int modelId = rawModelIds[blockId];
           if (modelId == -1) { // Failed, so just return error
-            return Mapper.getBlockId(block) | (1 << 31);
+            return blockId | (1 << 31);
+          }
+          if (collectVariants
+              && modelId != 0
+              && this.modelMan.isVariantEligibleBranchBlockId(blockId)) {
+            this.variantBlockIndices[this.variantBlockCount++] = i;
+          }
+          boolean trunkShellForLod0 = false;
+          if (collectVariants && this.modelMan.isTrunkShellBlockId(blockId)) {
+            // Shell states bake to the empty/air model, so they are collected by block id and
+            // marked non-empty below so the mesher traverses the cell after it is patched.
+            this.shellBlockIndices[this.shellBlockCount++] = i;
+            trunkShellForLod0 = true;
+          }
+          boolean rootForLod0 = false;
+          if (collectVariants && this.modelMan.isSurfaceRootBlockId(blockId)) {
+            this.rootBlockIndices[this.rootBlockCount++] = i;
+            rootForLod0 = true;
           }
           if (modelId == 0) { // modelId == 0, its basicly air so set it as air
             sectionData[i * 2] = (block & (0xFFL << 56)) >>> 1;
-            sectionData[i * 2 + 1] = 0;
+            boolean mayGetVariant = trunkShellForLod0 || rootForLod0;
+            // Use the air model's real metadata for candidates: metadata 0 makes faceExists()
+            // true for every face and would emit phantom model-0 quads if the variant never
+            // resolves.
+            sectionData[i * 2 + 1] = mayGetVariant ? airMetadata : 0;
+            if (mayGetVariant) {
+              // Non-opaque candidate: the variant resolver may install geometry here (root base
+              // models can dedupe to air, e.g. grounded=false DT 1.7.x roots).
+              notEmpty |= 1L << j;
+            }
           } else {
             // TODO: cache the results of this, then link it to `block` do same optimization as
             // SaveLoadSystem3
@@ -392,6 +450,617 @@ public class RenderDataFactory {
       sec.release(WorldSection.RELEASE_HINT_POSSIBLE_REUSE);
     }
   }
+
+  // Sentinel for "the face slice needed to resolve this neighbour was not acquired". Air is a
+  // valid block id (0), so a distinct value is required.
+  private static final int NEIGHBOR_UNAVAILABLE = -1;
+
+  /**
+   * Reads a neighbour block id from the section or from the boundary face slices filled by {@link
+   * #acquireNeighborData}. Raw section layout is {@code x + 32*z + 1024*y}; the six
+   * neighboringFaces slices use their own 2D packing, matching acquireNeighborData.
+   */
+  private int getNeighborBlockId(
+      long[] rawSectionData, int idx, Direction direction, int neighborMsk) {
+    int x = idx & 31;
+    int z = (idx >> 5) & 31;
+    int y = idx >> 10;
+    switch (direction) {
+      case DOWN: // -y
+        if (y > 0) {
+          return Mapper.getBlockId(rawSectionData[idx - 32 * 32]);
+        }
+        if ((neighborMsk & 4) == 0) return NEIGHBOR_UNAVAILABLE;
+        return Mapper.getBlockId(this.neighboringFaces[2 * 32 * 32 + x + (z << 5)]);
+      case UP: // +y
+        if (y < 31) {
+          return Mapper.getBlockId(rawSectionData[idx + 32 * 32]);
+        }
+        if ((neighborMsk & 8) == 0) return NEIGHBOR_UNAVAILABLE;
+        return Mapper.getBlockId(this.neighboringFaces[3 * 32 * 32 + x + (z << 5)]);
+      case NORTH: // -z
+        if (z > 0) {
+          return Mapper.getBlockId(rawSectionData[idx - 32]);
+        }
+        if ((neighborMsk & 16) == 0) return NEIGHBOR_UNAVAILABLE;
+        return Mapper.getBlockId(this.neighboringFaces[4 * 32 * 32 + x + (y << 5)]);
+      case SOUTH: // +z
+        if (z < 31) {
+          return Mapper.getBlockId(rawSectionData[idx + 32]);
+        }
+        if ((neighborMsk & 32) == 0) return NEIGHBOR_UNAVAILABLE;
+        return Mapper.getBlockId(this.neighboringFaces[5 * 32 * 32 + x + (y << 5)]);
+      case WEST: // -x
+        if (x > 0) {
+          return Mapper.getBlockId(rawSectionData[idx - 1]);
+        }
+        if ((neighborMsk & 1) == 0) return NEIGHBOR_UNAVAILABLE;
+        return Mapper.getBlockId(this.neighboringFaces[y * 32 + z]);
+      case EAST: // +x
+        if (x < 31) {
+          return Mapper.getBlockId(rawSectionData[idx + 1]);
+        }
+        if ((neighborMsk & 2) == 0) return NEIGHBOR_UNAVAILABLE;
+        return Mapper.getBlockId(this.neighboringFaces[32 * 32 + y * 32 + z]);
+      default:
+        return NEIGHBOR_UNAVAILABLE;
+    }
+  }
+
+  /**
+   * Replaces the base model id of every recorded Dynamic Trees branch block with its per-position
+   * variant model id. Must run after {@link #acquireNeighborData} (boundary neighbours) and before
+   * face generation (masks were built from the base model; branches are non-opaque and non-fluid in
+   * both cases).
+   */
+  private void resolveBranchVariants(long[] rawSectionData, int neighborMsk) {
+    final var rawModelIds = this.modelMan._unsafeRawAccess();
+    // Collect/request every not-ready variant in this pass and only then abort the section once.
+    // Throwing on the first miss forced one full section rebuild per distinct neighbour
+    // combination (prepareSectionData + neighbour acquisition), which serializes badly in forests.
+    boolean anyNotReady = false;
+    int notReadyBlockId = 0;
+    for (int i = 0; i < this.variantBlockCount; i++) {
+      int idx = this.variantBlockIndices[i];
+      int down = this.getNeighborBlockId(rawSectionData, idx, Direction.DOWN, neighborMsk);
+      int up = this.getNeighborBlockId(rawSectionData, idx, Direction.UP, neighborMsk);
+      int north = this.getNeighborBlockId(rawSectionData, idx, Direction.NORTH, neighborMsk);
+      int south = this.getNeighborBlockId(rawSectionData, idx, Direction.SOUTH, neighborMsk);
+      int west = this.getNeighborBlockId(rawSectionData, idx, Direction.WEST, neighborMsk);
+      int east = this.getNeighborBlockId(rawSectionData, idx, Direction.EAST, neighborMsk);
+      if (down == NEIGHBOR_UNAVAILABLE
+          || up == NEIGHBOR_UNAVAILABLE
+          || north == NEIGHBOR_UNAVAILABLE
+          || south == NEIGHBOR_UNAVAILABLE
+          || west == NEIGHBOR_UNAVAILABLE
+          || east == NEIGHBOR_UNAVAILABLE) {
+        // Boundary slice was not acquired; keep the base model rather than guessing.
+        continue;
+      }
+
+      int blockId = Mapper.getBlockId(rawSectionData[idx]);
+      int variantModelId =
+          this.modelMan.getVariantModelId(blockId, down, up, north, south, west, east);
+      if (variantModelId == ModelFactory.VARIANT_MODEL_NOT_READY) {
+        // Lazy bake requested by getVariantModelId. Keep requesting the remaining variants so a
+        // single retry can satisfy the whole section, then let the existing retry mechanism
+        // re-run this section once the bakes land.
+        anyNotReady = true;
+        if (notReadyBlockId == 0) {
+          notReadyBlockId = blockId;
+        }
+        continue;
+      }
+      if (variantModelId <= 0) {
+        continue; // VARIANT_MODEL_UNAVAILABLE, or the empty/air model: keep the base model.
+      }
+
+      long block = rawSectionData[idx];
+      long metadata = this.modelMan.getModelMetadataFromClientId(variantModelId);
+      // The opaque/fluid masks were built from the base model metadata. Dynamic Trees branches are
+      // non-opaque and non-fluid in both forms, but keep the base model if that invariant ever
+      // breaks so the face masks cannot disagree with the patched model id.
+      long baseMetadata = this.modelMan.getModelMetadataFromClientId(rawModelIds[blockId]);
+      if (ModelQueries._isFullyOpaque(baseMetadata) != ModelQueries._isFullyOpaque(metadata)
+          || ModelQueries._isFluid(baseMetadata) != ModelQueries._isFluid(metadata)
+          || ModelQueries._containsFluid(baseMetadata) != ModelQueries._containsFluid(metadata)) {
+        // Only the bits that feed the already-built section masks (opaque/fluid) must agree.
+        // Per-face layout bits (double-sided, alpha discard) legitimately differ between the
+        // connectionless base model and the neighbour-aware variant; comparing them rejected
+        // every mid-trunk variant and reverted those cells to the capped base geometry.
+        if (VARIANT_MASK_REJECT_LOG.compareAndSet(false, true)) {
+          Logger.warn(
+              "Dynamic Trees variant skipped: opaque/fluid mask mismatch for block "
+                  + blockId
+                  + " (base="
+                  + baseMetadata
+                  + ", variant="
+                  + metadata
+                  + ")");
+        }
+        continue;
+      }
+      this.sectionData[idx * 2] = packPartialQuadData(variantModelId, block, metadata);
+      this.sectionData[idx * 2 + 1] = metadata;
+    }
+    if (anyNotReady) {
+      throw new IdNotYetComputedException(notReadyBlockId, false);
+    }
+  }
+
+  /**
+   * Replaces the (empty) model of each {@code trunk_shell} cell adjacent to a thick Dynamic Trees
+   * trunk with the pre-baked prism piece for that cell. This restores the trunk's real 2x2/3x3
+   * width at LOD0; a plain bark cube only covered the core cell.
+   */
+  private void resolveTrunkShells(long[] rawSectionData, int neighborMsk) {
+    boolean anyNotReady = false;
+    int notReadyBlockId = 0;
+    for (int i = 0; i < this.shellBlockCount; i++) {
+      int idx = this.shellBlockIndices[i];
+      int shellBlockId = Mapper.getBlockId(rawSectionData[idx]);
+      int[] coreDir = DynamicTreesBranches.coreDir(this.modelMan.getBlockStateForId(shellBlockId));
+      if (coreDir == null) {
+        continue;
+      }
+      int cdx = coreDir[0];
+      int cdz = coreDir[1];
+      int x = idx & 31;
+      int z = (idx >> 5) & 31;
+      int y = idx >> 10;
+      int coreX = x + cdx;
+      int coreZ = z + cdz;
+      int coreBlockId;
+      if (coreX >= 0 && coreX < 32 && coreZ >= 0 && coreZ < 32) {
+        coreBlockId = Mapper.getBlockId(rawSectionData[coreX + 32 * coreZ + 1024 * y]);
+      } else if (cdx == 0 || cdz == 0) {
+        // Cardinal core across a section border: the neighbour slice holds the same y layer.
+        Direction dir =
+            cdx < 0
+                ? Direction.WEST
+                : cdx > 0 ? Direction.EAST : cdz < 0 ? Direction.NORTH : Direction.SOUTH;
+        int id = this.getNeighborBlockId(rawSectionData, idx, dir, neighborMsk);
+        if (id == NEIGHBOR_UNAVAILABLE) {
+          continue;
+        }
+        coreBlockId = id;
+      } else {
+        // Diagonal core across a section border: no slice available, keep the cell empty.
+        continue;
+      }
+      if (coreBlockId <= 0 || !this.modelMan.isThickBranchBlockId(coreBlockId)) {
+        continue;
+      }
+      int capBits = 0;
+      BlockState coreState = this.modelMan.getBlockStateForId(coreBlockId);
+      int coreRadius = DynamicTreesBranches.radiusOf(coreState);
+      int coreUp = this.readRootNeighbourId(rawSectionData, x, y, z, cdx, 1, cdz, neighborMsk);
+      if (coreUp < 0
+          || !(this.modelMan.isThickBranchBlockId(coreUp)
+              && DynamicTreesBranches.radiusOf(this.modelMan.getBlockStateForId(coreUp))
+                  >= coreRadius)) {
+        // Vanilla emits the trunk's top cap where the connection above is thinner (or absent).
+        capBits |= 1;
+      }
+      int coreDown = this.readRootNeighbourId(rawSectionData, x, y, z, cdx, -1, cdz, neighborMsk);
+      if (coreDown < 0) {
+        // Context outside this section: keep the conservative cap rather than risk a hole.
+        capBits |= 2;
+      } else {
+        BlockState downState = this.stateForIdSafe(coreDown);
+        int connDown;
+        if (this.modelMan.isThickBranchBlockId(coreDown)) {
+          // DT compares the raw connection radius with the core radius, so a thinner thick trunk
+          // below still gets a bottom bark cap (the old "any thick below" test skipped it and
+          // left an annular hole at downward radius steps).
+          connDown = DynamicTreesBranches.radiusOf(downState);
+        } else if (DynamicTreesBranches.isAirOrWater(downState)
+            || this.modelMan.isSurfaceRootBlockId(coreDown)) {
+          connDown = 0;
+        } else {
+          // Soil and other tree parts report a connection radius of at least 1 (rooty soil: 8).
+          connDown = 8;
+        }
+        boolean capDown = connDown < coreRadius;
+        if (capDown && connDown < 1) {
+          // DT's DOWN ring query is empty, so for a twig-sized connection it draws no bottom face
+          // unless horizontal branches exist around the core.
+          capDown = this.coreHasHorizontalBranch(rawSectionData, x, y, z, cdx, cdz, neighborMsk);
+        }
+        if (capDown) {
+          capBits |= 2;
+        }
+      }
+      int shellModelId = this.modelMan.getShellModelId(coreBlockId, -cdx, -cdz, capBits);
+      if (shellModelId == ModelFactory.VARIANT_MODEL_NOT_READY) {
+        anyNotReady = true;
+        if (notReadyBlockId == 0) {
+          notReadyBlockId = coreBlockId;
+        }
+        continue;
+      }
+      if (shellModelId <= 0) {
+        if (shellModelId == ModelFactory.VARIANT_MODEL_UNAVAILABLE) {
+          this.shellUnavailableCount++;
+        }
+        continue;
+      }
+      long block = rawSectionData[idx];
+      long metadata = this.modelMan.getModelMetadataFromClientId(shellModelId);
+      this.sectionData[idx * 2] = packPartialQuadData(shellModelId, block, metadata);
+      this.sectionData[idx * 2 + 1] = metadata;
+      this.shellPatchedCount++;
+    }
+    if (anyNotReady) {
+      throw new IdNotYetComputedException(notReadyBlockId, false);
+    }
+  }
+
+  /**
+   * DT's {@code branchesAround} flag for the thick-trunk cap rules: true when any horizontal
+   * neighbour of the core is a tree branch. Unknown context counts as true, which draws the cap
+   * (the safer direction: an occluded extra face instead of a hole).
+   */
+  private boolean coreHasHorizontalBranch(
+      long[] raw, int x, int y, int z, int coreDx, int coreDz, int neighborMsk) {
+    int cx = x + coreDx;
+    int cz = z + coreDz;
+    if (cx < 0 || cx > 31 || cz < 0 || cz > 31) {
+      // Core outside this section: its neighbours are beyond the single face slice we hold.
+      return true;
+    }
+    int[][] offsets = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+    for (int[] offset : offsets) {
+      int id =
+          this.readRootNeighbourId(
+              raw, x, y, z, coreDx + offset[0], 0, coreDz + offset[1], neighborMsk);
+      if (id < 0) {
+        return true;
+      }
+      if (DynamicTreesBranches.isBranch(this.stateForIdSafe(id))) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Replaces surface-root models with their 3x3x3-context variants. DT roots read the block above
+   * and each horizontal side at y-1/y/y+1; the plain per-state bake only knows a lone core box,
+   * which is why roots looked like loose cubes.
+   *
+   * <p>Roots on a section edge read the outside states from the already-acquired neighbour face
+   * slices (a ±x/±z slice holds the whole y/z or x/y face, so all 13 states are available).
+   * Positions outside two axes (section corners, y borders) are treated as air, which matches DT's
+   * "no connection" result; the exact root model is still baked from the captured cube.
+   */
+  private void resolveSurfaceRoots(long[] rawSectionData, int neighborMsk, WorldSection section) {
+    boolean anyNotReady = false;
+    int notReadyBlockId = 0;
+    for (int i = 0; i < this.rootBlockCount; i++) {
+      int idx = this.rootBlockIndices[i];
+      int x = idx & 31;
+      int z = (idx >> 5) & 31;
+      int y = idx >> 10;
+      int blockId = Mapper.getBlockId(rawSectionData[idx]);
+      int up = this.readRootNeighbourId(rawSectionData, x, y, z, 0, 1, 0, neighborMsk);
+      int northDown = this.readRootNeighbourId(rawSectionData, x, y, z, 0, -1, -1, neighborMsk);
+      int north = this.readRootNeighbourId(rawSectionData, x, y, z, 0, 0, -1, neighborMsk);
+      int northUp = this.readRootNeighbourId(rawSectionData, x, y, z, 0, 1, -1, neighborMsk);
+      int eastDown = this.readRootNeighbourId(rawSectionData, x, y, z, 1, -1, 0, neighborMsk);
+      int east = this.readRootNeighbourId(rawSectionData, x, y, z, 1, 0, 0, neighborMsk);
+      int eastUp = this.readRootNeighbourId(rawSectionData, x, y, z, 1, 1, 0, neighborMsk);
+      int southDown = this.readRootNeighbourId(rawSectionData, x, y, z, 0, -1, 1, neighborMsk);
+      int south = this.readRootNeighbourId(rawSectionData, x, y, z, 0, 0, 1, neighborMsk);
+      int southUp = this.readRootNeighbourId(rawSectionData, x, y, z, 0, 1, 1, neighborMsk);
+      int westDown = this.readRootNeighbourId(rawSectionData, x, y, z, -1, -1, 0, neighborMsk);
+      int west = this.readRootNeighbourId(rawSectionData, x, y, z, -1, 0, 0, neighborMsk);
+      int westUp = this.readRootNeighbourId(rawSectionData, x, y, z, -1, 1, 0, neighborMsk);
+      // Unavailable context cells (section corners, y borders) are treated as air: DT's
+      // RootConnections sees no connection there, and the exact root model still bakes.
+
+      // A root cell can replace a trunk_shell of a thick trunk. Find the adjacent core so the bake
+      // can composite the trunk's per-cell prism bark back into this cell.
+      int coreBlockId = 0;
+      int coreDx = 0;
+      int coreDz = 0;
+      if (this.modelMan.isThickBranchBlockId(north)) {
+        coreBlockId = north;
+        coreDz = 1;
+      } else if (this.modelMan.isThickBranchBlockId(south)) {
+        coreBlockId = south;
+        coreDz = -1;
+      } else if (this.modelMan.isThickBranchBlockId(west)) {
+        coreBlockId = west;
+        coreDx = 1;
+      } else if (this.modelMan.isThickBranchBlockId(east)) {
+        coreBlockId = east;
+        coreDx = -1;
+      } else {
+        int northWest = this.readRootNeighbourId(rawSectionData, x, y, z, -1, 0, -1, neighborMsk);
+        int northEast = this.readRootNeighbourId(rawSectionData, x, y, z, 1, 0, -1, neighborMsk);
+        int southWest = this.readRootNeighbourId(rawSectionData, x, y, z, -1, 0, 1, neighborMsk);
+        int southEast = this.readRootNeighbourId(rawSectionData, x, y, z, 1, 0, 1, neighborMsk);
+        if (this.modelMan.isThickBranchBlockId(northWest)) {
+          coreBlockId = northWest;
+          coreDx = 1;
+          coreDz = 1;
+        } else if (this.modelMan.isThickBranchBlockId(northEast)) {
+          coreBlockId = northEast;
+          coreDx = -1;
+          coreDz = 1;
+        } else if (this.modelMan.isThickBranchBlockId(southWest)) {
+          coreBlockId = southWest;
+          coreDx = 1;
+          coreDz = -1;
+        } else if (this.modelMan.isThickBranchBlockId(southEast)) {
+          coreBlockId = southEast;
+          coreDx = -1;
+          coreDz = -1;
+        }
+      }
+
+      boolean upAir = DynamicTreesBranches.isAirOrWater(this.stateForIdSafe(up));
+      int selfRadius = DynamicTreesBranches.radiusOf(this.modelMan.getBlockStateForId(blockId));
+      if (selfRadius <= 0) {
+        selfRadius = 1;
+      } else if (selfRadius > 8) {
+        selfRadius = 8;
+      }
+      int northC = this.rootSideConnection(north, northUp, northDown, upAir, selfRadius);
+      int eastC = this.rootSideConnection(east, eastUp, eastDown, upAir, selfRadius);
+      int southC = this.rootSideConnection(south, southUp, southDown, upAir, selfRadius);
+      int westC = this.rootSideConnection(west, westUp, westDown, upAir, selfRadius);
+      // Radii are packed in 4-bit fields: DT's connection radius reaches 8, and the old 3-bit
+      // packing collapsed radius 8 into 7, merging distinct DT contexts under one cache key.
+      int sideRadii =
+          (northC & 15) | ((eastC & 15) << 4) | ((southC & 15) << 8) | ((westC & 15) << 12);
+      int sideLevels =
+          ((northC >> 4) & 3)
+              | (((eastC >> 4) & 3) << 2)
+              | (((southC >> 4) & 3) << 4)
+              | (((westC >> 4) & 3) << 6);
+      BlockState[] cube =
+          this.buildRootCube(
+              blockId, up, northDown, north, northUp, eastDown, east, eastUp, southDown, south,
+              southUp, westDown, west, westUp);
+      if (DTRootGeometryCache.isActive()) {
+        // Suppress the root impostor: the vanilla-renderer overlay draws the exact DT model.
+        // Root cells that replaced a trunk_shell still need the thick-trunk prism wall, which the
+        // overlay does not draw; keep the pre-baked shell-only impostor for those cells.
+        int suppressionModelId = 0;
+        if (coreBlockId != 0) {
+          int shellId = this.modelMan.getShellModelId(coreBlockId, coreDx, coreDz, 0);
+          if (shellId == ModelFactory.VARIANT_MODEL_NOT_READY) {
+            // Do not air the cell while the shell bake is in flight: retry the whole section so
+            // the wall does not stay missing until an unrelated re-mesh.
+            anyNotReady = true;
+            if (notReadyBlockId == 0) {
+              notReadyBlockId = coreBlockId;
+            }
+            continue;
+          }
+          if (shellId > 0) {
+            suppressionModelId = shellId;
+          }
+        }
+        BlockState rootState = this.modelMan.getBlockStateForId(blockId);
+        this.overlayRoots.add(
+            new DTRootGeometryCache.RootBlock(
+                (section.x << 5) + x,
+                (section.y << 5) + y,
+                (section.z << 5) + z,
+                rootState,
+                cube,
+                Mapper.getLightId(rawSectionData[idx])));
+        long suppressionMetadata =
+            this.modelMan.getModelMetadataFromClientId(Math.max(suppressionModelId, 0));
+        this.sectionData[idx * 2] =
+            packPartialQuadData(suppressionModelId, rawSectionData[idx], suppressionMetadata);
+        this.sectionData[idx * 2 + 1] = suppressionMetadata;
+        // The section masks were computed in prepareSectionData from the BASE root model; the
+        // suppressed cell must not keep that model's opaque/non-opaque bit, or neighbours cull
+        // their faces against the cell and holes appear around roots such as the radius-8 pad.
+        int maskIndex = idx >> 5;
+        int bit = 1 << (idx & 31);
+        this.opaqueMasks[maskIndex] &= ~bit;
+        this.nonOpaqueMasks[maskIndex] &= ~bit;
+        if (suppressionModelId > 0) {
+          if (ModelQueries._isFullyOpaque(suppressionMetadata) != 0) {
+            this.opaqueMasks[maskIndex] |= bit;
+          } else {
+            this.nonOpaqueMasks[maskIndex] |= bit;
+          }
+        }
+        // fluidMasks stay untouched: waterlogged water is still meshed by the fluid pass.
+        this.rootPatchedCount++;
+        continue;
+      }
+      int rootModelId =
+          this.modelMan.getRootVariantModelId(
+              blockId, sideRadii, sideLevels, coreBlockId, coreDx, coreDz, cube);
+      if (rootModelId == ModelFactory.VARIANT_MODEL_NOT_READY) {
+        anyNotReady = true;
+        if (notReadyBlockId == 0) {
+          notReadyBlockId = blockId;
+        }
+        continue;
+      }
+      if (rootModelId <= 0) {
+        if (rootModelId == ModelFactory.VARIANT_MODEL_UNAVAILABLE) {
+          this.rootUnavailableCount++;
+        }
+        continue;
+      }
+      long metadata = this.modelMan.getModelMetadataFromClientId(rootModelId);
+      // The section's opaque/fluid masks were built from the base model metadata, so a root
+      // variant that flips those bits must fall back to the base model (same invariant as the
+      // branch path). Per-face layout bits may legitimately differ.
+      int baseModelId = this.modelMan._unsafeRawAccess()[blockId];
+      long baseMetadata = this.modelMan.getModelMetadataFromClientId(baseModelId);
+      if (ModelQueries._isFullyOpaque(baseMetadata) != ModelQueries._isFullyOpaque(metadata)
+          || ModelQueries._isFluid(baseMetadata) != ModelQueries._isFluid(metadata)
+          || ModelQueries._containsFluid(baseMetadata) != ModelQueries._containsFluid(metadata)) {
+        this.rootMaskRejectedCount++;
+        if (ROOT_MASK_REJECT_LOG.compareAndSet(false, true)) {
+          Logger.warn(
+              "Dynamic Trees root variant skipped: opaque/fluid mask mismatch for block "
+                  + blockId
+                  + " (base="
+                  + baseMetadata
+                  + ", variant="
+                  + metadata
+                  + ")");
+        }
+        continue;
+      }
+      long block = rawSectionData[idx];
+      this.sectionData[idx * 2] = packPartialQuadData(rootModelId, block, metadata);
+      this.sectionData[idx * 2 + 1] = metadata;
+      this.rootPatchedCount++;
+    }
+    if (anyNotReady) {
+      throw new IdNotYetComputedException(notReadyBlockId, false);
+    }
+  }
+
+  private static final int ROOT_NEIGHBOUR_UNAVAILABLE = -1;
+
+  /**
+   * Returns the connection index for one root side: bits 0-3 = radius (0..8), bits 4-5 = DT level
+   * (1 MID, 2 LOW, 3 HIGH), 0 = no connection. Mirrors DT's {@code getSideConnectionRadius}.
+   *
+   * <p>DT checks any {@code BranchBlock} (roots included) with radius {@code >= 8} first and
+   * returns a MID connection of radius 8; only afterwards it evaluates HIGH/LOW. Mirroring that
+   * order is what keeps the cache key aligned with the geometry DT bakes from the captured cube.
+   */
+  private int rootSideConnection(int same, int up, int down, boolean upAir, int selfRadius) {
+    BlockState sameState = this.stateForIdSafe(same);
+    // DT connects any BranchBlock (roots included) with radius >= 8 as a MID radius-8 connection
+    // before it looks at HIGH/LOW, so this check must stay first.
+    if (DynamicTreesBranches.isBranchLike(sameState)
+        && DynamicTreesBranches.radiusOf(sameState) >= 8) {
+      return Math.min(8, selfRadius) | (1 << 4);
+    }
+    // DT picks the level from the same-level neighbour: HIGH when the cell above this root is
+    // air/water and the neighbour is a full collision block, LOW when the neighbour is air/water,
+    // MID otherwise.
+    boolean goUp = upAir && DynamicTreesBranches.isFullCollisionBlock(sameState);
+    boolean goDown = DynamicTreesBranches.isAirOrWater(sameState);
+    int level = goUp ? 3 : goDown ? 2 : 1;
+    // HIGH/LOW read the cell one above/below the same-level neighbour; MID reads the neighbour
+    // itself. DT connects only when the cell at that level is a SurfaceRootBlock.
+    int shifted = level == 3 ? up : level == 2 ? down : same;
+    if (!this.modelMan.isSurfaceRootBlockId(shifted)) {
+      return 0;
+    }
+    int radius = DynamicTreesBranches.radiusOf(this.stateForIdSafe(shifted));
+    if (radius <= 0) {
+      return 0;
+    }
+    // DT's baked root model clamps every connection radius to the root's own radius (1..8), so a
+    // smaller key space is exact rather than lossy.
+    radius = Math.min(radius, selfRadius);
+    return radius | (level << 4);
+  }
+
+  private BlockState stateForIdSafe(int blockId) {
+    if (blockId <= 0) {
+      return net.minecraft.world.level.block.Blocks.AIR.defaultBlockState();
+    }
+    BlockState state = this.modelMan.getBlockStateForId(blockId);
+    return state == null ? net.minecraft.world.level.block.Blocks.AIR.defaultBlockState() : state;
+  }
+
+  private static int rootCubeIndex(int x, int y, int z) {
+    return (x + 1) + 3 * (y + 1) + 9 * (z + 1);
+  }
+
+  /** Builds the 27-state context cube the exact DT root model reads its ModelData from. */
+  private BlockState[] buildRootCube(
+      int blockId,
+      int up,
+      int northDown,
+      int north,
+      int northUp,
+      int eastDown,
+      int east,
+      int eastUp,
+      int southDown,
+      int south,
+      int southUp,
+      int westDown,
+      int west,
+      int westUp) {
+    BlockState[] cube = new BlockState[27];
+    Arrays.fill(cube, net.minecraft.world.level.block.Blocks.AIR.defaultBlockState());
+    cube[13] = this.modelMan.getBlockStateForId(blockId);
+    cube[rootCubeIndex(0, 1, 0)] = this.stateForIdSafe(up);
+    cube[rootCubeIndex(0, -1, -1)] = this.stateForIdSafe(northDown);
+    cube[rootCubeIndex(0, 0, -1)] = this.stateForIdSafe(north);
+    cube[rootCubeIndex(0, 1, -1)] = this.stateForIdSafe(northUp);
+    cube[rootCubeIndex(1, -1, 0)] = this.stateForIdSafe(eastDown);
+    cube[rootCubeIndex(1, 0, 0)] = this.stateForIdSafe(east);
+    cube[rootCubeIndex(1, 1, 0)] = this.stateForIdSafe(eastUp);
+    cube[rootCubeIndex(0, -1, 1)] = this.stateForIdSafe(southDown);
+    cube[rootCubeIndex(0, 0, 1)] = this.stateForIdSafe(south);
+    cube[rootCubeIndex(0, 1, 1)] = this.stateForIdSafe(southUp);
+    cube[rootCubeIndex(-1, -1, 0)] = this.stateForIdSafe(westDown);
+    cube[rootCubeIndex(-1, 0, 0)] = this.stateForIdSafe(west);
+    cube[rootCubeIndex(-1, 1, 0)] = this.stateForIdSafe(westUp);
+    return cube;
+  }
+
+  /**
+   * Reads one cell of a root's 3x3x3 context, using the neighbour face slices when the position is
+   * one axis outside the section. A ±x/±z slice contains the complete perpendicular face, so edge
+   * roots resolve fully; positions outside two axes (section corners, y borders) are unavailable.
+   */
+  private int readRootNeighbourId(
+      long[] raw, int x, int y, int z, int dx, int dy, int dz, int neighborMsk) {
+    final int area = 32 * 32;
+    int px = x + dx;
+    int py = y + dy;
+    int pz = z + dz;
+    int outside = 0;
+    if (px < 0 || px > 31) outside++;
+    if (py < 0 || py > 31) outside++;
+    if (pz < 0 || pz > 31) outside++;
+    if (outside == 0) {
+      return Mapper.getBlockId(raw[px + 32 * pz + 1024 * py]);
+    }
+    if (outside > 1) {
+      return ROOT_NEIGHBOUR_UNAVAILABLE;
+    }
+    if (py < 0) {
+      if ((neighborMsk & 4) == 0) return ROOT_NEIGHBOUR_UNAVAILABLE;
+      return Mapper.getBlockId(this.neighboringFaces[2 * area + px + (pz << 5)]);
+    }
+    if (py > 31) {
+      if ((neighborMsk & 8) == 0) return ROOT_NEIGHBOUR_UNAVAILABLE;
+      return Mapper.getBlockId(this.neighboringFaces[3 * area + px + (pz << 5)]);
+    }
+    if (px < 0) {
+      if ((neighborMsk & 1) == 0) return ROOT_NEIGHBOUR_UNAVAILABLE;
+      return Mapper.getBlockId(this.neighboringFaces[py * 32 + pz]);
+    }
+    if (px > 31) {
+      if ((neighborMsk & 2) == 0) return ROOT_NEIGHBOUR_UNAVAILABLE;
+      return Mapper.getBlockId(this.neighboringFaces[area + py * 32 + pz]);
+    }
+    if (pz < 0) {
+      if ((neighborMsk & 16) == 0) return ROOT_NEIGHBOUR_UNAVAILABLE;
+      return Mapper.getBlockId(this.neighboringFaces[4 * area + px + (py << 5)]);
+    }
+    if ((neighborMsk & 32) == 0) return ROOT_NEIGHBOUR_UNAVAILABLE;
+    return Mapper.getBlockId(this.neighboringFaces[5 * area + px + (py << 5)]);
+  }
+
+  private static final java.util.concurrent.atomic.AtomicBoolean VARIANT_MASK_REJECT_LOG =
+      new java.util.concurrent.atomic.AtomicBoolean();
+
+  private static final java.util.concurrent.atomic.AtomicBoolean ROOT_MASK_REJECT_LOG =
+      new java.util.concurrent.atomic.AtomicBoolean();
 
   private static final long LM = (0xFFL << 55);
 
@@ -1980,9 +2649,20 @@ public class RenderDataFactory {
     Arrays.fill(this.opaqueMasks, 0);
     Arrays.fill(this.nonOpaqueMasks, 0);
     Arrays.fill(this.fluidMasks, 0);
+    this.variantBlockCount = 0;
+    this.shellBlockCount = 0;
+    this.rootBlockCount = 0;
+    this.overlayRoots.clear();
+    this.rootPatchedCount = 0;
+    this.rootUnavailableCount = 0;
+    this.rootMaskRejectedCount = 0;
+    this.shellPatchedCount = 0;
+    this.shellUnavailableCount = 0;
 
-    // Prepare everything
-    int neighborMskAndFlags = this.prepareSectionData(section._unsafeGetRawDataArray());
+    // Prepare everything. Per-position Dynamic Trees variants only exist at LOD0; mips and other
+    // levels keep using the plain per-BlockState model ids.
+    boolean lod0 = section.lvl == 0;
+    int neighborMskAndFlags = this.prepareSectionData(section._unsafeGetRawDataArray(), lod0);
     if ((neighborMskAndFlags & (1 << 31)) != 0) { // We failed to get everything so throw exception
       throw new IdNotYetComputedException(neighborMskAndFlags & ((1 << 20) - 1), true);
     }
@@ -1993,6 +2673,47 @@ public class RenderDataFactory {
     }
 
     try {
+      if (lod0 && this.variantBlockCount != 0 && CHECK_NEIGHBOR_FACE_OCCLUSION) {
+        this.resolveBranchVariants(section._unsafeGetRawDataArray(), neighborMsk);
+      }
+      if (lod0 && this.shellBlockCount != 0) {
+        this.resolveTrunkShells(section._unsafeGetRawDataArray(), neighborMsk);
+      }
+      if (lod0 && this.rootBlockCount != 0) {
+        this.resolveSurfaceRoots(section._unsafeGetRawDataArray(), neighborMsk, section);
+      }
+      if (lod0 && DTRootGeometryCache.isActive()) {
+        // Publish (or clear) the overlay entry on every LOD0 mesh: an empty list marks the section
+        // as root-free and drops stale roots from an earlier mesh. After resolveSurfaceRoots, so a
+        // thrown IdNotYetComputedException does not publish a half-resolved list.
+        DTRootGeometryCache.putSection(
+            SectionPos.asLong(section.x, section.y, section.z), this.overlayRoots);
+      }
+      if (lod0
+          && (this.rootBlockCount != 0 || this.shellBlockCount != 0)
+          && SECTION_DIAG_LOGS.getAndIncrement() < 24) {
+        Logger.info(
+            "DT LOD0 section diag @ "
+                + section.x
+                + ","
+                + section.y
+                + ","
+                + section.z
+                + " roots="
+                + this.rootBlockCount
+                + " patched="
+                + this.rootPatchedCount
+                + " unavailable="
+                + this.rootUnavailableCount
+                + " maskRejected="
+                + this.rootMaskRejectedCount
+                + " shells="
+                + this.shellBlockCount
+                + " patched="
+                + this.shellPatchedCount
+                + " unavailable="
+                + this.shellUnavailableCount);
+      }
       this.generateYZFaces();
       this.generateXFaces();
     } catch (IdNotYetComputedException e) {

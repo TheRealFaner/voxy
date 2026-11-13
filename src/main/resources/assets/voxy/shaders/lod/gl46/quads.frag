@@ -22,6 +22,17 @@ layout(location = 0) in flat uvec4 interData;
 layout(location = 1) in vec2 uv;
 #endif
 
+#if !defined(PATCHED_SHADER) && !defined(TRANSLUCENT)
+// Per-pixel model-texture depth for root impostors. depth_greater keeps early-Z valid because
+// every written value is >= the interpolated gl_FragCoord.z (see the max() below).
+layout(depth_greater) out float gl_FragDepth;
+layout(location = 2) flat in float vBaseIndent;
+layout(location = 3) flat in float vDepthA;
+layout(location = 4) flat in float vDepthB;
+layout(location = 5) in float vClipW;
+bool hasPerPixelDepth() { return (interData.x&0x80u)!=0u; }
+#endif
+
 #ifdef DEBUG_RENDER
 layout(location = 7) in flat uint quadDebug;
 #endif
@@ -152,8 +163,19 @@ void main() {
         return;
     }
 
+    float fragZ = gl_FragCoord.z;
+    #if !defined(PATCHED_SHADER) && !defined(TRANSLUCENT)
+    if (hasPerPixelDepth()) {
+        float pix = clamp((textureLod(blockModelAtlas, texPos, 0).a*255.0 - 128.0)*(1.0/127.0), 0.0, 1.0);
+        float delta = max(pix - vBaseIndent, 0.0);
+        float ndcZ = 2.0*gl_FragCoord.z - 1.0;
+        float dz = 0.5*delta*(vDepthA - ndcZ*vDepthB)/vClipW;
+        fragZ = clamp(max(gl_FragCoord.z, gl_FragCoord.z + dz), 0.0, 1.0);
+    }
+    #endif
+
     //Check the minimum bounding texture and ensure we are greater than it
-    if (gl_FragCoord.z < texelFetch(depthTex, ivec2(gl_FragCoord.xy), 0).r) {
+    if (fragZ < texelFetch(depthTex, ivec2(gl_FragCoord.xy), 0).r) {
         discard;
         return;
     }
@@ -179,6 +201,10 @@ void main() {
     if (gl_HelperInvocation) {
         return;
     }
+    #endif
+
+    #if !defined(PATCHED_SHADER) && !defined(TRANSLUCENT)
+    gl_FragDepth = fragZ;
     #endif
 
     #ifndef PATCHED_SHADER

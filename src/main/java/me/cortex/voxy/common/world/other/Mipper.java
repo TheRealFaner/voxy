@@ -38,29 +38,29 @@ public class Mipper {
     // TODO: i think it needs to compute the _max_ light level, since e.g. if a point is bright irl
     // you can see it from really really damn far away.
     // it could be a heavily weighted average with a huge preference to the top most lighting value
-    if (!Mapper.isAir(I111)) {
-      max = (mapper.getBlockStateOpacity(I111) << 4) | 0b111;
+    if (!Mapper.isAir(I111) && !mapper.isMipSkipped(I111)) {
+      max = (mapper.getBlockStateMipBase(I111) << 4) | 0b111;
     }
-    if (!Mapper.isAir(I110)) {
-      max = Math.max((mapper.getBlockStateOpacity(I110) << 4) | 0b110, max);
+    if (!Mapper.isAir(I110) && !mapper.isMipSkipped(I110)) {
+      max = Math.max((mapper.getBlockStateMipBase(I110) << 4) | 0b110, max);
     }
-    if (!Mapper.isAir(I011)) {
-      max = Math.max((mapper.getBlockStateOpacity(I011) << 4) | 0b011, max);
+    if (!Mapper.isAir(I011) && !mapper.isMipSkipped(I011)) {
+      max = Math.max((mapper.getBlockStateMipBase(I011) << 4) | 0b011, max);
     }
-    if (!Mapper.isAir(I010)) {
-      max = Math.max((mapper.getBlockStateOpacity(I010) << 4) | 0b010, max);
+    if (!Mapper.isAir(I010) && !mapper.isMipSkipped(I010)) {
+      max = Math.max((mapper.getBlockStateMipBase(I010) << 4) | 0b010, max);
     }
-    if (!Mapper.isAir(I101)) {
-      max = Math.max((mapper.getBlockStateOpacity(I101) << 4) | 0b101, max);
+    if (!Mapper.isAir(I101) && !mapper.isMipSkipped(I101)) {
+      max = Math.max((mapper.getBlockStateMipBase(I101) << 4) | 0b101, max);
     }
-    if (!Mapper.isAir(I100)) {
-      max = Math.max((mapper.getBlockStateOpacity(I100) << 4) | 0b100, max);
+    if (!Mapper.isAir(I100) && !mapper.isMipSkipped(I100)) {
+      max = Math.max((mapper.getBlockStateMipBase(I100) << 4) | 0b100, max);
     }
-    if (!Mapper.isAir(I001)) {
-      max = Math.max((mapper.getBlockStateOpacity(I001) << 4) | 0b001, max);
+    if (!Mapper.isAir(I001) && !mapper.isMipSkipped(I001)) {
+      max = Math.max((mapper.getBlockStateMipBase(I001) << 4) | 0b001, max);
     }
-    if (!Mapper.isAir(I000)) {
-      max = Math.max((mapper.getBlockStateOpacity(I000) << 4), max);
+    if (!Mapper.isAir(I000) && !mapper.isMipSkipped(I000)) {
+      max = Math.max((mapper.getBlockStateMipBase(I000) << 4), max);
     }
 
     if (max != -1) {
@@ -103,7 +103,9 @@ public class Mipper {
       blockLight = (blockLight / 8) & 0xF0;
       skyLight = (int) Math.ceil((double) skyLight / 8);
 
-      return withLight(I111, blockLight | skyLight);
+      // All eight cells are air or mip-skipped (e.g. surface roots): emit air, never I111, which
+      // may itself be one of the skipped decorative blocks and would leak it into LOD>0.
+      return withLight(0L, blockLight | skyLight);
     }
   }
 }

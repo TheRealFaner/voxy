@@ -3,8 +3,9 @@ package me.cortex.voxy.client.mixin.minecraft;
 import java.util.Objects;
 import me.cortex.voxy.client.VoxyClientInstance;
 import me.cortex.voxy.client.config.VoxyConfig;
-import me.cortex.voxy.client.core.VoxyRenderSystem;
 import me.cortex.voxy.client.core.IVoxyRenderSystemHolder;
+import me.cortex.voxy.client.core.VoxyRenderSystem;
+import me.cortex.voxy.client.core.model.DTRootGeometryCache;
 import me.cortex.voxy.client.core.util.IrisUtil;
 import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.common.world.WorldEngine;
@@ -61,6 +62,9 @@ public abstract class MixinLevelRenderer implements IVoxyRenderSystemHolder {
       this.renderer.shutdown();
       this.renderer = null;
     }
+    // Clear only after the mesher workers are stopped, otherwise a worker can publish a stale
+    // section after the clear and the overlay would draw roots that no longer exist.
+    DTRootGeometryCache.clear();
   }
 
   @Override
