@@ -139,6 +139,78 @@ public class TextureUtils {
     throw new IllegalArgumentException();
   }
 
+  /** Minimum depth separation (24-bit depth units) between two planes of the same face. */
+  public static final int DEPTH_BAND_MIN_SEPARATION = 1 << 20; // ~1/16 of the 24-bit range
+
+  /**
+   * Splits the written pixels of one face into at most {@code maxBands} depth bands. Returns
+   * ascending band-minimum depths in 24-bit units (never more than maxBands values; one value when
+   * all written pixels are coplanar). Empty face -> empty array. The split points are the largest
+   * gaps between consecutive distinct sorted written depths that are >= {@link
+   * #DEPTH_BAND_MIN_SEPARATION}; ties resolve deterministically (lowest depth wins).
+   */
+  public static int[] computeDepthBands(ColourDepthTextureData face, int checkMode, int maxBands) {
+    final int bandLimit = Math.max(1, Math.min(3, maxBands));
+    final int[] depthData = face.depth();
+    // Face textures are 16x16; size the scratch array from the face so the split never overflows.
+    final int[] depths = new int[depthData.length];
+    int count = 0;
+    for (int i = 0; i < depthData.length; i++) {
+      if (wasPixelWritten(face, checkMode, i)) {
+        depths[count++] = depthData[i] >>> 8;
+      }
+    }
+    if (count == 0) {
+      return new int[0];
+    }
+    Arrays.sort(depths, 0, count);
+
+    // Collapse duplicates in place: gaps are only meaningful between distinct depths.
+    int distinct = 1;
+    for (int i = 1; i < count; i++) {
+      if (depths[i] != depths[distinct - 1]) {
+        depths[distinct++] = depths[i];
+      }
+    }
+
+    // Greedily mark the largest qualifying gaps; strict '>' keeps the shallowest split on ties.
+    final boolean[] isSplit = new boolean[distinct];
+    for (int remaining = bandLimit - 1; remaining > 0; remaining--) {
+      int bestIndex = -1;
+      int bestGap = DEPTH_BAND_MIN_SEPARATION - 1;
+      for (int i = 0; i < distinct - 1; i++) {
+        if (isSplit[i]) {
+          continue;
+        }
+        int gap = depths[i + 1] - depths[i];
+        if (gap > bestGap) {
+          bestGap = gap;
+          bestIndex = i;
+        }
+      }
+      if (bestIndex < 0) {
+        break; // No remaining gap reaches the minimum separation.
+      }
+      isSplit[bestIndex] = true;
+    }
+
+    int bandCount = 1;
+    for (int i = 0; i < distinct - 1; i++) {
+      if (isSplit[i]) {
+        bandCount++;
+      }
+    }
+    int[] bands = new int[bandCount];
+    bands[0] = depths[0];
+    int band = 1;
+    for (int i = 0; i < distinct - 1; i++) {
+      if (isSplit[i]) {
+        bands[band++] = depths[i + 1];
+      }
+    }
+    return bands;
+  }
+
   private static float u2fdepth(int depth, boolean halfDepthRange) {
     float depthF = (float) ((double) depth / ((1 << 24) - 1));
     // https://registry.khronos.org/OpenGL-Refpages/gl4/html/glDepthRange.xhtml

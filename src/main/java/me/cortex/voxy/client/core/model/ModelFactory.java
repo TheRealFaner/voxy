@@ -277,6 +277,13 @@ public class ModelFactory {
   // Dynamic Trees surface-root variants (3x3x3 neighbour context). Patched into LOD0 sections.
   private final ConcurrentHashMap<RootCrownKey, Integer> rootVariantModelIds =
       new ConcurrentHashMap<>();
+  // Stage 1 option A scaffolding: base root model id -> plane model ids. Populated only when
+  // DT_ROOT_MULTIPLANE is on; for now each key maps to a single plane (its own model id).
+  private final ConcurrentHashMap<Integer, int[]> rootPlaneModelIds = new ConcurrentHashMap<>();
+  // Key -> most recently published base model id. failRootVariant only receives the key, so this
+  // lets it drop the corresponding plane registry entry. Also flag-gated.
+  private final ConcurrentHashMap<RootCrownKey, Integer> rootBaseModelIds =
+      new ConcurrentHashMap<>();
   // Representative 3x3x3 state cube per root key, captured on the first request. The exact DT
   // root model recomputes RootConnections from it; any context with the same key is geometrically
   // identical.
@@ -306,6 +313,17 @@ public class ModelFactory {
    */
   private static final boolean SYNTHETIC_ROOT_PAD =
       "synthetic".equalsIgnoreCase(System.getProperty("voxy.dtRootModel", "exact"));
+
+  /**
+   * Stage 1 scaffolding for option A root impostors: a root face may later bake several depth-band
+   * planes, each exported as its own ordinary model id. This stage only maintains an inert id
+   * registry (always exactly one plane per published key); Stage 2 will populate the N plane ids.
+   * Default off; with the flag off the registry is never populated and output is unchanged.
+   */
+  private static final boolean DT_ROOT_MULTIPLANE =
+      "true".equalsIgnoreCase(System.getProperty("voxy.dtRootMultiplane", "false"));
+  private static final int DT_ROOT_MAX_PLANES =
+      Math.max(1, Math.min(3, Integer.getInteger("voxy.dtRootMaxPlanes", 3)));
 
   /**
    * Branch variants drop the small twig sleeve end caps lying on a cell boundary plane (the
@@ -976,6 +994,12 @@ public class ModelFactory {
     // are not bounded by the variant cap, so keeping them would leak a BlockState[27] per context.
     this.rootCubes.remove(key);
     this.rootVariantAttempts.remove(key);
+    // Stage 1 plane registry cleanup: drop the mapping and the plane entry for the id this key
+    // published earlier, if any (a key that never published leaves both maps untouched).
+    Integer baseModelId = this.rootBaseModelIds.remove(key);
+    if (baseModelId != null) {
+      this.rootPlaneModelIds.remove(baseModelId);
+    }
     if (this.variantFailureCount.incrementAndGet() <= 32) {
       Logger.warn("Failed to bake Dynamic Trees surface root variant " + key, cause);
     }
@@ -1177,6 +1201,11 @@ public class ModelFactory {
       this.rootVariantModelIds.put(publish.rootKey, publish.modelId);
       this.rootVariantSuccessCount.incrementAndGet();
       this.variantSuccessCount.incrementAndGet();
+      if (DT_ROOT_MULTIPLANE) {
+        // Stage 1: exactly one plane per key. Stage 2 will register the per-face band ids here.
+        this.rootBaseModelIds.put(publish.rootKey, publish.modelId);
+        this.rootPlaneModelIds.put(publish.modelId, new int[] {publish.modelId});
+      }
     }
   }
 
@@ -2359,6 +2388,26 @@ public class ModelFactory {
               + this.mapper.getBlockStateFromBlockId(blockId));
     }
     return VARIANT_MODEL_NOT_READY;
+  }
+
+  /**
+   * Stage 1 option A accessor: ordinary model ids making up the given base root model. Falls back
+   * to a single-element array containing the base id itself, so callers always get a valid plane
+   * list even when the flag is off or nothing was published.
+   */
+  public int[] getRootPlaneModelIds(int baseModelId) {
+    int[] planes = this.rootPlaneModelIds.get(baseModelId);
+    return planes != null ? planes : new int[] {baseModelId};
+  }
+
+  /** Upper bound on depth bands per root face (1..3), used by later multi-plane stages. */
+  public int getRootMaxPlanes() {
+    return DT_ROOT_MAX_PLANES;
+  }
+
+  /** True when the option A multi-plane root scaffolding (and its registry) is active. */
+  public boolean isRootMultiplaneEnabled() {
+    return DT_ROOT_MULTIPLANE;
   }
 
   /**
