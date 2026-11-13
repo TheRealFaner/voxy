@@ -28,22 +28,35 @@ import org.jetbrains.annotations.Nullable;
  *       turning every connected root into a vertical post.
  * </ul>
  *
- * <p>With {@code dropBoundaryCaps == true} (Dynamic Trees branch variants) the filter also drops
- * the small twig end caps: quads lying exactly in one cell-boundary plane ({@code x}, {@code y} or
- * {@code z} = 0 or 16) whose two in-plane extents are both under 8 model units. The connected
+ * <p>With boundary-cap dropping enabled (Dynamic Trees branch variants) the filter also drops the
+ * small twig end caps: quads lying exactly in one cell-boundary plane ({@code x}, {@code y} or
+ * {@code z} = 0 or 16) whose two in-plane extents are both under 8 model units. A connected
  * neighbouring cell covers that plane in vanilla, but Voxy's per-face depth would drag the face
  * forward into a visible fin/sliver. Large boundary faces (for example a thick trunk's 16x16 top)
  * are kept.
+ *
+ * <p>The caps are dropped per side: {@code dropCapSidesMask} bit {@code i} (where {@code i} is
+ * {@link Direction#get3DDataValue()}) means that side's boundary cap may be dropped because the
+ * neighbour there is a connected branch. Plane {@code x=0} maps to WEST(4), {@code x=16} to
+ * EAST(5), {@code y=0} to DOWN(0), {@code y=16} to UP(1), {@code z=0} to NORTH(2) and {@code
+ * z=16} to SOUTH(3). Air neighbours keep their caps, so a trunk top or an exposed side stays
+ * closed.
  */
 final class RootVertFilterBakedModel implements BakedModel {
+  private static final int ALL_SIDES_MASK = 0x3F;
+
   private final BakedModel delegate;
   private final float maxY;
-  private final boolean dropBoundaryCaps;
+  private final int dropCapSidesMask;
 
   RootVertFilterBakedModel(BakedModel delegate, float maxY, boolean dropBoundaryCaps) {
+    this(delegate, maxY, dropBoundaryCaps ? ALL_SIDES_MASK : 0);
+  }
+
+  RootVertFilterBakedModel(BakedModel delegate, float maxY, int dropCapSidesMask) {
     this.delegate = delegate;
     this.maxY = maxY;
-    this.dropBoundaryCaps = dropBoundaryCaps;
+    this.dropCapSidesMask = dropCapSidesMask;
   }
 
   BakedModel delegate() {
@@ -56,7 +69,7 @@ final class RootVertFilterBakedModel implements BakedModel {
     }
     List<BakedQuad> kept = new ArrayList<>(quads.size());
     for (BakedQuad quad : quads) {
-      if (withinHeight(quad, this.maxY) && !(this.dropBoundaryCaps && isBoundaryCap(quad))) {
+      if (withinHeight(quad, this.maxY) && !isBoundaryCap(quad, this.dropCapSidesMask)) {
         kept.add(quad);
       }
     }
@@ -65,10 +78,14 @@ final class RootVertFilterBakedModel implements BakedModel {
 
   /**
    * True for a small quad lying exactly in one cell-boundary plane ({@code x}, {@code y} or {@code
-   * z} = 0 or 16). The two in-plane extents must be small so large legitimate boundary faces (for
-   * example a thick trunk's 16x16 top) are kept.
+   * z} = 0 or 16) on a side whose mask bit is set. The two in-plane extents must be small so large
+   * legitimate boundary faces (for example a thick trunk's 16x16 top) are kept. Plane-to-side
+   * mapping: x=0 → WEST, x=16 → EAST, y=0 → DOWN, y=16 → UP, z=0 → NORTH, z=16 → SOUTH.
    */
-  private static boolean isBoundaryCap(BakedQuad quad) {
+  private static boolean isBoundaryCap(BakedQuad quad, int dropCapSidesMask) {
+    if (dropCapSidesMask == 0) {
+      return false;
+    }
     int[] vertices = quad.getVertices();
     float minX = Float.POSITIVE_INFINITY;
     float minY = Float.POSITIVE_INFINITY;
@@ -87,22 +104,40 @@ final class RootVertFilterBakedModel implements BakedModel {
       minZ = Math.min(minZ, z);
       maxZ = Math.max(maxZ, z);
     }
-    boolean onXPlane = near(minX, maxX) && (near(minX, 0.0f) || near(minX, 16.0f));
-    boolean onYPlane = near(minY, maxY) && (near(minY, 0.0f) || near(minY, 16.0f));
-    boolean onZPlane = near(minZ, maxZ) && (near(minZ, 0.0f) || near(minZ, 16.0f));
-    float extentA;
-    float extentB;
-    if (onXPlane) {
-      extentA = maxY - minY;
-      extentB = maxZ - minZ;
-    } else if (onYPlane) {
-      extentA = maxX - minX;
-      extentB = maxZ - minZ;
-    } else if (onZPlane) {
-      extentA = maxX - minX;
-      extentB = maxY - minY;
+    int side;
+    if (near(minX, maxX) && near(minX, 0.0f)) {
+      side = Direction.WEST.get3DDataValue();
+    } else if (near(minX, maxX) && near(minX, 16.0f)) {
+      side = Direction.EAST.get3DDataValue();
+    } else if (near(minY, maxY) && near(minY, 0.0f)) {
+      side = Direction.DOWN.get3DDataValue();
+    } else if (near(minY, maxY) && near(minY, 16.0f)) {
+      side = Direction.UP.get3DDataValue();
+    } else if (near(minZ, maxZ) && near(minZ, 0.0f)) {
+      side = Direction.NORTH.get3DDataValue();
+    } else if (near(minZ, maxZ) && near(minZ, 16.0f)) {
+      side = Direction.SOUTH.get3DDataValue();
     } else {
       return false;
+    }
+    if ((dropCapSidesMask & (1 << side)) == 0) {
+      return false;
+    }
+    float extentA;
+    float extentB;
+    switch (side) {
+      case 4, 5 -> { // WEST / EAST: yz plane
+        extentA = maxY - minY;
+        extentB = maxZ - minZ;
+      }
+      case 0, 1 -> { // DOWN / UP: xz plane
+        extentA = maxX - minX;
+        extentB = maxZ - minZ;
+      }
+      default -> { // NORTH / SOUTH: xy plane
+        extentA = maxX - minX;
+        extentB = maxY - minY;
+      }
     }
     return extentA < 7.9f && extentB < 7.9f;
   }
