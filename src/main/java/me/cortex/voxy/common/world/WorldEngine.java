@@ -19,6 +19,11 @@ public class WorldEngine {
   public static final int DEFAULT_UPDATE_FLAGS =
       UPDATE_TYPE_BLOCK_BIT | UPDATE_TYPE_CHILD_EXISTENCE_BIT;
 
+  // Neighbour mask layout shared with the dirty-callback consumers. This is the WORLD/update
+  // convention: bit 0 -y, bit 1 +y, bit 2 -x, bit 3 +x, bit 4 -z, bit 5 +z. It is distinct from
+  // RenderDataFactory's internal neighbour mask order, which uses a different bit layout.
+  public static final int NEIGHBOR_MSK_ALL = 0b11_1111;
+
   public interface ISectionChangeCallback {
     void accept(WorldSection section, int updateFlags, int neighborMsk);
   }

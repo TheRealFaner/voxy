@@ -29,6 +29,9 @@ public final class DynamicTreesBranches {
       "com.dtteam.dynamictrees.block.branch.SurfaceRootBlock";
   public static final String EXCLUDED_NAMESPACE = "dynamictreesplus";
 
+  /** Set once any Dynamic Trees block state is mapped; gates DT-only meshing work. */
+  public static volatile boolean PRESENT = false;
+
   /**
    * DynamicTreesPlus mushroom stem ({@code dynamictreesplus:mushroom_branch}). Its class chain
    * extends DT {@code ThickBranchBlock}, and its model is a regular DT branch model whose bark

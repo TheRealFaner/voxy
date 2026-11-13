@@ -88,6 +88,11 @@ public class RenderDataFactory {
   private int rootPlaneBoundarySkipped = 0;
   private int shellPatchedCount = 0;
   private int shellUnavailableCount = 0;
+  // Per-section shell skip reasons (one-shot diag only).
+  private int shellSkippedCornerBothOutside = 0;
+  private int shellSkippedMskBitMissing = 0;
+  private int shellSkippedCoreNotThick = 0;
+  private int shellSkippedCoreDirNull = 0;
   private static final java.util.concurrent.atomic.AtomicInteger SECTION_DIAG_LOGS =
       new java.util.concurrent.atomic.AtomicInteger();
 
@@ -381,13 +386,16 @@ public class RenderDataFactory {
   }
 
   private static int getNeighborMsk(long notEmpty, int i) {
-    int packedEmpty = (int) ((notEmpty >>> 32) | notEmpty);
-
     int neighborMsk = 0;
-    // -+x
-    neighborMsk += packedEmpty & 1; // -x
-    neighborMsk += (packedEmpty >>> 30) & 0b10; // +x
+    // Explicit full-face form of the +/-x neighbour test. One 64-cell group spans the full x
+    // range twice (j=0..31 is the x=0..31 row at z, j=32..63 the same row at z+1), so masking
+    // both row copies covers every x=0 and x=31 cell. This is the same mask the previous folded
+    // form produced; the mask only decides whether one face slice per direction is acquired, so
+    // full-face coverage costs nothing extra.
+    if ((notEmpty & 0x0000_0001_0000_0001L) != 0) neighborMsk |= 0b000001; // -x, x=0 row
+    if ((notEmpty & 0x8000_0000_8000_0000L) != 0) neighborMsk |= 0b000010; // +x, x=31 row
 
+    int packedEmpty = (int) ((notEmpty >>> 32) | notEmpty);
     // notEmpty = (notEmpty != 0)?1:0;
     neighborMsk += ((((i - 1) >> 10) == 0) ? 0b100 : 0) * (packedEmpty != 0 ? 1 : 0); // -y
     neighborMsk += ((((i - 1) >> 10) == 31) ? 0b1000 : 0) * (packedEmpty != 0 ? 1 : 0); // +y
@@ -606,7 +614,7 @@ public class RenderDataFactory {
    * trunk with the pre-baked prism piece for that cell. This restores the trunk's real 2x2/3x3
    * width at LOD0; a plain bark cube only covered the core cell.
    */
-  private void resolveTrunkShells(long[] rawSectionData, int neighborMsk) {
+  private void resolveTrunkShells(long[] rawSectionData, int neighborMsk, WorldSection section) {
     boolean anyNotReady = false;
     int notReadyBlockId = 0;
     for (int i = 0; i < this.shellBlockCount; i++) {
@@ -614,6 +622,7 @@ public class RenderDataFactory {
       int shellBlockId = Mapper.getBlockId(rawSectionData[idx]);
       int[] coreDir = DynamicTreesBranches.coreDir(this.modelMan.getBlockStateForId(shellBlockId));
       if (coreDir == null) {
+        this.shellSkippedCoreDirNull++;
         continue;
       }
       int cdx = coreDir[0];
@@ -630,18 +639,25 @@ public class RenderDataFactory {
         coreBlockId = Mapper.getBlockId(rawSectionData[coreX + 32 * coreZ + 1024 * y]);
       } else if (outX && outZ) {
         // Both core offsets point outside: only possible at a section corner, where no single
-        // face slice holds the core. Keep the cell empty.
-        continue;
+        // face slice holds the core. Read it from the diagonally adjacent section instead of
+        // adding another slice; if that section is not resident, keep the cell empty.
+        coreBlockId = this.readDiagonalCoreId(section, x, y, z, cdx, cdz);
+        if (coreBlockId == DIAGONAL_CELL_UNAVAILABLE) {
+          this.shellSkippedCornerBothOutside++;
+          continue;
+        }
       } else if (outX) {
         // Diagonal or cardinal core with x outside: the ±x face slice spans the whole y/z face,
         // so index it at the core's z (in range even when the shell cell's z differs).
         if (cdx < 0) {
           if ((neighborMsk & 1) == 0) {
+            this.shellSkippedMskBitMissing++;
             continue;
           }
           coreBlockId = Mapper.getBlockId(this.neighboringFaces[y * 32 + coreZ]);
         } else {
           if ((neighborMsk & 2) == 0) {
+            this.shellSkippedMskBitMissing++;
             continue;
           }
           coreBlockId = Mapper.getBlockId(this.neighboringFaces[32 * 32 + y * 32 + coreZ]);
@@ -651,17 +667,20 @@ public class RenderDataFactory {
         // so index it at the core's x (in range even when the shell cell's x differs).
         if (cdz < 0) {
           if ((neighborMsk & 16) == 0) {
+            this.shellSkippedMskBitMissing++;
             continue;
           }
           coreBlockId = Mapper.getBlockId(this.neighboringFaces[4 * 32 * 32 + coreX + (y << 5)]);
         } else {
           if ((neighborMsk & 32) == 0) {
+            this.shellSkippedMskBitMissing++;
             continue;
           }
           coreBlockId = Mapper.getBlockId(this.neighboringFaces[5 * 32 * 32 + coreX + (y << 5)]);
         }
       }
       if (coreBlockId <= 0 || !this.modelMan.isThickBranchBlockId(coreBlockId)) {
+        this.shellSkippedCoreNotThick++;
         continue;
       }
       int capBits = 0;
@@ -726,6 +745,31 @@ public class RenderDataFactory {
     }
     if (anyNotReady) {
       throw new IdNotYetComputedException(notReadyBlockId, false);
+    }
+  }
+
+  private static final int DIAGONAL_CELL_UNAVAILABLE = -1;
+
+  /**
+   * Resolves a thick-trunk core that lies diagonally across a section corner by reading the
+   * matching cell of the diagonally adjacent section. The six face slices each hold one axis, so
+   * they cannot cover a position outside both x and z; this direct lookup avoids adding another
+   * slice. Returns {@link #DIAGONAL_CELL_UNAVAILABLE} when the adjacent section has no resident
+   * data (absent from the tracker and from storage); the caller then keeps the shell cell empty.
+   */
+  private int readDiagonalCoreId(WorldSection section, int x, int y, int z, int cdx, int cdz) {
+    WorldSection diagonal =
+        this.world.acquireIfExists(section.lvl, section.x + cdx, section.y, section.z + cdz);
+    if (diagonal == null) {
+      return DIAGONAL_CELL_UNAVAILABLE;
+    }
+    try {
+      int localX = (x + cdx) & 31;
+      int localZ = (z + cdz) & 31;
+      return Mapper.getBlockId(
+          diagonal._unsafeGetRawDataArray()[localX + 32 * localZ + 1024 * y]);
+    } finally {
+      diagonal.release(WorldSection.RELEASE_HINT_POSSIBLE_REUSE);
     }
   }
 
@@ -2836,6 +2880,10 @@ public class RenderDataFactory {
     this.rootPlaneBoundarySkipped = 0;
     this.shellPatchedCount = 0;
     this.shellUnavailableCount = 0;
+    this.shellSkippedCornerBothOutside = 0;
+    this.shellSkippedMskBitMissing = 0;
+    this.shellSkippedCoreNotThick = 0;
+    this.shellSkippedCoreDirNull = 0;
 
     // Prepare everything. Per-position Dynamic Trees variants only exist at LOD0; mips and other
     // levels keep using the plain per-BlockState model ids.
@@ -2855,7 +2903,7 @@ public class RenderDataFactory {
         this.resolveBranchVariants(section._unsafeGetRawDataArray(), neighborMsk);
       }
       if (lod0 && this.shellBlockCount != 0) {
-        this.resolveTrunkShells(section._unsafeGetRawDataArray(), neighborMsk);
+        this.resolveTrunkShells(section._unsafeGetRawDataArray(), neighborMsk, section);
       }
       if (lod0 && this.rootBlockCount != 0) {
         this.resolveSurfaceRoots(section._unsafeGetRawDataArray(), neighborMsk, section);
@@ -2892,7 +2940,15 @@ public class RenderDataFactory {
                 + " patched="
                 + this.shellPatchedCount
                 + " unavailable="
-                + this.shellUnavailableCount);
+                + this.shellUnavailableCount
+                + " shellSkips=corner:"
+                + this.shellSkippedCornerBothOutside
+                + ",msk:"
+                + this.shellSkippedMskBitMissing
+                + ",notThick:"
+                + this.shellSkippedCoreNotThick
+                + ",dirNull:"
+                + this.shellSkippedCoreDirNull);
       }
       this.generateYZFaces();
       this.generateXFaces();
