@@ -659,17 +659,37 @@ public class ModelFactory {
     return neighbours;
   }
 
+  /**
+   * Boundary-cap side mask for a branch variant bake. Bit {@code i} ({@code i =}
+   * {@link Direction#get3DDataValue()}, matching the {@code neighbours} array order) is set when
+   * that neighbour resolves to a connected Dynamic Trees branch ({@code BranchBlock} subclasses,
+   * roots included), so the quad on that boundary plane is an internal face Voxy would drag into a
+   * visible fin. Air and unrelated blocks keep their caps, so exposed trunk tops and sides stay
+   * closed. A substituted UP/DOWN self id (LOD-level seam continuation) resolves to the branch
+   * state, so those seams drop their caps as internal continuations too.
+   */
+  private static int computeDropCapSidesMask(BlockState[] neighbours) {
+    int mask = 0;
+    for (int i = 0; i < 6; i++) {
+      if (DynamicTreesBranches.isBranchLike(neighbours[i])) {
+        mask |= 1 << i;
+      }
+    }
+    return mask;
+  }
+
   private void bakeVariantSoftware(VariantKey key) {
     try {
       BlockState state = this.mapper.getBlockStateFromBlockId(key.blockId());
       BlockState[] neighbours = this.resolveVariantNeighbours(key);
+      int dropCapSidesMask = DROP_BRANCH_BOUNDARY_CAPS ? computeDropCapSidesMask(neighbours) : 0;
       BakedModel branchModel = null;
       if (DROP_BRANCH_BOUNDARY_CAPS) {
         try {
           BakedModel raw =
               Minecraft.getInstance().getModelManager().getBlockModelShaper().getBlockModel(state);
           if (raw != null) {
-            branchModel = new RootVertFilterBakedModel(raw, 16.0f, true);
+            branchModel = new RootVertFilterBakedModel(raw, 16.0f, dropCapSidesMask);
           }
         } catch (Throwable t) {
           branchModel = null;
@@ -732,13 +752,14 @@ public class ModelFactory {
     try {
       BlockState state = this.mapper.getBlockStateFromBlockId(key.blockId());
       BlockState[] neighbours = this.resolveVariantNeighbours(key);
+      int dropCapSidesMask = DROP_BRANCH_BOUNDARY_CAPS ? computeDropCapSidesMask(neighbours) : 0;
       BakedModel branchModel = null;
       if (DROP_BRANCH_BOUNDARY_CAPS) {
         try {
           BakedModel raw =
               Minecraft.getInstance().getModelManager().getBlockModelShaper().getBlockModel(state);
           if (raw != null) {
-            branchModel = new RootVertFilterBakedModel(raw, 16.0f, true);
+            branchModel = new RootVertFilterBakedModel(raw, 16.0f, dropCapSidesMask);
           }
         } catch (Throwable t) {
           branchModel = null;

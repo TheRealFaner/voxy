@@ -549,17 +549,36 @@ public class RenderDataFactory {
       int south = this.getNeighborBlockId(rawSectionData, idx, Direction.SOUTH, neighborMsk);
       int west = this.getNeighborBlockId(rawSectionData, idx, Direction.WEST, neighborMsk);
       int east = this.getNeighborBlockId(rawSectionData, idx, Direction.EAST, neighborMsk);
-      if (down == NEIGHBOR_UNAVAILABLE
-          || up == NEIGHBOR_UNAVAILABLE
-          || north == NEIGHBOR_UNAVAILABLE
-          || south == NEIGHBOR_UNAVAILABLE
-          || west == NEIGHBOR_UNAVAILABLE
-          || east == NEIGHBOR_UNAVAILABLE) {
-        // Boundary slice was not acquired; keep the base model rather than guessing.
-        continue;
+      final int blockId = Mapper.getBlockId(rawSectionData[idx]);
+      // LOD-level seam heuristic: NEIGHBOR_UNAVAILABLE means the section holding that face slice
+      // was not acquired. At the edge of the loaded LOD0 grid the neighbour section at the same
+      // LOD level does not exist, so skipping the cell leaves Dynamic Trees' connectionless base
+      // model (only the centre cube band y in [8-r, 8+r]): the upper/lower bands of a thin trunk
+      // lose their bark and a vertical slit opens.
+      // Assume the trunk continues vertically: substituting the cell's own state id for DOWN/UP
+      // makes DT bake a connected vertical continuation (full-height walls, no end caps on those
+      // sides). The four horizontal sides get air (0) instead so no phantom sideways sleeves
+      // appear. One cell of extension at a true seam is preferable to a hole. The substituted ids
+      // are part of the VariantKey, so these variants stay distinct from ones baked against real
+      // neighbours and no stale cache entry is reused.
+      if (down == NEIGHBOR_UNAVAILABLE) {
+        down = blockId;
       }
-
-      int blockId = Mapper.getBlockId(rawSectionData[idx]);
+      if (up == NEIGHBOR_UNAVAILABLE) {
+        up = blockId;
+      }
+      if (north == NEIGHBOR_UNAVAILABLE) {
+        north = 0; // air
+      }
+      if (south == NEIGHBOR_UNAVAILABLE) {
+        south = 0;
+      }
+      if (west == NEIGHBOR_UNAVAILABLE) {
+        west = 0;
+      }
+      if (east == NEIGHBOR_UNAVAILABLE) {
+        east = 0;
+      }
       int variantModelId =
           this.modelMan.getVariantModelId(blockId, down, up, north, south, west, east);
       if (variantModelId == ModelFactory.VARIANT_MODEL_NOT_READY) {
