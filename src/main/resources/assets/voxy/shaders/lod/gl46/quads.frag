@@ -83,6 +83,30 @@ vec2 getBaseUV() {
     return modelUV + (vec2(face>>1, face&1u) * (1.0/(vec2(3.0, 2.0)*256.0)));
 }
 
+// Voxy vegetation mip clamp=1.0 (cutout/tinted faces): at LOD distances the atlas is sampled at
+// deep mip levels and grass/leaves/plant faces collapse into flat solid-colour cards (hue stays
+// correct because tinting is applied after the sample). Clamping the effective mip level keeps
+// roughly 8x8 atlas texels visible per 16x16 face so the cutout silhouette/texture survives.
+// TODO: expose as a config option (shader define or uniform) instead of a hardcoded constant.
+const float VEGETATION_MIP_CLAMP = 1.0;
+
+// A "vegetation face" is a face with alpha cutout (grass/leaves/flowers/glass/rails/... - interData.x
+// bit 0, from faceData bit 22 + the multi-tile override bit 23), or, in the opaque pass, any tinted
+// face (grass/leaves/plants incl. baked-opaque tops - tint state bits 2|3 of interData.x, from
+// faceData bits 24|25). The translucent pass is water/ice: tinted as well, but it must keep smooth
+// deep mips (huge merged quads would show tiling/aliasing at mip 1), so it is never clamped.
+// Ordinary opaque terrain (stone/dirt) has neither flag and keeps the textureGrad path.
+bool isVegetationFace() {
+    if (useDiscard()) {
+        return true;
+    }
+#ifdef TRANSLUCENT
+    return false;
+#else
+    return tintingState() != 0u;
+#endif
+}
+
 
 #ifdef PATCHED_SHADER
 struct VoxyFragmentParameters {
@@ -142,7 +166,16 @@ void main() {
         vec2 uvSmol = uv*(1.0/(vec2(3.0,2.0)*256.0));
         vec2 dx = dFdx(uvSmol);//vec2(lDx, dDx);
         vec2 dy = dFdy(uvSmol);//vec2(lDy, dDy);
-        colour = textureGrad(blockModelAtlas, texPos, dx, dy);
+        // Vegetation mip clamp (see VEGETATION_MIP_CLAMP): textureQueryLod returns the natural mip
+        // level; min() freezes vegetation at mip VEGETATION_MIP_CLAMP while leaving faces whose
+        // natural lod is below it untouched, so the LOD0 band renders identically to before. The
+        // atlas is a plain 2D texture sampled with UVs, so textureQueryLod/textureLod are valid.
+        if (isVegetationFace()) {
+            float lod = textureQueryLod(blockModelAtlas, texPos).y;
+            colour = textureLod(blockModelAtlas, texPos, min(lod, VEGETATION_MIP_CLAMP));
+        } else {
+            colour = textureGrad(blockModelAtlas, texPos, dx, dy);
+        }
     }// else {
     //    colour = textureLod(blockModelAtlas, texPos, 0);
     //}
