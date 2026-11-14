@@ -357,12 +357,62 @@ public class ModelFactory {
       Math.max(1, Math.min(3, Integer.getInteger("voxy.dtRootMaxPlanes", 3)));
 
   /**
-   * Branch variants drop the small twig sleeve end caps lying on a cell boundary plane (the
-   * neighbour covers them, but Voxy's per-face depth turns them into fins). Disable for A/B with
-   * {@code -Dvoxy.dtBranchCapFilter=false}.
+   * Boundary-cap filtering for Dynamic Trees branch variants. {@code all} (the default) restores
+   * the stable-candidate behaviour and drops every small boundary-plane cap; {@code per-side} drops
+   * a cap only toward a connected branch neighbour whose radius is at least the self radius; {@code
+   * none} keeps every cap (the old {@code -Dvoxy.dtBranchCapFilter=false}).
+   *
+   * <p>Select a mode with {@code -Dvoxy.dtBranchCapFilter=all|per-side|none}. For compatibility
+   * {@code true} maps to {@code per-side} and {@code false} to {@code none}; an unknown value warns
+   * once and falls back to {@code all}.
    */
-  private static final boolean DROP_BRANCH_BOUNDARY_CAPS =
-      !"false".equalsIgnoreCase(System.getProperty("voxy.dtBranchCapFilter", "true"));
+  private enum BranchCapFilterMode {
+    ALL("all"),
+    PER_SIDE("per-side"),
+    NONE("none");
+
+    private final String id;
+
+    BranchCapFilterMode(String id) {
+      this.id = id;
+    }
+  }
+
+  private static final BranchCapFilterMode BRANCH_CAP_FILTER_MODE = parseBranchCapFilterMode();
+  private static final AtomicBoolean BRANCH_CAP_FILTER_LOG = new AtomicBoolean();
+
+  private static BranchCapFilterMode parseBranchCapFilterMode() {
+    String raw = System.getProperty("voxy.dtBranchCapFilter");
+    if (raw == null) {
+      return BranchCapFilterMode.ALL;
+    }
+    return switch (raw.trim().toLowerCase(java.util.Locale.ROOT)) {
+      case "all" -> BranchCapFilterMode.ALL;
+      case "per-side", "per_side" -> BranchCapFilterMode.PER_SIDE;
+      case "none" -> BranchCapFilterMode.NONE;
+      case "true" -> BranchCapFilterMode.PER_SIDE;
+      case "false" -> BranchCapFilterMode.NONE;
+      default -> {
+        // Static initialisation runs once per JVM, so this warning is one-shot by construction.
+        Logger.warn(
+            "Unknown -Dvoxy.dtBranchCapFilter value '"
+                + raw
+                + "' (expected all|per-side|none), using all");
+        yield BranchCapFilterMode.ALL;
+      }
+    };
+  }
+
+  /** Cap filter mode id for logs: {@code all}, {@code per-side} or {@code none}. */
+  public static String branchCapFilterMode() {
+    return BRANCH_CAP_FILTER_MODE.id;
+  }
+
+  private static void logBranchCapFilterMode() {
+    if (BRANCH_CAP_FILTER_LOG.compareAndSet(false, true)) {
+      Logger.info("DT branch cap filter mode=" + BRANCH_CAP_FILTER_MODE.id);
+    }
+  }
 
   /**
    * Branch variants use MAX face depth: at radius tapers/junctions AVG smears the mixed planes and
@@ -403,6 +453,7 @@ public class ModelFactory {
   }
 
   public ModelFactory(Mapper mapper, ModelStore storage, ModelOutputSink outputSink) {
+    logBranchCapFilterMode();
     this.mapper = mapper;
     this.storage = storage;
     this.outputSink = outputSink;
@@ -696,17 +747,29 @@ public class ModelFactory {
   /**
    * Boundary-cap side mask for a branch variant bake. Bit {@code i} ({@code i =} {@link
    * Direction#get3DDataValue()}, matching the {@code neighbours} array order) is set when that
-   * neighbour resolves to a connected Dynamic Trees branch that actually covers the boundary plane,
-   * so the quad on that boundary plane is an internal face Voxy would drag into a visible fin. Air
-   * and unrelated blocks keep their caps, so exposed trunk tops and sides stay closed. A
-   * substituted UP/DOWN self id (LOD-level seam continuation) resolves to the branch state, so
-   * those seams drop their caps as internal continuations too.
+   * side's cap may be dropped. In {@code all} mode every side is enabled and {@link
+   * RootVertFilterBakedModel} removes only the small ({@code < 7.9} model unit) caps lying exactly
+   * on a cell boundary plane, like the stable candidate; large boundary faces stay. In {@code
+   * per-side} mode a side is set only when its neighbour resolves to a connected Dynamic Trees
+   * branch that actually covers the boundary plane, so the quad on that boundary plane is an
+   * internal face Voxy would drag into a visible fin. Air and unrelated blocks keep their caps, so
+   * exposed trunk tops and sides stay closed. {@code none} keeps every cap and skips installing the
+   * filter entirely.
    *
-   * <p>Only real branches ({@link DynamicTreesBranches#isBranch}, roots excluded) whose radius is
-   * at least the self radius may drop a cap: roots and thinner neighbours don't reliably cover the
-   * boundary plane, and dropping the cap there would leave an open end, so the cap is kept.
+   * <p>In per-side mode only real branches ({@link DynamicTreesBranches#isBranch}, roots excluded)
+   * whose radius is at least the self radius may drop a cap: roots and thinner neighbours don't
+   * reliably cover the boundary plane, and dropping the cap there would leave an open end, so the
+   * cap is kept.
    */
   private static int computeDropCapSidesMask(BlockState self, BlockState[] neighbours) {
+    if (BRANCH_CAP_FILTER_MODE == BranchCapFilterMode.ALL) {
+      // Stable-candidate behaviour: enable every side. The filter itself still keeps large
+      // boundary faces and anything above maxY, so this cannot remove arbitrary geometry.
+      return RootVertFilterBakedModel.ALL_SIDES_MASK;
+    }
+    if (BRANCH_CAP_FILTER_MODE == BranchCapFilterMode.NONE) {
+      return 0;
+    }
     int selfRadius = DynamicTreesBranches.radiusOf(self);
     if (selfRadius < 0) {
       // No radius property: the neighbour coverage cannot be proven, keep every cap.
@@ -732,10 +795,9 @@ public class ModelFactory {
     try {
       BlockState state = this.mapper.getBlockStateFromBlockId(key.blockId());
       BlockState[] neighbours = this.resolveVariantNeighbours(key);
-      int dropCapSidesMask =
-          DROP_BRANCH_BOUNDARY_CAPS ? computeDropCapSidesMask(state, neighbours) : 0;
+      int dropCapSidesMask = computeDropCapSidesMask(state, neighbours);
       BakedModel branchModel = null;
-      if (DROP_BRANCH_BOUNDARY_CAPS) {
+      if (BRANCH_CAP_FILTER_MODE != BranchCapFilterMode.NONE) {
         try {
           BakedModel raw =
               Minecraft.getInstance().getModelManager().getBlockModelShaper().getBlockModel(state);
@@ -746,7 +808,7 @@ public class ModelFactory {
           branchModel = null;
         }
       }
-      if (DROP_BRANCH_BOUNDARY_CAPS && branchModel == null) {
+      if (BRANCH_CAP_FILTER_MODE != BranchCapFilterMode.NONE && branchModel == null) {
         this.failVariant(key, "missing the branch model for the boundary-cap filter");
         return;
       }
@@ -804,10 +866,9 @@ public class ModelFactory {
     try {
       BlockState state = this.mapper.getBlockStateFromBlockId(key.blockId());
       BlockState[] neighbours = this.resolveVariantNeighbours(key);
-      int dropCapSidesMask =
-          DROP_BRANCH_BOUNDARY_CAPS ? computeDropCapSidesMask(state, neighbours) : 0;
+      int dropCapSidesMask = computeDropCapSidesMask(state, neighbours);
       BakedModel branchModel = null;
-      if (DROP_BRANCH_BOUNDARY_CAPS) {
+      if (BRANCH_CAP_FILTER_MODE != BranchCapFilterMode.NONE) {
         try {
           BakedModel raw =
               Minecraft.getInstance().getModelManager().getBlockModelShaper().getBlockModel(state);
@@ -818,7 +879,7 @@ public class ModelFactory {
           branchModel = null;
         }
       }
-      if (DROP_BRANCH_BOUNDARY_CAPS && branchModel == null) {
+      if (BRANCH_CAP_FILTER_MODE != BranchCapFilterMode.NONE && branchModel == null) {
         this.failVariant(key, "missing the branch model for the boundary-cap filter");
         return;
       }
