@@ -7,7 +7,7 @@ on:
       - multiversion
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -44,9 +44,21 @@ jobs:
           test -n "$(unzip -l "$JAR" | grep 'natives/macos/libvoxy_gl41metal.dylib')"
           test -n "$(unzip -l "$JAR" | grep 'natives/macos/gl41metal/voxy_gl41metal.metallib')"
 
-      - name: Upload jar
-        uses: actions/upload-artifact@v4
-        with:
-          name: voxy-neoforge-macos
-          path: neoforge/build/libs/*.jar
-          if-no-files-found: error
+      - name: Publish jar to rolling release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG=neoforge-latest
+          BASE=$(sed -n 's/^archives_base_name[[:space:]]*=[[:space:]]*//p' gradle.properties)
+          MOD=$(sed -n 's/^mod_version[[:space:]]*=[[:space:]]*//p' gradle.properties)
+          MC=$(sed -n 's/^minecraft_version[[:space:]]*=[[:space:]]*//p' gradle.properties)
+          CANONICAL="${BASE}-${MOD}+${MC}-neoforge.jar"
+          JAR=$(ls neoforge/build/libs/*.jar | head -n 1)
+          if [ "$(basename "$JAR")" != "$CANONICAL" ]; then
+            cp "$JAR" "neoforge/build/libs/$CANONICAL"
+          fi
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" \
+            --title "Voxy NeoForge builds" \
+            --notes "Universal NeoForge jar for Windows/Linux/Apple Silicon (arm64 Metal natives included). Intel Macs not supported." \
+            --prerelease --latest=false
+          gh release upload "$TAG" "neoforge/build/libs/$CANONICAL" --clobber

@@ -1,6 +1,10 @@
 name: manual-artifact
 
 on: [ workflow_dispatch ]
+
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -24,9 +28,26 @@ jobs:
       - name: Gradle build
         run: ./gradlew build
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: voxy-artifacts
-          path: build/libs/*.jar
-          archive: false
+      - name: Publish jars to rolling release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG=manual-latest
+          BASE=$(sed -n 's/^archives_base_name[[:space:]]*=[[:space:]]*//p' gradle.properties)
+          MOD=$(sed -n 's/^mod_version[[:space:]]*=[[:space:]]*//p' gradle.properties)
+          MC=$(sed -n 's/^minecraft_version[[:space:]]*=[[:space:]]*//p' gradle.properties)
+          NEO="${BASE}-${MOD}+${MC}-neoforge.jar"
+          FAB="${BASE}-${MOD}+${MC}-fabric.jar"
+          NEO_JAR=$(ls neoforge/build/libs/*.jar | head -n 1)
+          FAB_JAR=$(ls fabric/build/libs/*.jar | head -n 1)
+          if [ "$(basename "$NEO_JAR")" != "$NEO" ]; then
+            cp "$NEO_JAR" "neoforge/build/libs/$NEO"
+          fi
+          if [ "$(basename "$FAB_JAR")" != "$FAB" ]; then
+            cp "$FAB_JAR" "fabric/build/libs/$FAB"
+          fi
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" \
+            --title "Manual builds" \
+            --notes "Rolling manual Voxy builds for NeoForge and Fabric. Updated on every manual run." \
+            --prerelease --latest=false
+          gh release upload "$TAG" "neoforge/build/libs/$NEO" "fabric/build/libs/$FAB" --clobber
