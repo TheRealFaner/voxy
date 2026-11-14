@@ -94,6 +94,9 @@ public class RenderDataFactory {
   private int rootPlaneHiddenSkipped = 0;
   private int shellPatchedCount = 0;
   private int shellUnavailableCount = 0;
+  // Shell cells patched with the fail-safe solid bark base cube because the prism could not be
+  // resolved for a data/model-absence reason. DT-invalid shells (known non-thick core) stay empty.
+  private int shellSolidBaseFallbacks = 0;
   // Branch cells whose section masks were patched to match a neighbour-aware variant (one-shot
   // diag only).
   private int branchMaskPatchedCount = 0;
@@ -107,6 +110,16 @@ public class RenderDataFactory {
   // (one-shot diag only).
   private int shellLod1FallbackCount = 0;
   private int rootLod1FallbackCount = 0;
+  // Mesh-time LOD1 octant fill for the render-distance seam: fully-air LOD0 octants whose LOD1
+  // parent still holds data are replicated into a transient raw-array copy before meshing
+  // (one-shot diag only).
+  private final long[] fillScratch = new long[32 * 32 * 32];
+  private int seamFillSections = 0;
+  private int seamFillOctants = 0;
+  private int seamFillParentAbsent = 0;
+  private int seamFillParentAir = 0;
+  private static final java.util.concurrent.atomic.AtomicBoolean SEAM_FILL_FAIL_LOG =
+      new java.util.concurrent.atomic.AtomicBoolean();
   private static final java.util.concurrent.atomic.AtomicInteger SECTION_DIAG_LOGS =
       new java.util.concurrent.atomic.AtomicInteger();
 
@@ -674,6 +687,13 @@ public class RenderDataFactory {
         coreBlockId = this.readDiagonalCoreId(section, x, y, z, cdx, cdz);
         if (coreBlockId == DIAGONAL_CELL_UNAVAILABLE) {
           this.shellSkippedCornerBothOutside++;
+          if (!this.patchShellSolidBase(
+              rawSectionData, idx, x, y, z, shellBlockId, 0, neighborMsk)) {
+            anyNotReady = true;
+            if (notReadyBlockId == 0) {
+              notReadyBlockId = shellBlockId;
+            }
+          }
           continue;
         }
       } else if (outX) {
@@ -682,12 +702,26 @@ public class RenderDataFactory {
         if (cdx < 0) {
           if ((neighborMsk & 1) == 0) {
             this.shellSkippedMskBitMissing++;
+            if (!this.patchShellSolidBase(
+                rawSectionData, idx, x, y, z, shellBlockId, 0, neighborMsk)) {
+              anyNotReady = true;
+              if (notReadyBlockId == 0) {
+                notReadyBlockId = shellBlockId;
+              }
+            }
             continue;
           }
           coreBlockId = Mapper.getBlockId(this.neighboringFaces[y * 32 + coreZ]);
         } else {
           if ((neighborMsk & 2) == 0) {
             this.shellSkippedMskBitMissing++;
+            if (!this.patchShellSolidBase(
+                rawSectionData, idx, x, y, z, shellBlockId, 0, neighborMsk)) {
+              anyNotReady = true;
+              if (notReadyBlockId == 0) {
+                notReadyBlockId = shellBlockId;
+              }
+            }
             continue;
           }
           coreBlockId = Mapper.getBlockId(this.neighboringFaces[32 * 32 + y * 32 + coreZ]);
@@ -698,18 +732,33 @@ public class RenderDataFactory {
         if (cdz < 0) {
           if ((neighborMsk & 16) == 0) {
             this.shellSkippedMskBitMissing++;
+            if (!this.patchShellSolidBase(
+                rawSectionData, idx, x, y, z, shellBlockId, 0, neighborMsk)) {
+              anyNotReady = true;
+              if (notReadyBlockId == 0) {
+                notReadyBlockId = shellBlockId;
+              }
+            }
             continue;
           }
           coreBlockId = Mapper.getBlockId(this.neighboringFaces[4 * 32 * 32 + coreX + (y << 5)]);
         } else {
           if ((neighborMsk & 32) == 0) {
             this.shellSkippedMskBitMissing++;
+            if (!this.patchShellSolidBase(
+                rawSectionData, idx, x, y, z, shellBlockId, 0, neighborMsk)) {
+              anyNotReady = true;
+              if (notReadyBlockId == 0) {
+                notReadyBlockId = shellBlockId;
+              }
+            }
             continue;
           }
           coreBlockId = Mapper.getBlockId(this.neighboringFaces[5 * 32 * 32 + coreX + (y << 5)]);
         }
       }
       boolean lod1Fallback = false;
+      boolean lod1CellEmpty = false;
       if (coreBlockId <= 0) {
         // The LOD0 core cell is air/unavailable: the core's chunk can lie beyond the vanilla
         // render distance while VSS still holds LOD1 data there. Read the core state at the exact
@@ -718,13 +767,40 @@ public class RenderDataFactory {
         int worldY = (section.y << 5) + y;
         int worldZ = (section.z << 5) + z + cdz;
         int lod1CoreId = this.readBlockIdAtLevel(section.lvl + 1, worldX, worldY, worldZ);
-        if (lod1CoreId > 0 && this.modelMan.isThickBranchBlockId(lod1CoreId)) {
-          coreBlockId = lod1CoreId;
-          lod1Fallback = true;
-          this.shellLod1FallbackCount++;
+        // A negative result means the LOD1 section is absent (data unknown), so the fail-safe
+        // solid-bark cube below still applies. A non-negative result is the real block id.
+        if (lod1CoreId >= 0) {
+          if (this.modelMan.isThickBranchBlockId(lod1CoreId)) {
+            coreBlockId = lod1CoreId;
+            lod1Fallback = true;
+            this.shellLod1FallbackCount++;
+          } else {
+            // LOD1 data is present but the core cell is air or known non-thick: DT renders no
+            // trunk here, so keep the shell cell empty instead of adding a solid-bark cube.
+            lod1CellEmpty = true;
+          }
         }
       }
-      if (coreBlockId <= 0 || !this.modelMan.isThickBranchBlockId(coreBlockId)) {
+      if (coreBlockId <= 0) {
+        if (lod1CellEmpty) {
+          // LOD1 resolved the core as empty: the solid cube is only a data-absence fail-safe.
+          this.shellSkippedCoreNotThick++;
+          continue;
+        }
+        // Unknown core: LOD0 air plus a missing LOD1 section means the data is absent (chunk
+        // beyond the vanilla render distance, missing neighbour slice), not that DT drew nothing.
+        // Patch the fail-safe solid bark cube so a valid trunk wall never becomes a hole.
+        if (!this.patchShellSolidBase(rawSectionData, idx, x, y, z, shellBlockId, 0, neighborMsk)) {
+          anyNotReady = true;
+          if (notReadyBlockId == 0) {
+            notReadyBlockId = shellBlockId;
+          }
+        }
+        continue;
+      }
+      if (!this.modelMan.isThickBranchBlockId(coreBlockId)) {
+        // Known non-thick muse (root/thin branch/stale shell): DT itself renders nothing for this
+        // shell, so a bark cube here would be a wrong protrusion. Keep the cell empty.
         this.shellSkippedCoreNotThick++;
         continue;
       }
@@ -780,8 +856,17 @@ public class RenderDataFactory {
         continue;
       }
       if (shellModelId <= 0) {
+        // The prism piece is missing (id budget, degenerate sliver, failed bake): model absence,
+        // so keep the wall closed with the core's bark cube.
         if (shellModelId == ModelFactory.VARIANT_MODEL_UNAVAILABLE) {
           this.shellUnavailableCount++;
+        }
+        if (!this.patchShellSolidBase(
+            rawSectionData, idx, x, y, z, shellBlockId, coreBlockId, neighborMsk)) {
+          anyNotReady = true;
+          if (notReadyBlockId == 0) {
+            notReadyBlockId = shellBlockId;
+          }
         }
         continue;
       }
@@ -794,6 +879,68 @@ public class RenderDataFactory {
     if (anyNotReady) {
       throw new IdNotYetComputedException(notReadyBlockId, false);
     }
+  }
+
+  /**
+   * Patches the fail-safe solid bark cube into a {@code trunk_shell} cell whose prism cannot be
+   * resolved for a data/model-absence reason (unknown core, missing neighbour slice, unavailable
+   * shell bake). The cube is the cell's sole model on this path, so it never competes with a
+   * successfully patched prism. Known DT-invalid shells never reach here and stay empty.
+   *
+   * @return false while the derived cube bake is still queued, so the caller can retry the section;
+   *     a terminal bake failure leaves the cell empty instead of crashing
+   */
+  private boolean patchShellSolidBase(
+      long[] rawSectionData,
+      int idx,
+      int x,
+      int y,
+      int z,
+      int shellBlockId,
+      int coreBlockId,
+      int neighborMsk) {
+    int barkSourceBlockId =
+        coreBlockId > 0
+            ? coreBlockId
+            : this.findNearbyBarkSourceId(rawSectionData, x, y, z, neighborMsk);
+    int modelId = this.modelMan.getShellSolidBaseModelId(shellBlockId, barkSourceBlockId);
+    if (modelId == ModelFactory.VARIANT_MODEL_NOT_READY) {
+      return false;
+    }
+    if (modelId <= 0) {
+      // Every sprite/bake attempt failed (model factory already logged it): keep the cell empty
+      // rather than throwing or installing a bogus model.
+      return true;
+    }
+    long block = rawSectionData[idx];
+    long metadata = this.modelMan.getModelMetadataFromClientId(modelId);
+    this.sectionData[idx * 2] = packPartialQuadData(modelId, block, metadata);
+    this.sectionData[idx * 2 + 1] = metadata;
+    this.shellSolidBaseFallbacks++;
+    return true;
+  }
+
+  /**
+   * First Dynamic Trees branch state in the 26 neighbours of a shell cell, used as the bark sprite
+   * source when the core itself is unknown (data absence at the LOD seam). Reads through the same
+   * per-face neighbour slices as the core/cap resolution; unavailable neighbours are skipped.
+   * Returns 0 when no branch is visible, which selects the deterministic oak fallback.
+   */
+  private int findNearbyBarkSourceId(long[] rawSectionData, int x, int y, int z, int neighborMsk) {
+    for (int dy = -1; dy <= 1; dy++) {
+      for (int dz = -1; dz <= 1; dz++) {
+        for (int dx = -1; dx <= 1; dx++) {
+          if (dx == 0 && dy == 0 && dz == 0) {
+            continue;
+          }
+          int blockId = this.readRootNeighbourId(rawSectionData, x, y, z, dx, dy, dz, neighborMsk);
+          if (blockId > 0 && this.modelMan.isAnyBranchBlockId(blockId)) {
+            return blockId;
+          }
+        }
+      }
+    }
+    return 0;
   }
 
   private static final int DIAGONAL_CELL_UNAVAILABLE = -1;
@@ -814,8 +961,7 @@ public class RenderDataFactory {
     try {
       int localX = (x + cdx) & 31;
       int localZ = (z + cdz) & 31;
-      return Mapper.getBlockId(
-          diagonal._unsafeGetRawDataArray()[localX + 32 * localZ + 1024 * y]);
+      return Mapper.getBlockId(diagonal._unsafeGetRawDataArray()[localX + 32 * localZ + 1024 * y]);
     } finally {
       diagonal.release(WorldSection.RELEASE_HINT_POSSIBLE_REUSE);
     }
@@ -847,6 +993,115 @@ public class RenderDataFactory {
     } finally {
       section.release(WorldSection.RELEASE_HINT_POSSIBLE_REUSE);
     }
+  }
+
+  /**
+   * Mesh-time LOD1 octant fill for the render-distance seam. An LOD0 section is eight 16^3 octants;
+   * an octant that is entirely air in LOD0 (its chunk lies beyond the vanilla render distance) but
+   * has data in the parent LOD1 section gets each non-air LOD1 cell replicated over its 2x2x2 LOD0
+   * cells. The fill goes into a transient copy of the raw array: the section and its storage are
+   * never mutated. Returns null when nothing was filled.
+   */
+  private long[] tryFillSeamOctants(WorldSection section, long[] raw) {
+    if (section.lvl != 0) {
+      return null;
+    }
+    int airOctantMask = 0;
+    for (int o = 0; o < 8; o++) {
+      int ox = (o & 1) << 4;
+      int oz = ((o >> 1) & 1) << 4;
+      int oy = ((o >> 2) & 1) << 4;
+      boolean air = true;
+      octantScan:
+      for (int y = 0; y < 16; y++) {
+        for (int z = 0; z < 16; z++) {
+          for (int x = 0; x < 16; x++) {
+            if (!Mapper.isAir(raw[WorldSection.getIndex(ox + x, oy + y, oz + z)])) {
+              air = false;
+              break octantScan;
+            }
+          }
+        }
+      }
+      if (air) {
+        airOctantMask |= 1 << o;
+      }
+    }
+    if (airOctantMask == 0) {
+      return null;
+    }
+
+    WorldSection parent =
+        this.world.acquireIfExists(1, section.x >> 1, section.y >> 1, section.z >> 1);
+    if (parent == null) {
+      this.seamFillParentAbsent++;
+      return null;
+    }
+    int filledOctants = 0;
+    long[] scratch = null;
+    try {
+      long[] parentData = parent._unsafeGetRawDataArray();
+      for (int o = 0; o < 8; o++) {
+        if ((airOctantMask & (1 << o)) == 0) {
+          continue;
+        }
+        int ox = (o & 1) << 4;
+        int oz = ((o >> 1) & 1) << 4;
+        int oy = ((o >> 2) & 1) << 4;
+        int px0 = ((section.x & 1) << 4) + ((o & 1) << 3);
+        int pz0 = ((section.z & 1) << 4) + (((o >> 1) & 1) << 3);
+        int py0 = ((section.y & 1) << 4) + (((o >> 2) & 1) << 3);
+        boolean parentAir = true;
+        parentScan:
+        for (int cy = 0; cy < 8; cy++) {
+          for (int cz = 0; cz < 8; cz++) {
+            for (int cx = 0; cx < 8; cx++) {
+              if (!Mapper.isAir(parentData[WorldSection.getIndex(px0 + cx, py0 + cy, pz0 + cz)])) {
+                parentAir = false;
+                break parentScan;
+              }
+            }
+          }
+        }
+        if (parentAir) {
+          this.seamFillParentAir++;
+          continue;
+        }
+        if (scratch == null) {
+          scratch = this.fillScratch;
+          section.copyDataTo(scratch);
+        }
+        for (int cy = 0; cy < 8; cy++) {
+          for (int cz = 0; cz < 8; cz++) {
+            for (int cx = 0; cx < 8; cx++) {
+              long id = parentData[WorldSection.getIndex(px0 + cx, py0 + cy, pz0 + cz)];
+              if (Mapper.isAir(id)) {
+                continue;
+              }
+              int bx = ox + (cx << 1);
+              int by = oy + (cy << 1);
+              int bz = oz + (cz << 1);
+              for (int dy = 0; dy < 2; dy++) {
+                for (int dz = 0; dz < 2; dz++) {
+                  for (int dx = 0; dx < 2; dx++) {
+                    scratch[WorldSection.getIndex(bx + dx, by + dy, bz + dz)] = id;
+                  }
+                }
+              }
+            }
+          }
+        }
+        filledOctants++;
+      }
+    } finally {
+      parent.release(WorldSection.RELEASE_HINT_POSSIBLE_REUSE);
+    }
+    if (filledOctants == 0) {
+      return null;
+    }
+    this.seamFillSections++;
+    this.seamFillOctants += filledOctants;
+    return scratch;
   }
 
   // Horizontal neighbours of a surface root, in the same order as the LOD0 core search in
@@ -2922,8 +3177,8 @@ public class RenderDataFactory {
   /**
    * Emits one isolated quad through the scratch mesher using the same swizzle as the scanline
    * loops: axis 0 (Y) takes (x,z), axis 1 (Z) takes (x,y), axis 2 (X) takes (z,y). emitQuad writes
-   * the owning block's coordinate as the auxiliary position, so the face offset is enabled only
-   * for positive faces (side 1), matching the {@code face & 1} bit the mesh loops putNext.
+   * the owning block's coordinate as the auxiliary position, so the face offset is enabled only for
+   * positive faces (side 1), matching the {@code face & 1} bit the mesh loops putNext.
    */
   private void emitRootPlaneQuad(int face, int x, int y, int z, long data) {
     int axis = face >> 1;
@@ -3031,6 +3286,7 @@ public class RenderDataFactory {
     this.rootPlaneHiddenSkipped = 0;
     this.shellPatchedCount = 0;
     this.shellUnavailableCount = 0;
+    this.shellSolidBaseFallbacks = 0;
     this.branchMaskPatchedCount = 0;
     this.shellSkippedCornerBothOutside = 0;
     this.shellSkippedMskBitMissing = 0;
@@ -3038,11 +3294,31 @@ public class RenderDataFactory {
     this.shellSkippedCoreDirNull = 0;
     this.shellLod1FallbackCount = 0;
     this.rootLod1FallbackCount = 0;
+    this.seamFillSections = 0;
+    this.seamFillOctants = 0;
+    this.seamFillParentAbsent = 0;
+    this.seamFillParentAir = 0;
 
     // Prepare everything. Per-position Dynamic Trees variants only exist at LOD0; mips and other
     // levels keep using the plain per-BlockState model ids.
     boolean lod0 = section.lvl == 0;
-    int neighborMskAndFlags = this.prepareSectionData(section._unsafeGetRawDataArray(), lod0);
+    // Mesh-time seam fill: at the render-distance seam the far LOD0 octants are air while the
+    // LOD1 parent still holds the trunk, and the LOD0 mesh suppresses the LOD1 parent. Mesh a
+    // transient copy with those octants filled from LOD1 so the far half of the trunk is drawn.
+    long[] rawData = section._unsafeGetRawDataArray();
+    if (lod0 && DynamicTreesBranches.PRESENT) {
+      try {
+        long[] filled = this.tryFillSeamOctants(section, rawData);
+        if (filled != null) {
+          rawData = filled;
+        }
+      } catch (RuntimeException e) {
+        if (SEAM_FILL_FAIL_LOG.compareAndSet(false, true)) {
+          Logger.warn("Dynamic Trees LOD seam octant fill failed; meshing raw section data", e);
+        }
+      }
+    }
+    int neighborMskAndFlags = this.prepareSectionData(rawData, lod0);
     if ((neighborMskAndFlags & (1 << 31)) != 0) { // We failed to get everything so throw exception
       throw new IdNotYetComputedException(neighborMskAndFlags & ((1 << 20) - 1), true);
     }
@@ -3054,13 +3330,13 @@ public class RenderDataFactory {
 
     try {
       if (lod0 && this.variantBlockCount != 0 && CHECK_NEIGHBOR_FACE_OCCLUSION) {
-        this.resolveBranchVariants(section._unsafeGetRawDataArray(), neighborMsk);
+        this.resolveBranchVariants(rawData, neighborMsk);
       }
       if (lod0 && this.shellBlockCount != 0) {
-        this.resolveTrunkShells(section._unsafeGetRawDataArray(), neighborMsk, section);
+        this.resolveTrunkShells(rawData, neighborMsk, section);
       }
       if (lod0 && this.rootBlockCount != 0) {
-        this.resolveSurfaceRoots(section._unsafeGetRawDataArray(), neighborMsk, section);
+        this.resolveSurfaceRoots(rawData, neighborMsk, section);
       }
       if (lod0 && DTRootGeometryCache.isActive()) {
         // Publish (or clear) the overlay entry on every LOD0 mesh: an empty list marks the section
@@ -3070,9 +3346,7 @@ public class RenderDataFactory {
             SectionPos.asLong(section.x, section.y, section.z), this.overlayRoots);
       }
       if (lod0
-          && (this.rootBlockCount != 0
-              || this.shellBlockCount != 0
-              || this.variantBlockCount != 0)
+          && (this.rootBlockCount != 0 || this.shellBlockCount != 0 || this.variantBlockCount != 0)
           && SECTION_DIAG_LOGS.getAndIncrement() < 24) {
         Logger.info(
             "DT LOD0 section diag @ "
@@ -3097,6 +3371,8 @@ public class RenderDataFactory {
                 + this.shellPatchedCount
                 + " unavailable="
                 + this.shellUnavailableCount
+                + " shellSolidBaseFallbacks="
+                + this.shellSolidBaseFallbacks
                 + " shellSkips=corner:"
                 + this.shellSkippedCornerBothOutside
                 + ",msk:"
@@ -3109,6 +3385,14 @@ public class RenderDataFactory {
                 + this.shellLod1FallbackCount
                 + ",root:"
                 + this.rootLod1FallbackCount
+                + " seamFill=sections:"
+                + this.seamFillSections
+                + ",octants:"
+                + this.seamFillOctants
+                + ",parentAbsent:"
+                + this.seamFillParentAbsent
+                + ",parentAir:"
+                + this.seamFillParentAir
                 + " branches="
                 + this.variantBlockCount
                 + " maskPatched="
@@ -3116,7 +3400,7 @@ public class RenderDataFactory {
       }
       this.generateYZFaces();
       this.generateXFaces();
-      this.generateRootPlaneGeometry(section._unsafeGetRawDataArray());
+      this.generateRootPlaneGeometry(rawData);
     } catch (IdNotYetComputedException e) {
       e.auxBitMsk = neighborMsk;
       e.auxData = this.neighboringFaces;
