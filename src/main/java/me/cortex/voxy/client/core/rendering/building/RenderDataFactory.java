@@ -278,6 +278,10 @@ public class RenderDataFactory {
     final var rawModelIds = this.modelMan._unsafeRawAccess();
     final long airMetadata = this.modelMan.getModelMetadataFromClientId(0);
     final boolean collectVariants = lod0 && this.modelMan.supportsVariantModels();
+    // Root cells must be resolved (and suppressed) at LOD0 even where variant baking is
+    // unsupported, so that the master switch can keep every DT root out of the Voxy mesh. When
+    // the switch is on this adds nothing: variants-capable loaders already collect them above.
+    final boolean collectRoots = collectVariants || (lod0 && !DTRootGeometryCache.ROOTS_ENABLED);
     long opaque = 0;
     long notEmpty = 0;
     long pureFluid = 0;
@@ -310,7 +314,7 @@ public class RenderDataFactory {
             trunkShellForLod0 = true;
           }
           boolean rootForLod0 = false;
-          if (collectVariants && this.modelMan.isSurfaceRootBlockId(blockId)) {
+          if (collectRoots && this.modelMan.isSurfaceRootBlockId(blockId)) {
             this.rootBlockIndices[this.rootBlockCount++] = i;
             rootForLod0 = true;
           }
@@ -820,14 +824,20 @@ public class RenderDataFactory {
               | (((eastC >> 4) & 3) << 2)
               | (((southC >> 4) & 3) << 4)
               | (((westC >> 4) & 3) << 6);
+      // The 3x3x3 cube is consumed only by the overlay and root-variant paths. With the master
+      // switch off neither runs, so the capture is skipped entirely.
       BlockState[] cube =
-          this.buildRootCube(
-              blockId, up, northDown, north, northUp, eastDown, east, eastUp, southDown, south,
-              southUp, westDown, west, westUp);
-      if (DTRootGeometryCache.isActive()) {
-        // Suppress the root impostor: the vanilla-renderer overlay draws the exact DT model.
-        // Root cells that replaced a trunk_shell still need the thick-trunk prism wall, which the
-        // overlay does not draw; keep the pre-baked shell-only impostor for those cells.
+          DTRootGeometryCache.ROOTS_ENABLED
+              ? this.buildRootCube(
+                  blockId, up, northDown, north, northUp, eastDown, east, eastUp, southDown, south,
+                  southUp, westDown, west, westUp)
+              : null;
+      if (!DTRootGeometryCache.ROOTS_ENABLED || DTRootGeometryCache.isActive()) {
+        // Master switch off, or overlay active: suppress the root impostor from the LOD0 mesh so
+        // Voxy draws no root geometry here. Root cells that replaced a trunk_shell still need the
+        // thick-trunk prism wall, which the overlay does not draw; keep the pre-baked shell-only
+        // impostor for those cells so the wall remains. Without an adjacent thick-trunk core the
+        // cell stays air/base (no root geometry).
         int suppressionModelId = 0;
         if (coreBlockId != 0) {
           int shellId = this.modelMan.getShellModelId(coreBlockId, coreDx, coreDz, 0);
@@ -844,15 +854,20 @@ public class RenderDataFactory {
             suppressionModelId = shellId;
           }
         }
-        BlockState rootState = this.modelMan.getBlockStateForId(blockId);
-        this.overlayRoots.add(
-            new DTRootGeometryCache.RootBlock(
-                (section.x << 5) + x,
-                (section.y << 5) + y,
-                (section.z << 5) + z,
-                rootState,
-                cube,
-                Mapper.getLightId(rawSectionData[idx])));
+        if (DTRootGeometryCache.isActive()) {
+          // Overlay on: draw the exact DT model with the vanilla renderer. With the master switch
+          // off isActive() is false, so nothing is collected and the root stays suppressed (air
+          // or shell-only) in the impostor mesh.
+          BlockState rootState = this.modelMan.getBlockStateForId(blockId);
+          this.overlayRoots.add(
+              new DTRootGeometryCache.RootBlock(
+                  (section.x << 5) + x,
+                  (section.y << 5) + y,
+                  (section.z << 5) + z,
+                  rootState,
+                  cube,
+                  Mapper.getLightId(rawSectionData[idx])));
+        }
         long suppressionMetadata =
             this.modelMan.getModelMetadataFromClientId(Math.max(suppressionModelId, 0));
         this.sectionData[idx * 2] =
@@ -2699,6 +2714,8 @@ public class RenderDataFactory {
                 + section.y
                 + ","
                 + section.z
+                + " rootsEnabled="
+                + DTRootGeometryCache.ROOTS_ENABLED
                 + " roots="
                 + this.rootBlockCount
                 + " patched="

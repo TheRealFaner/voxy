@@ -19,6 +19,9 @@ public class NeoForgeVoxyClient extends VoxyClient {
       new java.util.concurrent.atomic.AtomicBoolean();
 
   public NeoForgeVoxyClient(IEventBus modBus, ModContainer container) {
+    // The loader is always marked active; DTRootGeometryCache.ROOTS_ENABLED
+    // (voxy.dtRootsEnabled) is the master switch that makes isActive() false and turns the
+    // overlay hook below into a no-op.
     DTRootGeometryCache.setActive(true);
     NeoForge.EVENT_BUS.addListener(
         (RegisterClientCommandsEvent evt) -> {
@@ -34,6 +37,8 @@ public class NeoForgeVoxyClient extends VoxyClient {
               me.cortex.voxy.common.Logger.info(
                   "DT root overlay stage reached (AFTER_TRANSLUCENT_BLOCKS)");
             }
+            // No-op when the DT roots master switch is off: the renderer early-returns before
+            // any work (the one-shot DISABLED message is logged on DTRootGeometryCache load).
             DTRootOverlayRenderer.render(event.getPoseStack(), event.getCamera());
           }
         });

@@ -764,6 +764,11 @@ public class ModelFactory {
 
   private void bakeRootVariantSoftware(RootCrownKey key) {
     try {
+      if (!DTRootGeometryCache.ROOTS_ENABLED) {
+        // Fail-safe: no root bake may run while the master switch is off (the finally still
+        // releases the inflight slot if a stale key was queued before the switch was read).
+        return;
+      }
       BlockState state = this.mapper.getBlockStateFromBlockId(key.blockId());
       BlockState[] cube = this.rootCubes.get(key);
       BakedModel model = this.buildRootExactModel(key, state, cube);
@@ -832,6 +837,11 @@ public class ModelFactory {
 
   private void bakeRootVariantGl41(RootCrownKey key) {
     try {
+      if (!DTRootGeometryCache.ROOTS_ENABLED) {
+        // Fail-safe: no root bake may run while the master switch is off (the finally still
+        // releases the inflight slot if a stale key was queued before the switch was read).
+        return;
+      }
       BlockState state = this.mapper.getBlockStateFromBlockId(key.blockId());
       BlockState[] cube = this.rootCubes.get(key);
       BakedModel model = this.buildRootExactModel(key, state, cube);
@@ -2314,6 +2324,11 @@ public class ModelFactory {
       int coreDx,
       int coreDz,
       BlockState[] cube) {
+    if (!DTRootGeometryCache.ROOTS_ENABLED) {
+      // Master switch off: fail-safe, never queue a RootCrownKey bake. The LOD0 resolver
+      // suppresses root cells without requesting a variant.
+      return VARIANT_MODEL_UNAVAILABLE;
+    }
     if (!this.variantBakingSupported || cube == null) {
       // The exact DT model can only be baked from a captured context cube. A null cube would
       // poison the key (the first caller wins the stored cube) and every later request would

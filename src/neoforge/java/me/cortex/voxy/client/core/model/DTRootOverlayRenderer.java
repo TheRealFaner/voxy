@@ -48,6 +48,11 @@ public final class DTRootOverlayRenderer {
   private DTRootOverlayRenderer() {}
 
   public static void render(PoseStack poseStack, Camera camera) {
+    if (!DTRootGeometryCache.ROOTS_ENABLED) {
+      // Master switch off: the loader hook may still fire, but it must do no work at all. The
+      // one-shot DISABLED message is logged by DTRootGeometryCache on first class load.
+      return;
+    }
     if (!DTRootGeometryCache.isActive() || DTRootGeometryCache.isEmpty()) {
       return;
     }
@@ -128,7 +133,9 @@ public final class DTRootOverlayRenderer {
     if (cachedRoots > 0 && now - lastLogNanos > 5_000_000_000L) {
       lastLogNanos = now;
       me.cortex.voxy.common.Logger.info(
-          "DT root overlay: sections="
+          "DT root overlay: rootsEnabled="
+              + DTRootGeometryCache.ROOTS_ENABLED
+              + " sections="
               + DTRootGeometryCache.sections().size()
               + " roots="
               + cachedRoots
