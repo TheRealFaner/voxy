@@ -102,6 +102,11 @@ public class RenderDataFactory {
   private int shellSkippedMskBitMissing = 0;
   private int shellSkippedCoreNotThick = 0;
   private int shellSkippedCoreDirNull = 0;
+  // Render-distance seam fallback: the LOD0 core reads as air because its chunk lies beyond the
+  // vanilla render distance, so the core state is read from the LOD1 mip section instead
+  // (one-shot diag only).
+  private int shellLod1FallbackCount = 0;
+  private int rootLod1FallbackCount = 0;
   private static final java.util.concurrent.atomic.AtomicInteger SECTION_DIAG_LOGS =
       new java.util.concurrent.atomic.AtomicInteger();
 
@@ -700,6 +705,21 @@ public class RenderDataFactory {
           coreBlockId = Mapper.getBlockId(this.neighboringFaces[5 * 32 * 32 + coreX + (y << 5)]);
         }
       }
+      boolean lod1Fallback = false;
+      if (coreBlockId <= 0) {
+        // The LOD0 core cell is air/unavailable: the core's chunk can lie beyond the vanilla
+        // render distance while VSS still holds LOD1 data there. Read the core state at the exact
+        // world position from the LOD1 mip section so the ring keeps its trunk wall.
+        int worldX = (section.x << 5) + x + cdx;
+        int worldY = (section.y << 5) + y;
+        int worldZ = (section.z << 5) + z + cdz;
+        int lod1CoreId = this.readBlockIdAtLevel(section.lvl + 1, worldX, worldY, worldZ);
+        if (lod1CoreId > 0 && this.modelMan.isThickBranchBlockId(lod1CoreId)) {
+          coreBlockId = lod1CoreId;
+          lod1Fallback = true;
+          this.shellLod1FallbackCount++;
+        }
+      }
       if (coreBlockId <= 0 || !this.modelMan.isThickBranchBlockId(coreBlockId)) {
         this.shellSkippedCoreNotThick++;
         continue;
@@ -744,7 +764,10 @@ public class RenderDataFactory {
           capBits |= 2;
         }
       }
-      int shellModelId = this.modelMan.getShellModelId(coreBlockId, -cdx, -cdz, capBits);
+      // The fallback core was read from the LOD1 mip, where the LOD0 up/down context around it is
+      // unavailable/unreliable: cap both ends conservatively instead of trusting those reads.
+      int shellModelId =
+          this.modelMan.getShellModelId(coreBlockId, -cdx, -cdz, lod1Fallback ? 3 : capBits);
       if (shellModelId == ModelFactory.VARIANT_MODEL_NOT_READY) {
         anyNotReady = true;
         if (notReadyBlockId == 0) {
@@ -793,6 +816,41 @@ public class RenderDataFactory {
       diagonal.release(WorldSection.RELEASE_HINT_POSSIBLE_REUSE);
     }
   }
+
+  /**
+   * Reads the block id at world coords from a Voxy mip level; -1 when the section is absent.
+   *
+   * <p>Render-distance seam fallback: beyond the vanilla render distance the LOD0 section is air,
+   * but the Voxel Shape Storage still holds the coarser LOD1 data there, so the thick-trunk core
+   * can be recovered at its exact position instead of losing the trunk wall.
+   */
+  private int readBlockIdAtLevel(int lvl, int worldX, int worldY, int worldZ) {
+    int bx = worldX >> lvl;
+    int by = worldY >> lvl;
+    int bz = worldZ >> lvl;
+    int sx = bx >> 5;
+    int sy = by >> 5;
+    int sz = bz >> 5;
+    int lx = bx & 31;
+    int ly = by & 31;
+    int lz = bz & 31;
+    WorldSection section = this.world.acquireIfExists(lvl, sx, sy, sz);
+    if (section == null) {
+      return -1;
+    }
+    try {
+      return Mapper.getBlockId(section._unsafeGetRawDataArray()[lx + 32 * lz + 1024 * ly]);
+    } finally {
+      section.release(WorldSection.RELEASE_HINT_POSSIBLE_REUSE);
+    }
+  }
+
+  // Horizontal neighbours of a surface root, in the same order as the LOD0 core search in
+  // resolveSurfaceRoots (cardinals, then diagonals). The LOD1 fallback reads at cell + offset and
+  // stores the negated offset, because coreDx/coreDz is the cell's offset from the core.
+  private static final int[][] ROOT_CORE_OFFSETS = {
+    {0, -1}, {0, 1}, {-1, 0}, {1, 0}, {-1, -1}, {1, -1}, {-1, 1}, {1, 1}
+  };
 
   /**
    * DT's {@code branchesAround} flag for the thick-trunk cap rules: true when any horizontal
@@ -862,6 +920,14 @@ public class RenderDataFactory {
       int coreBlockId = 0;
       int coreDx = 0;
       int coreDz = 0;
+      // Seam gate: remember whether any already-read LOD0 neighbour is a trunk_shell, so the LOD1
+      // root probes below run only in a thick-trunk context (thin trees have no shell cells).
+      // No extra reads: the cardinal ids are read above and the diagonals in their branch below.
+      boolean adjacentTrunkShell =
+          this.modelMan.isTrunkShellBlockId(north)
+              || this.modelMan.isTrunkShellBlockId(south)
+              || this.modelMan.isTrunkShellBlockId(west)
+              || this.modelMan.isTrunkShellBlockId(east);
       if (this.modelMan.isThickBranchBlockId(north)) {
         coreBlockId = north;
         coreDz = 1;
@@ -879,6 +945,12 @@ public class RenderDataFactory {
         int northEast = this.readRootNeighbourId(rawSectionData, x, y, z, 1, 0, -1, neighborMsk);
         int southWest = this.readRootNeighbourId(rawSectionData, x, y, z, -1, 0, 1, neighborMsk);
         int southEast = this.readRootNeighbourId(rawSectionData, x, y, z, 1, 0, 1, neighborMsk);
+        adjacentTrunkShell =
+            adjacentTrunkShell
+                || this.modelMan.isTrunkShellBlockId(northWest)
+                || this.modelMan.isTrunkShellBlockId(northEast)
+                || this.modelMan.isTrunkShellBlockId(southWest)
+                || this.modelMan.isTrunkShellBlockId(southEast);
         if (this.modelMan.isThickBranchBlockId(northWest)) {
           coreBlockId = northWest;
           coreDx = 1;
@@ -973,6 +1045,30 @@ public class RenderDataFactory {
         // fluidMasks stay untouched: waterlogged water is still meshed by the fluid pass.
         this.rootPatchedCount++;
         continue;
+      }
+      // Seam fallback (non-overlay path only): when the trunk core's chunk lies beyond the vanilla
+      // render distance, LOD0 reports the core as air and the root loses the trunk-facing wall.
+      // Read the core at the exact position from the LOD1 mip section instead. Same y only: the
+      // y-1 root flare under a trunk has no core beside it and must stay wall-less. Gated on a
+      // LOD0 trunk_shell neighbour: thin trees have no shell cells, so their root cells skip the
+      // (potentially storage-loading) LOD1 probes entirely.
+      if (coreBlockId == 0 && adjacentTrunkShell) {
+        int wx = (section.x << 5) + x;
+        int wy = (section.y << 5) + y;
+        int wz = (section.z << 5) + z;
+        for (int[] offset : ROOT_CORE_OFFSETS) {
+          int candidateId =
+              this.readBlockIdAtLevel(section.lvl + 1, wx + offset[0], wy, wz + offset[1]);
+          if (candidateId > 0 && this.modelMan.isThickBranchBlockId(candidateId)) {
+            coreBlockId = candidateId;
+            // Stored convention: the cell's offset from the core (core -> cell), as in the LOD0
+            // search above and as getShellModelId/buildRootExactModel expect.
+            coreDx = -offset[0];
+            coreDz = -offset[1];
+            this.rootLod1FallbackCount++;
+            break;
+          }
+        }
       }
       int rootModelId =
           this.modelMan.getRootVariantModelId(
@@ -2925,6 +3021,8 @@ public class RenderDataFactory {
     this.shellSkippedMskBitMissing = 0;
     this.shellSkippedCoreNotThick = 0;
     this.shellSkippedCoreDirNull = 0;
+    this.shellLod1FallbackCount = 0;
+    this.rootLod1FallbackCount = 0;
 
     // Prepare everything. Per-position Dynamic Trees variants only exist at LOD0; mips and other
     // levels keep using the plain per-BlockState model ids.
@@ -2990,6 +3088,10 @@ public class RenderDataFactory {
                 + this.shellSkippedCoreNotThick
                 + ",dirNull:"
                 + this.shellSkippedCoreDirNull
+                + " lod1Fallback=shell:"
+                + this.shellLod1FallbackCount
+                + ",root:"
+                + this.rootLod1FallbackCount
                 + " branches="
                 + this.variantBlockCount
                 + " maskPatched="
