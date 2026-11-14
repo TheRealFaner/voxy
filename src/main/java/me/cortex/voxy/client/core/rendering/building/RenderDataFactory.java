@@ -3379,7 +3379,9 @@ public class RenderDataFactory {
                 + " branches="
                 + this.variantBlockCount
                 + " maskPatched="
-                + this.branchMaskPatchedCount);
+                + this.branchMaskPatchedCount
+                + " capFilter="
+                + ModelFactory.branchCapFilterMode());
       }
       this.generateYZFaces();
       this.generateXFaces();

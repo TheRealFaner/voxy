@@ -36,14 +36,15 @@ import org.jetbrains.annotations.Nullable;
  * are kept.
  *
  * <p>The caps are dropped per side: {@code dropCapSidesMask} bit {@code i} (where {@code i} is
- * {@link Direction#get3DDataValue()}) means that side's boundary cap may be dropped because the
- * neighbour there is a connected branch. Plane {@code x=0} maps to WEST(4), {@code x=16} to
- * EAST(5), {@code y=0} to DOWN(0), {@code y=16} to UP(1), {@code z=0} to NORTH(2) and {@code
- * z=16} to SOUTH(3). Air neighbours keep their caps, so a trunk top or an exposed side stays
- * closed.
+ * {@link Direction#get3DDataValue()}) means that side's boundary cap may be dropped. {@link
+ * #ALL_SIDES_MASK} enables every side (the default {@code all} branch-cap-filter mode); the {@code
+ * per-side} mode sets only sides whose neighbour is a connected branch. Plane {@code x=0} maps to
+ * WEST(4), {@code x=16} to EAST(5), {@code y=0} to DOWN(0), {@code y=16} to UP(1), {@code z=0} to
+ * NORTH(2) and {@code z=16} to SOUTH(3). Air neighbours keep their caps, so a trunk top or an
+ * exposed side stays closed.
  */
 final class RootVertFilterBakedModel implements BakedModel {
-  private static final int ALL_SIDES_MASK = 0x3F;
+  static final int ALL_SIDES_MASK = 0x3F;
 
   private final BakedModel delegate;
   private final float maxY;
