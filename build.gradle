@@ -86,6 +86,8 @@ tasks.register('compileGl41MetalNative', Exec) {
                  '-Werror',
                  '-Wno-deprecated-declarations',
                  '-dynamiclib',
+                 '-arch', 'x86_64',
+                 '-arch', 'arm64',
                  '-I', "${javaHome}/include",
                  '-I', "${javaHome}/include/darwin",
                  '-I', 'src/main/native/gl41metal'] +
