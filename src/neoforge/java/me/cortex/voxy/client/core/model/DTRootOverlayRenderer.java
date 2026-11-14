@@ -36,13 +36,33 @@ import org.jetbrains.annotations.Nullable;
  * from the impostor stream ({@code DTRootGeometryCache} collection) and drawn here with the vanilla
  * block renderer instead: the exact SurfaceRootBlockBakedModel quads, the vanilla atlas, lightmap,
  * tint and AO. The 3x3x3 connection cube captured during meshing is fed back through {@link
- * ModelData}, so cross-section connections match Dynamic Trees exactly. Roots are skipped where
- * vanilla renders them: the chunk must be loaded AND inside the vanilla render distance (the client
- * stores more chunks than it renders).
+ * ModelData}, so cross-section connections match Dynamic Trees exactly. By default the overlay
+ * draws roots everywhere in range: Voxy suppresses the root impostor while this overlay is active,
+ * so in a Voxy-only pack (no Sable, Voxy replaces vanilla chunk rendering) the overlay is the only
+ * root renderer in loaded chunks. {@code -Dvoxy.dtRootOverlaySkipVanillaChunks=true} restores the
+ * old skip for loaded chunks inside the vanilla render distance (the client stores more chunks than
+ * it renders), for setups where a vanilla/Sable renderer draws those chunks itself.
  */
 public final class DTRootOverlayRenderer {
   private static final java.util.concurrent.atomic.AtomicBoolean STARTED =
       new java.util.concurrent.atomic.AtomicBoolean();
+  private static final java.util.concurrent.atomic.AtomicBoolean WARNED_SKIP =
+      new java.util.concurrent.atomic.AtomicBoolean();
+
+  /**
+   * Whether to skip overlay roots in chunks the vanilla/Sable chunk renderer draws. Read once at
+   * class initialisation.
+   *
+   * <p>Default {@code false}: Voxy suppresses the DT root impostors while this overlay is active
+   * ({@code RenderDataFactory.resolveSurfaceRoots}), and in a Voxy-only pack there is no Sable and
+   * Voxy replaces vanilla chunk rendering, so the overlay is the only renderer of roots in loaded
+   * chunks and must draw them. Set {@code -Dvoxy.dtRootOverlaySkipVanillaChunks=true} only when a
+   * vanilla/Sable renderer draws loaded chunks itself: the skip then avoids a double render at the
+   * cost of dropping the overlay where that other renderer is expected to draw.
+   */
+  private static final boolean SKIP_VANILLA_CHUNKS =
+      Boolean.parseBoolean(System.getProperty("voxy.dtRootOverlaySkipVanillaChunks", "false"));
+
   private static long lastLogNanos;
 
   private DTRootOverlayRenderer() {}
@@ -54,9 +74,6 @@ public final class DTRootOverlayRenderer {
     ClientLevel level = Minecraft.getInstance().level;
     if (level == null) {
       return;
-    }
-    if (STARTED.compareAndSet(false, true)) {
-      me.cortex.voxy.common.Logger.info("DT root overlay renderer active");
     }
     Vec3 cam = camera.getPosition();
     int rd = Minecraft.getInstance().options.getEffectiveRenderDistance();
@@ -70,7 +87,8 @@ public final class DTRootOverlayRenderer {
     boolean any = false;
     int cachedRoots = 0;
     int drawn = 0;
-    int skippedLoaded = 0;
+    int skippedSections = 0;
+    int skippedRoots = 0;
     for (Map.Entry<Long, List<DTRootGeometryCache.RootBlock>> entry :
         DTRootGeometryCache.sections().entrySet()) {
       int sx = SectionPos.x(entry.getKey());
@@ -84,17 +102,24 @@ public final class DTRootOverlayRenderer {
         continue;
       }
       cachedRoots += entry.getValue().size();
+      boolean sectionSkipped = false;
       for (DTRootGeometryCache.RootBlock root : entry.getValue()) {
         int cx = root.x() >> 4;
         int cz = root.z() >> 4;
         // The client stores viewDistance+3 chunks but vanilla renders only viewDistance, so a
-        // loaded-chunk-only test skipped a ~3-chunk ring that vanilla does not draw.
+        // loaded-chunk-only test skipped a ~3-chunk ring that vanilla does not draw. The whole
+        // skip is opt-in: with Voxy-only rendering nothing else draws roots in loaded chunks.
         boolean vanillaVisible =
-            level.getChunkSource().hasChunk(cx, cz)
+            SKIP_VANILLA_CHUNKS
+                && level.getChunkSource().hasChunk(cx, cz)
                 && Math.max(Math.abs(cx - camChunkX), Math.abs(cz - camChunkZ)) <= rd;
         if (vanillaVisible) {
-          skippedLoaded++;
-          continue; // vanilla already renders roots in loaded chunks within the render distance
+          if (!sectionSkipped) {
+            skippedSections++;
+            sectionSkipped = true;
+          }
+          skippedRoots++;
+          continue; // the vanilla/Sable renderer draws roots in this chunk
         }
         poseStack.pushPose();
         poseStack.translate(root.x() - cam.x, root.y() - cam.y, root.z() - cam.z);
@@ -125,7 +150,19 @@ public final class DTRootOverlayRenderer {
       }
     }
     long now = System.nanoTime();
-    if (cachedRoots > 0 && now - lastLogNanos > 5_000_000_000L) {
+    boolean firstFrame = cachedRoots > 0 && STARTED.compareAndSet(false, true);
+    if (firstFrame) {
+      lastLogNanos = now;
+      me.cortex.voxy.common.Logger.info(
+          "DT root overlay renderer active: skipVanillaChunks="
+              + SKIP_VANILLA_CHUNKS
+              + " skippedSections="
+              + skippedSections
+              + " skippedRoots="
+              + skippedRoots
+              + " (chunks drawn by a vanilla/Sable renderer require"
+              + " -Dvoxy.dtRootOverlaySkipVanillaChunks=true; Voxy-only packs must leave it false)");
+    } else if (cachedRoots > 0 && now - lastLogNanos > 5_000_000_000L) {
       lastLogNanos = now;
       me.cortex.voxy.common.Logger.info(
           "DT root overlay: sections="
@@ -134,8 +171,20 @@ public final class DTRootOverlayRenderer {
               + cachedRoots
               + " drawn="
               + drawn
-              + " skippedLoaded="
-              + skippedLoaded);
+              + " skippedSections="
+              + skippedSections
+              + " skippedRoots="
+              + skippedRoots
+              + " skipVanillaChunks="
+              + SKIP_VANILLA_CHUNKS);
+    }
+    if (skippedSections > 0 && WARNED_SKIP.compareAndSet(false, true)) {
+      me.cortex.voxy.common.Logger.warn(
+          "DT root overlay skipped "
+              + skippedSections
+              + " loaded section(s) because -Dvoxy.dtRootOverlaySkipVanillaChunks=true; this"
+              + " assumes the vanilla/Sable chunk renderer draws their roots. With Voxy-only"
+              + " rendering (no Sable) leave the flag false or those roots disappear.");
     }
     if (any) {
       buffers.endBatch();

@@ -35,6 +35,7 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.color.block.BlockColor;
 import net.minecraft.client.renderer.ItemBlockRenderTypes;
 import net.minecraft.client.renderer.RenderType;
+import net.minecraft.client.renderer.texture.MissingTextureAtlasSprite;
 import net.minecraft.client.renderer.texture.TextureAtlasSprite;
 import net.minecraft.client.resources.model.BakedModel;
 import net.minecraft.core.BlockPos;
@@ -100,6 +101,15 @@ public class ModelFactory {
   /** A thick-trunk shell cell: core block state id plus the cell offset (x/z in -1..1). */
   /** {@code capBits} bit0 = UP end cap, bit1 = DOWN end cap. */
   private record ShellModelKey(int coreBlockId, int dx, int dz, int capBits) {}
+
+  /**
+   * Fail-safe solid bark base cube for a {@code trunk_shell} cell whose prism piece cannot be
+   * resolved for a data/model-absence reason. {@code shellBlockId} is the shell state's own block
+   * id (its model particle icon is the first sprite source and keys the one-shot oak warning);
+   * {@code barkSourceBlockId} is the resolved thick core or a nearby Dynamic Trees branch state (0
+   * = no source, use the deterministic oak bark fallback).
+   */
+  private record ShellSolidBaseKey(int shellBlockId, int barkSourceBlockId) {}
 
   /**
    * A Dynamic Trees surface-root variant. {@code sideRadii} packs the four connection radii into
@@ -265,6 +275,7 @@ public class ModelFactory {
   private final byte[] dynamicTreesBranchCache = new byte[1 << 20];
   private final byte[] thickBranchCache = new byte[1 << 20];
   private final byte[] trunkShellCache = new byte[1 << 20];
+  private final byte[] anyBranchCache = new byte[1 << 20];
 
   // Synthetic full-bark-cube models for Dynamic Trees thick branch states (radius > 8), see
   // thickBranchModelFor. Optional.empty() caches a failed sprite lookup so it is attempted once.
@@ -274,6 +285,18 @@ public class ModelFactory {
   // Per-shell-cell models of the thick-trunk prism, keyed by core state + cell offset. Baked
   // together with the core's solid cube and patched into trunk_shell cells at LOD0 meshing time.
   private final ConcurrentHashMap<ShellModelKey, Integer> shellModelIds = new ConcurrentHashMap<>();
+
+  // Fail-safe solid bark cubes patched into trunk_shell cells whose prism cannot be resolved
+  // because of data/model absence. The cube is the cell's only model in that case (never an
+  // overlay), so it cannot z-fight with a successfully patched prism. Derived models are baked
+  // lazily on the bakery thread like branch/root variants.
+  private final ConcurrentHashMap<ShellSolidBaseKey, Integer> shellSolidBaseModelIds =
+      new ConcurrentHashMap<>();
+  private final ConcurrentLinkedDeque<ShellSolidBaseKey> shellSolidBaseBakeQueue =
+      new ConcurrentLinkedDeque<>();
+  private final AtomicInteger shellSolidBaseFailureCount = new AtomicInteger();
+  // One-shot warning per shell block id when the bark sprite had to fall back to oak.
+  private final Set<Integer> shellSolidBaseOakWarned = ConcurrentHashMap.newKeySet();
 
   // Dynamic Trees surface-root variants (3x3x3 neighbour context). Patched into LOD0 sections.
   private final ConcurrentHashMap<RootCrownKey, Integer> rootVariantModelIds =
@@ -329,6 +352,7 @@ public class ModelFactory {
    */
   private static final boolean DT_ROOT_MULTIPLANE =
       "true".equalsIgnoreCase(System.getProperty("voxy.dtRootMultiplane", "false"));
+
   private static final int DT_ROOT_MAX_PLANES =
       Math.max(1, Math.min(3, Integer.getInteger("voxy.dtRootMaxPlanes", 3)));
 
@@ -616,6 +640,11 @@ public class ModelFactory {
       this.bakeRootVariantSoftware(rootKey);
       return true;
     }
+    ShellSolidBaseKey solidBaseKey = this.shellSolidBaseBakeQueue.poll();
+    if (solidBaseKey != null) {
+      this.bakeShellSolidBaseSoftware(solidBaseKey);
+      return true;
+    }
     return false;
   }
 
@@ -634,6 +663,11 @@ public class ModelFactory {
       this.bakeRootVariantGl41(rootKey);
       return true;
     }
+    ShellSolidBaseKey solidBaseKey = this.shellSolidBaseBakeQueue.poll();
+    if (solidBaseKey != null) {
+      this.bakeShellSolidBaseGl41(solidBaseKey);
+      return true;
+    }
     return false;
   }
 
@@ -649,11 +683,11 @@ public class ModelFactory {
   }
 
   /**
-   * Boundary-cap side mask for a branch variant bake. Bit {@code i} ({@code i =}
-   * {@link Direction#get3DDataValue()}, matching the {@code neighbours} array order) is set when
-   * that neighbour resolves to a connected Dynamic Trees branch that actually covers the boundary
-   * plane, so the quad on that boundary plane is an internal face Voxy would drag into a visible
-   * fin. Air and unrelated blocks keep their caps, so exposed trunk tops and sides stay closed. A
+   * Boundary-cap side mask for a branch variant bake. Bit {@code i} ({@code i =} {@link
+   * Direction#get3DDataValue()}, matching the {@code neighbours} array order) is set when that
+   * neighbour resolves to a connected Dynamic Trees branch that actually covers the boundary plane,
+   * so the quad on that boundary plane is an internal face Voxy would drag into a visible fin. Air
+   * and unrelated blocks keep their caps, so exposed trunk tops and sides stay closed. A
    * substituted UP/DOWN self id (LOD-level seam continuation) resolves to the branch state, so
    * those seams drop their caps as internal continuations too.
    *
@@ -742,6 +776,7 @@ public class ModelFactory {
               null,
               null,
               null,
+              null,
               null);
       if (upload != null) {
         this.uploadResults.add(upload);
@@ -815,6 +850,7 @@ public class ModelFactory {
               null,
               result.fallbackReason(),
               key,
+              null,
               null,
               null,
               null,
@@ -894,8 +930,7 @@ public class ModelFactory {
         return;
       }
       if (multiplane) {
-        var planes =
-            TextureUtils.splitDepthBandPlanes(textureData, checkMode, DT_ROOT_MAX_PLANES);
+        var planes = TextureUtils.splitDepthBandPlanes(textureData, checkMode, DT_ROOT_MAX_PLANES);
         if (planes.length >= 2) {
           this.rootMultiplaneBakes.incrementAndGet();
           RootPlanePublish pending = new RootPlanePublish(key, new int[planes.length]);
@@ -914,7 +949,8 @@ public class ModelFactory {
                     null,
                     key,
                     ctx,
-                    pending);
+                    pending,
+                    null);
             if (ctx.failed) {
               this.failRootVariant(key, ctx.failure);
               return;
@@ -947,6 +983,7 @@ public class ModelFactory {
               null,
               null,
               key,
+              null,
               null,
               null);
       if (upload != null) {
@@ -1016,6 +1053,7 @@ public class ModelFactory {
               null,
               null,
               key,
+              null,
               null,
               null);
       if (upload != null) {
@@ -1256,6 +1294,8 @@ public class ModelFactory {
               this.failVariant(result.variantKey, t);
             } else if (result.shellModelKey != null) {
               this.shellModelIds.put(result.shellModelKey, VARIANT_MODEL_UNAVAILABLE);
+            } else if (result.shellSolidBaseKey != null) {
+              this.shellSolidBaseModelIds.put(result.shellSolidBaseKey, VARIANT_MODEL_UNAVAILABLE);
             } else if (result.rootVariantKey != null) {
               this.failRootVariant(result.rootVariantKey, t);
             }
@@ -1274,15 +1314,24 @@ public class ModelFactory {
             if (result.variantKey != null) {
               readyPublishes.add(
                   new ModelPublishUpload(
-                      result.variantKey, null, null, result.variantModelId, false));
+                      result.variantKey, null, null, null, result.variantModelId, false));
             } else if (result.shellModelKey != null) {
               readyPublishes.add(
                   new ModelPublishUpload(
-                      null, result.shellModelKey, null, result.shellModelId, false));
+                      null, result.shellModelKey, null, null, result.shellModelId, false));
+            } else if (result.shellSolidBaseKey != null) {
+              readyPublishes.add(
+                  new ModelPublishUpload(
+                      null,
+                      null,
+                      null,
+                      result.shellSolidBaseKey,
+                      result.shellSolidBaseModelId,
+                      false));
             } else if (result.rootVariantKey != null) {
               readyPublishes.add(
                   new ModelPublishUpload(
-                      null, null, result.rootVariantKey, result.rootVariantModelId, false));
+                      null, null, result.rootVariantKey, null, result.rootVariantModelId, false));
             }
           }
         } else if (upload instanceof RootPlanePublish publish) {
@@ -1332,6 +1381,8 @@ public class ModelFactory {
       }
     } else if (modelPublish.shellKey != null) {
       this.shellModelIds.put(modelPublish.shellKey, modelPublish.modelId);
+    } else if (modelPublish.shellSolidBaseKey != null) {
+      this.shellSolidBaseModelIds.put(modelPublish.shellSolidBaseKey, modelPublish.modelId);
     } else if (modelPublish.rootKey != null) {
       this.rootVariantModelIds.put(modelPublish.rootKey, modelPublish.modelId);
       this.rootVariantSuccessCount.incrementAndGet();
@@ -1393,6 +1444,7 @@ public class ModelFactory {
         || this.variantRequestCount.get() == 0
         || !this.variantBakeQueue.isEmpty()
         || !this.rootVariantBakeQueue.isEmpty()
+        || !this.shellSolidBaseBakeQueue.isEmpty()
         || this.variantInflightCount.get() != 0
         || this.rootVariantInflight.get() != 0
         || !this.uploadResults.isEmpty()
@@ -1428,9 +1480,9 @@ public class ModelFactory {
 
   /**
    * Bake-scope state for the Stage 2a multi-plane root path. One instance spans all plane bakes of
-   * a single root key: {@code planeIds} collects each plane's model id in plane order, while
-   * {@code failed}/{@code failure} abort the whole key (from the bake loop, once) instead of
-   * publishing a partial plane set.
+   * a single root key: {@code planeIds} collects each plane's model id in plane order, while {@code
+   * failed}/{@code failure} abort the whole key (from the bake loop, once) instead of publishing a
+   * partial plane set.
    */
   private static final class RootPlaneBakeContext {
     final RootCrownKey key;
@@ -1445,9 +1497,9 @@ public class ModelFactory {
   }
 
   /**
-   * Publication-only queue entry for a multi-plane root. Each plane bake uploads its own atlas
-   * slot but publishes nothing; this owner is enqueued after every plane, so when it drains the
-   * whole plane set is in the atlas and can be published atomically for the key.
+   * Publication-only queue entry for a multi-plane root. Each plane bake uploads its own atlas slot
+   * but publishes nothing; this owner is enqueued after every plane, so when it drains the whole
+   * plane set is in the atlas and can be published atomically for the key.
    */
   private static final class RootPlanePublish implements ResultUploader {
     final RootCrownKey rootKey;
@@ -1477,6 +1529,7 @@ public class ModelFactory {
     final @Nullable VariantKey variantKey;
     final @Nullable ShellModelKey shellKey;
     final @Nullable RootCrownKey rootKey;
+    final @Nullable ShellSolidBaseKey shellSolidBaseKey;
     final int modelId;
     final boolean dedupedToBase;
 
@@ -1484,11 +1537,13 @@ public class ModelFactory {
         @Nullable VariantKey variantKey,
         @Nullable ShellModelKey shellKey,
         @Nullable RootCrownKey rootKey,
+        @Nullable ShellSolidBaseKey shellSolidBaseKey,
         int modelId,
         boolean dedupedToBase) {
       this.variantKey = variantKey;
       this.shellKey = shellKey;
       this.rootKey = rootKey;
+      this.shellSolidBaseKey = shellSolidBaseKey;
       this.modelId = modelId;
       this.dedupedToBase = dedupedToBase;
     }
@@ -1525,6 +1580,9 @@ public class ModelFactory {
     // Same deferral for a thick-trunk shell cell / surface-root variant model.
     public @Nullable ShellModelKey shellModelKey;
     public int shellModelId = -1;
+    // Fail-safe solid bark base cube for a trunk_shell cell (same deferred publication).
+    public @Nullable ShellSolidBaseKey shellSolidBaseKey;
+    public int shellSolidBaseModelId = -1;
     public @Nullable RootCrownKey rootVariantKey;
     public int rootVariantModelId = -1;
     // Multi-plane roots: non-null on every plane upload. Planes never publish themselves; the
@@ -1620,12 +1678,13 @@ public class ModelFactory {
         null,
         null,
         null,
+        null,
         null);
   }
 
-  // variantKey/shellKey/rootKey == null is the normal per-block bake. A non-null key installs the
-  // result into the corresponding registry instead of idMappings[blockId], so base ids are never
-  // overwritten.
+  // variantKey/shellKey/rootKey/shellSolidBaseKey == null is the normal per-block bake. A non-null
+  // key installs the result into the corresponding registry instead of idMappings[blockId], so
+  // base ids are never overwritten.
   private ModelBakeResultUpload processTextureBakeResult(
       int blockId,
       BlockState blockState,
@@ -1647,12 +1706,13 @@ public class ModelFactory {
         null,
         null,
         null,
+        null,
         null);
   }
 
   // planeContext is non-null only for Stage 2a multi-plane root plane bakes; owner is the pending
   // RootPlanePublish those planes belong to (set on the returned upload so processUploads does not
-  // publish an individual plane).
+  // publish an individual plane). shellSolidBaseKey is the trunk_shell fail-safe bark cube.
   private ModelBakeResultUpload processTextureBakeResult(
       int blockId,
       BlockState blockState,
@@ -1665,8 +1725,9 @@ public class ModelFactory {
       @Nullable ShellModelKey shellKey,
       @Nullable RootCrownKey rootKey,
       @Nullable RootPlaneBakeContext planeContext,
-      @Nullable RootPlanePublish owner) {
-    if (variantKey == null && shellKey == null && rootKey == null) {
+      @Nullable RootPlanePublish owner,
+      @Nullable ShellSolidBaseKey shellSolidBaseKey) {
+    if (variantKey == null && shellKey == null && rootKey == null && shellSolidBaseKey == null) {
       if (this.idMappings[blockId] != -1) {
         // This should be impossible to reach as it means that multiple bakes for the same blockId
         // happened and where inflight at the same time!
@@ -1777,6 +1838,7 @@ public class ModelFactory {
                   variantKey,
                   null,
                   null,
+                  null,
                   possibleDuplicate,
                   possibleDuplicate == this.idMappings[blockId]));
           return null;
@@ -1787,7 +1849,18 @@ public class ModelFactory {
             return null;
           }
           this.uploadResults.add(
-              new ModelPublishUpload(null, shellKey, null, possibleDuplicate, false));
+              new ModelPublishUpload(null, shellKey, null, null, possibleDuplicate, false));
+          return null;
+        }
+        if (shellSolidBaseKey != null) {
+          if (possibleDuplicate == 0) {
+            // The fail-safe cube must never collapse into the empty/air model.
+            this.shellSolidBaseModelIds.put(shellSolidBaseKey, VARIANT_MODEL_UNAVAILABLE);
+            return null;
+          }
+          this.uploadResults.add(
+              new ModelPublishUpload(
+                  null, null, null, shellSolidBaseKey, possibleDuplicate, false));
           return null;
         }
         if (rootKey != null) {
@@ -1809,7 +1882,7 @@ public class ModelFactory {
             return null;
           }
           this.uploadResults.add(
-              new ModelPublishUpload(null, null, rootKey, possibleDuplicate, false));
+              new ModelPublishUpload(null, null, rootKey, null, possibleDuplicate, false));
           return null;
         }
         this.idMappings[blockId] = possibleDuplicate;
@@ -1823,7 +1896,7 @@ public class ModelFactory {
         return null;
       } else { // Not a duplicate so create a new entry
         modelId = this.modelTexture2id.size();
-        if ((variantKey != null || shellKey != null || rootKey != null)
+        if ((variantKey != null || shellKey != null || rootKey != null || shellSolidBaseKey != null)
             && modelId >= MAX_MODEL_ID_COUNT) {
           // Never exceed the 16-bit id space. The derived model falls back to the base model/air.
           this.capVariants("16-bit model id space exhausted");
@@ -1831,6 +1904,8 @@ public class ModelFactory {
             this.markVariantUnavailable(variantKey);
           } else if (shellKey != null) {
             this.shellModelIds.put(shellKey, VARIANT_MODEL_UNAVAILABLE);
+          } else if (shellSolidBaseKey != null) {
+            this.shellSolidBaseModelIds.put(shellSolidBaseKey, VARIANT_MODEL_UNAVAILABLE);
           } else if (planeContext != null) {
             // Fail the multi-plane key once from the bake loop; do not fail it per plane here.
             planeContext.failed = true;
@@ -2192,6 +2267,9 @@ public class ModelFactory {
     } else if (shellKey != null) {
       uploadResult.shellModelKey = shellKey;
       uploadResult.shellModelId = modelId;
+    } else if (shellSolidBaseKey != null) {
+      uploadResult.shellSolidBaseKey = shellSolidBaseKey;
+      uploadResult.shellSolidBaseModelId = modelId;
     } else if (rootKey != null) {
       if (planeContext != null) {
         // Multi-plane plane: record the plane id in plane order and defer publication to the
@@ -2543,6 +2621,20 @@ public class ModelFactory {
     return result;
   }
 
+  /** Cached per-block-id check: any Dynamic Trees branch, thick branches included. */
+  public boolean isAnyBranchBlockId(int blockId) {
+    if (blockId <= 0 || blockId >= this.anyBranchCache.length) {
+      return false;
+    }
+    byte cached = this.anyBranchCache[blockId];
+    if (cached != 0) {
+      return cached == 1;
+    }
+    boolean result = DynamicTreesBranches.isBranch(this.mapper.getBlockStateFromBlockId(blockId));
+    this.anyBranchCache[blockId] = result ? (byte) 1 : (byte) 2;
+    return result;
+  }
+
   /** Resolves a Mapper block id to its BlockState (used by LOD0 shell patching). */
   public BlockState getBlockStateForId(int blockId) {
     return this.mapper.getBlockStateFromBlockId(blockId);
@@ -2571,6 +2663,36 @@ public class ModelFactory {
   public int getShellModelId(int coreBlockId, int dx, int dz, int capBits) {
     Integer id = this.shellModelIds.get(new ShellModelKey(coreBlockId, dx, dz, capBits));
     return id == null ? VARIANT_MODEL_UNAVAILABLE : id;
+  }
+
+  /**
+   * Model id of the fail-safe solid bark cube patched into a {@code trunk_shell} cell whose prism
+   * piece cannot be resolved because of <em>data/model</em> absence (unknown core, missing
+   * neighbour slice, shell bake unavailable). Cells whose core is known to be non-thick are
+   * DT-invalid and must stay empty; the caller makes that distinction.
+   *
+   * <p>The sprite is resolved on the bakery thread in this order: the shell state's own model
+   * particle icon, the resolved core's / nearby branch state's bark sprite, then the deterministic
+   * oak bark side sprite (one-shot WARN per shell block id). The bake is queued lazily, so the
+   * first caller gets {@link #VARIANT_MODEL_NOT_READY} and must retry the section.
+   *
+   * @param shellBlockId the {@code trunk_shell} block id that will carry the cube
+   * @param barkSourceBlockId block id of the resolved core or a nearby Dynamic Trees branch; 0 when
+   *     neither is available (the oak fallback is used)
+   * @return a baked model id, {@link #VARIANT_MODEL_NOT_READY} while queued, or {@link
+   *     #VARIANT_MODEL_UNAVAILABLE} if every sprite/bake attempt failed (caller leaves the cell
+   *     empty rather than crashing)
+   */
+  public int getShellSolidBaseModelId(int shellBlockId, int barkSourceBlockId) {
+    ShellSolidBaseKey key = new ShellSolidBaseKey(shellBlockId, barkSourceBlockId);
+    Integer id = this.shellSolidBaseModelIds.get(key);
+    if (id != null) {
+      return id;
+    }
+    if (this.shellSolidBaseModelIds.putIfAbsent(key, VARIANT_MODEL_NOT_READY) == null) {
+      this.shellSolidBaseBakeQueue.add(key);
+    }
+    return VARIANT_MODEL_NOT_READY;
   }
 
   /** Cached per-block-id check for Dynamic Trees surface roots. */
@@ -2845,6 +2967,7 @@ public class ModelFactory {
                     key,
                     null,
                     null,
+                    null,
                     null);
             if (upload != null) {
               this.uploadResults.add(upload);
@@ -2857,6 +2980,159 @@ public class ModelFactory {
           }
         }
       }
+    }
+  }
+
+  /**
+   * Bakes one fail-safe solid bark cube for a {@code trunk_shell} cell with the software bakery.
+   * Runs on the model factory processor thread, like the other Dynamic Trees variants.
+   */
+  private void bakeShellSolidBaseSoftware(ShellSolidBaseKey key) {
+    try {
+      BlockState shellState = this.mapper.getBlockStateFromBlockId(key.shellBlockId());
+      TextureAtlasSprite sprite = this.resolveShellSolidBaseSprite(key, shellState);
+      int flags =
+          this.bakery2.renderToOutput(
+              shellState, this.bakeScratchBuffer, null, new SolidBarkBakedModel(sprite));
+      ColourDepthTextureData[] textureData = this.readSoftwareBakeTextures();
+      int writtenPixels = 0;
+      for (ColourDepthTextureData face : textureData) {
+        writtenPixels += TextureUtils.getWrittenPixelCount(face, TextureUtils.WRITE_CHECK_STENCIL);
+      }
+      if (writtenPixels == 0) {
+        this.failShellSolidBase(key, "bake produced no pixels");
+        return;
+      }
+      var upload =
+          this.processTextureBakeResult(
+              key.shellBlockId(),
+              shellState,
+              textureData,
+              (flags & 1) != 0,
+              (flags & 2) != 0,
+              RenderType.solid(),
+              FALLBACK_NONE,
+              null,
+              null,
+              null,
+              null,
+              null,
+              key);
+      if (upload != null) {
+        this.uploadResults.add(upload);
+      }
+    } catch (Throwable t) {
+      this.failShellSolidBase(key, t);
+    }
+  }
+
+  /** GL41 sink variant of {@link #bakeShellSolidBaseSoftware}; runs on the render thread. */
+  private void bakeShellSolidBaseGl41(ShellSolidBaseKey key) {
+    try {
+      BlockState shellState = this.mapper.getBlockStateFromBlockId(key.shellBlockId());
+      TextureAtlasSprite sprite = this.resolveShellSolidBaseSprite(key, shellState);
+      var result = this.gl41OffscreenBakery.bake(shellState, null, new SolidBarkBakedModel(sprite));
+      if (result.fallbackReason() != FALLBACK_NONE) {
+        this.failShellSolidBase(key, "bake failed with fallback reason " + result.fallbackReason());
+        return;
+      }
+      int writtenPixels = 0;
+      for (ColourDepthTextureData face : result.faces()) {
+        writtenPixels += TextureUtils.getWrittenPixelCount(face, TextureUtils.WRITE_CHECK_STENCIL);
+      }
+      if (writtenPixels == 0) {
+        this.failShellSolidBase(key, "bake produced no pixels");
+        return;
+      }
+      var upload =
+          this.processTextureBakeResult(
+              key.shellBlockId(),
+              shellState,
+              result.faces(),
+              result.shaded(),
+              result.darkenedTextures(),
+              RenderType.solid(),
+              FALLBACK_NONE,
+              null,
+              null,
+              null,
+              null,
+              null,
+              key);
+      if (upload != null) {
+        this.uploadResults.add(upload);
+      }
+    } catch (Throwable t) {
+      this.failShellSolidBase(key, t);
+    }
+  }
+
+  private void failShellSolidBase(ShellSolidBaseKey key, Object cause) {
+    this.shellSolidBaseModelIds.put(key, VARIANT_MODEL_UNAVAILABLE);
+    if (this.shellSolidBaseFailureCount.incrementAndGet() <= 8) {
+      Logger.warn("Failed to bake the fail-safe trunk_shell bark cube " + key, cause);
+    }
+  }
+
+  /**
+   * Resolves the fail-safe cube sprite on the bakery thread: the shell state's own model particle
+   * icon, then the resolved core's / nearby branch state's bark sprite, then the deterministic oak
+   * bark side sprite (one-shot WARN per shell block id). The missing-texture sprite is used only as
+   * an absolute last resort, so the cube always has geometry and the caller never falls back to the
+   * empty model.
+   */
+  private TextureAtlasSprite resolveShellSolidBaseSprite(
+      ShellSolidBaseKey key, BlockState shellState) {
+    TextureAtlasSprite sprite = barkSpriteOrNull(shellState);
+    if (sprite != null) {
+      return sprite;
+    }
+    if (key.barkSourceBlockId() > 0) {
+      sprite = barkSpriteOrNull(this.mapper.getBlockStateFromBlockId(key.barkSourceBlockId()));
+      if (sprite != null) {
+        return sprite;
+      }
+    }
+    sprite = barkSpriteOrNull(Blocks.OAK_LOG.defaultBlockState());
+    if (sprite != null) {
+      if (this.shellSolidBaseOakWarned.add(key.shellBlockId())) {
+        Logger.warn(
+            "No bark sprite for Dynamic Trees trunk_shell block id "
+                + key.shellBlockId()
+                + " ("
+                + shellState
+                + "), using the deterministic oak bark fallback");
+      }
+      return sprite;
+    }
+    if (this.shellSolidBaseOakWarned.add(key.shellBlockId())) {
+      Logger.warn(
+          "No bark or oak sprite available for Dynamic Trees trunk_shell block id "
+              + key.shellBlockId()
+              + ", using the missing-texture cube");
+    }
+    return Minecraft.getInstance().getModelManager().getMissingModel().getParticleIcon();
+  }
+
+  /** The state's model particle icon, or null when it is absent or the missing-texture sprite. */
+  private static @Nullable TextureAtlasSprite barkSpriteOrNull(@Nullable BlockState state) {
+    if (state == null) {
+      return null;
+    }
+    try {
+      BakedModel model =
+          Minecraft.getInstance().getModelManager().getBlockModelShaper().getBlockModel(state);
+      if (model == null) {
+        return null;
+      }
+      TextureAtlasSprite sprite = model.getParticleIcon();
+      if (sprite == null
+          || MissingTextureAtlasSprite.getLocation().equals(sprite.contents().name())) {
+        return null;
+      }
+      return sprite;
+    } catch (Throwable t) {
+      return null;
     }
   }
 
@@ -2923,7 +3199,9 @@ public class ModelFactory {
 
   /** True while variant bake requests are queued for the render-thread/sink bakery. */
   public boolean hasQueuedVariantBakes() {
-    return !this.variantBakeQueue.isEmpty() || !this.rootVariantBakeQueue.isEmpty();
+    return !this.variantBakeQueue.isEmpty()
+        || !this.rootVariantBakeQueue.isEmpty()
+        || !this.shellSolidBaseBakeQueue.isEmpty();
   }
 
   public int getVariantInflightCount() {
