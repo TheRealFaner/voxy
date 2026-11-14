@@ -83,22 +83,27 @@ vec2 getBaseUV() {
     return modelUV + (vec2(face>>1, face&1u) * (1.0/(vec2(3.0, 2.0)*256.0)));
 }
 
-// Voxy vegetation mip clamp=1.0 (cutout/tinted faces): at LOD distances the atlas is sampled at
-// deep mip levels and grass/leaves/plant faces collapse into flat solid-colour cards (hue stays
-// correct because tinting is applied after the sample). Clamping the effective mip level keeps
-// roughly 8x8 atlas texels visible per 16x16 face so the cutout silhouette/texture survives.
+// Voxy vegetation mip clamp=1.0 (tinted opaque faces only): at LOD distances the atlas is
+// sampled at deep mip levels and tinted opaque grass/leaf tops collapse into flat solid-colour
+// cards (hue stays correct because tinting is applied after the sample). Clamping the effective
+// mip level keeps roughly 8x8 atlas texels visible per 16x16 face so the texture survives.
+// Cutout plants (short grass, flowers, saplings, ...) are deliberately excluded: their cross
+// sprites are sparse in the atlas, so a clamped mip averages mostly transparent texels into the
+// RGB and the crosses render dark. They keep the original textureGrad path.
 // TODO: expose as a config option (shader define or uniform) instead of a hardcoded constant.
 const float VEGETATION_MIP_CLAMP = 1.0;
 
-// A "vegetation face" is a face with alpha cutout (grass/leaves/flowers/glass/rails/... - interData.x
-// bit 0, from faceData bit 22 + the multi-tile override bit 23), or, in the opaque pass, any tinted
-// face (grass/leaves/plants incl. baked-opaque tops - tint state bits 2|3 of interData.x, from
-// faceData bits 24|25). The translucent pass is water/ice: tinted as well, but it must keep smooth
-// deep mips (huge merged quads would show tiling/aliasing at mip 1), so it is never clamped.
-// Ordinary opaque terrain (stone/dirt) has neither flag and keeps the textureGrad path.
+// A "vegetation face" is a tinted face in the opaque pass (grass/leaves block faces, incl.
+// baked-opaque tops - tint state bits 2|3 of interData.x, from faceData bits 24|25). Faces with
+// alpha cutout (interData.x bit 0, from faceData bit 22 + the multi-tile override bit 23) are
+// excluded even when tinted: cutout plants/flowers/glass/rails are cross/flat sprites whose
+// sparse alpha would produce dark crosses at mip 1, so they keep the old textureGrad path. The
+// translucent pass is water/ice: tinted as well, but it must keep smooth deep mips (huge merged
+// quads would show tiling/aliasing at mip 1), so it is never clamped. Ordinary opaque terrain
+// (stone/dirt) has no tint flag and also keeps the textureGrad path.
 bool isVegetationFace() {
     if (useDiscard()) {
-        return true;
+        return false;
     }
 #ifdef TRANSLUCENT
     return false;

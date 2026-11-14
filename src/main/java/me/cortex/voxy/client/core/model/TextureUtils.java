@@ -261,53 +261,32 @@ public class TextureUtils {
     float g = 0.0f;
     float b = 0.0f;
     float a = 0.0f;
-    // Alpha-weighted (premultiplied) RGB accumulation: dividing RGB by 4 unconditionally darkened
-    // sparse sprites (e.g. cutout vegetation covering only 1-2 of the 4 texels) by up to 4x at
-    // every mip level. Dividing by the summed alpha keeps sparse-sprite mips at full brightness
-    // and is a no-op for fully opaque sprites; if the summed alpha is 0 (all texels transparent)
-    // fall back to the contributing texel count. The alpha average itself is unchanged, so the
-    // cutout threshold semantics stay compatible.
-    float wSum = 0.0f;
-    int contrib = 0;
     if (darkend || (C00 >>> 24) != 0) {
-      float w00 = darkend ? (C00 >>> 24) : ColorSRGB.srgbToLinear(C00 >>> 24);
-      r += ColorSRGB.srgbToLinear((C00 >> 0) & 0xFF) * w00;
-      g += ColorSRGB.srgbToLinear((C00 >> 8) & 0xFF) * w00;
-      b += ColorSRGB.srgbToLinear((C00 >> 16) & 0xFF) * w00;
+      r += ColorSRGB.srgbToLinear((C00 >> 0) & 0xFF);
+      g += ColorSRGB.srgbToLinear((C00 >> 8) & 0xFF);
+      b += ColorSRGB.srgbToLinear((C00 >> 16) & 0xFF);
       a += darkend ? (C00 >>> 24) : ColorSRGB.srgbToLinear(C00 >>> 24);
-      wSum += w00;
-      contrib++;
     }
     if (darkend || (C01 >>> 24) != 0) {
-      float w01 = darkend ? (C01 >>> 24) : ColorSRGB.srgbToLinear(C01 >>> 24);
-      r += ColorSRGB.srgbToLinear((C01 >> 0) & 0xFF) * w01;
-      g += ColorSRGB.srgbToLinear((C01 >> 8) & 0xFF) * w01;
-      b += ColorSRGB.srgbToLinear((C01 >> 16) & 0xFF) * w01;
+      r += ColorSRGB.srgbToLinear((C01 >> 0) & 0xFF);
+      g += ColorSRGB.srgbToLinear((C01 >> 8) & 0xFF);
+      b += ColorSRGB.srgbToLinear((C01 >> 16) & 0xFF);
       a += darkend ? (C01 >>> 24) : ColorSRGB.srgbToLinear(C01 >>> 24);
-      wSum += w01;
-      contrib++;
     }
     if (darkend || (C10 >>> 24) != 0) {
-      float w10 = darkend ? (C10 >>> 24) : ColorSRGB.srgbToLinear(C10 >>> 24);
-      r += ColorSRGB.srgbToLinear((C10 >> 0) & 0xFF) * w10;
-      g += ColorSRGB.srgbToLinear((C10 >> 8) & 0xFF) * w10;
-      b += ColorSRGB.srgbToLinear((C10 >> 16) & 0xFF) * w10;
+      r += ColorSRGB.srgbToLinear((C10 >> 0) & 0xFF);
+      g += ColorSRGB.srgbToLinear((C10 >> 8) & 0xFF);
+      b += ColorSRGB.srgbToLinear((C10 >> 16) & 0xFF);
       a += darkend ? (C10 >>> 24) : ColorSRGB.srgbToLinear(C10 >>> 24);
-      wSum += w10;
-      contrib++;
     }
     if (darkend || (C11 >>> 24) != 0) {
-      float w11 = darkend ? (C11 >>> 24) : ColorSRGB.srgbToLinear(C11 >>> 24);
-      r += ColorSRGB.srgbToLinear((C11 >> 0) & 0xFF) * w11;
-      g += ColorSRGB.srgbToLinear((C11 >> 8) & 0xFF) * w11;
-      b += ColorSRGB.srgbToLinear((C11 >> 16) & 0xFF) * w11;
+      r += ColorSRGB.srgbToLinear((C11 >> 0) & 0xFF);
+      g += ColorSRGB.srgbToLinear((C11 >> 8) & 0xFF);
+      b += ColorSRGB.srgbToLinear((C11 >> 16) & 0xFF);
       a += darkend ? (C11 >>> 24) : ColorSRGB.srgbToLinear(C11 >>> 24);
-      wSum += w11;
-      contrib++;
     }
 
-    float wDiv = wSum > 0.0f ? wSum : Math.max(contrib, 1);
     return ColorSRGB.linearToSrgb(
-        r / wDiv, g / wDiv, b / wDiv, darkend ? ((int) a) / 4 : ARGB.linearToSrgbChannel(a / 4));
+        r / 4, g / 4, b / 4, darkend ? ((int) a) / 4 : ARGB.linearToSrgbChannel(a / 4));
   }
 }
