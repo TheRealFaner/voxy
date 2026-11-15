@@ -17,8 +17,10 @@ import org.jetbrains.annotations.Nullable;
  * only real branch blocks (Basic/Thick/Palm and addon subclasses) are valid variant candidates.
  * Roots extend {@code BranchBlock} but must be excluded. The {@code dynamictreesplus} namespace is
  * excluded by default because its cacti use a different ModelData contract, with one carve-out:
- * mushroom stems ({@code MushroomBranchBlock extends ThickBranchBlock}) are regular DT branch
- * models and stay variant-eligible.
+ * mushroom stems ({@code MushroomBranchBlock extends ThickBranchBlock}) are classified as branches
+ * so thick-trunk neighbours and bark sources still see them, but they are not LOD0
+ * variant-eligible: their real neighbour-aware variants bake on SOLID, leave mask-uncovered texels
+ * black and drop small end caps, so the opaque bark cube base model is kept instead.
  */
 public final class DynamicTreesBranches {
   public static final String BRANCH_CLASS = "com.dtteam.dynamictrees.block.branch.BranchBlock";
@@ -295,9 +297,18 @@ public final class DynamicTreesBranches {
     return ((EnumProperty) property).getName(value);
   }
 
-  /** True when the branch model can be baked into a single cell (radius {@code <= 8}). */
+  /**
+   * True when the branch model can be baked into a single cell (radius {@code <= 8}) and is a safe
+   * LOD0 variant candidate. DynamicTreesPlus mushroom stems are excluded: their real dynamic
+   * variants install on the SOLID layer, leave texels uncovered by the mask black, and drop small
+   * end caps, which produced missing planes and black stems. Their opaque {@code
+   * mushroomStemModelFor} bark cube remains the base/LOD0 model.
+   */
   public static boolean isVariantSupported(BlockState state) {
     if (!isBranch(state)) {
+      return false;
+    }
+    if (isMushroomBranch(state)) {
       return false;
     }
     int radius = radiusOf(state);
