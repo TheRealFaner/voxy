@@ -1,7 +1,6 @@
 package me.cortex.voxy.client.core.model;
 
 import static me.cortex.voxy.client.core.model.BakedModelPayload.FALLBACK_NONE;
-import static me.cortex.voxy.client.core.model.BakedModelPayload.FALLBACK_NO_QUADS;
 import static me.cortex.voxy.client.core.model.BakedModelPayload.RENDER_LAYER_CUTOUT;
 import static me.cortex.voxy.client.core.model.BakedModelPayload.RENDER_LAYER_FLUID;
 import static me.cortex.voxy.client.core.model.BakedModelPayload.RENDER_LAYER_OPAQUE;
@@ -268,15 +267,8 @@ public class ModelFactory {
 
   // Synthetic full-bark-cube models for Dynamic Trees thick branch states (radius > 8), see
   // thickBranchModelFor. Optional.empty() caches a failed sprite lookup so it is attempted once.
-  // Also reused by branchSolidBarkFallbackFor for branch base bakes that produced no quads; both
-  // are keyed per branch state, bounded by the Mapper block-state id space.
   private final ConcurrentHashMap<BlockState, Optional<BakedModel>> thickBranchSolidModels =
       new ConcurrentHashMap<>();
-
-  // Per-session count of DT branch base bakes that produced no quads and were replaced by the
-  // solid bark cube (DTP mushroom stems without ModelData). Logged once in the DT summary.
-  private final AtomicInteger branchEmptyBaseFallbackCount = new AtomicInteger();
-  private final AtomicBoolean branchEmptyBaseFallbackLogged = new AtomicBoolean();
 
   // Per-shell-cell models of the thick-trunk prism, keyed by core state + cell offset. Baked
   // together with the core's solid cube and patched into trunk_shell cells at LOD0 meshing time.
@@ -497,19 +489,6 @@ public class ModelFactory {
 
     BakedModel thickBranchModel = this.thickBranchModelFor(blockState);
     var result = this.gl41OffscreenBakery.bake(blockState, null, thickBranchModel);
-    if (thickBranchModel == null && result.fallbackReason() == FALLBACK_NO_QUADS) {
-      // DTP mushroom branches derive their geometry from ModelData; without neighbours the base
-      // bake returns no quads and dedupes to the air model, making the stems invisible. Substitute
-      // the synthetic solid bark cube so the base id is non-air and LOD0 can request variants.
-      BakedModel solidBark = this.branchSolidBarkFallbackFor(blockState);
-      if (solidBark != null) {
-        var fallbackResult = this.gl41OffscreenBakery.bake(blockState, null, solidBark);
-        if (fallbackResult.fallbackReason() == FALLBACK_NONE) {
-          result = fallbackResult;
-          this.countBranchEmptyBaseFallback(blockState);
-        }
-      }
-    }
     var upload =
         this.processTextureBakeResult(
             blockId,
@@ -571,24 +550,11 @@ public class ModelFactory {
     if (bake == null) return false;
 
     BakedModel thickBranchModel = this.thickBranchModelFor(bake.state);
-    int flags;
-    if (thickBranchModel == null) {
-      flags = this.bakery2.renderToOutput(bake.state, this.bakeScratchBuffer);
-      if (this.bakery2.lastBakeQuadCount() == 0) {
-        // Same empty-base fallback as the GL41 path: DT branch models that need ModelData bake to
-        // zero quads without neighbours and would dedupe to the air model.
-        BakedModel solidBark = this.branchSolidBarkFallbackFor(bake.state);
-        if (solidBark != null) {
-          flags = this.bakery2.renderToOutput(bake.state, this.bakeScratchBuffer, null, solidBark);
-          if (this.bakery2.lastBakeQuadCount() != 0) {
-            this.countBranchEmptyBaseFallback(bake.state);
-          }
-        }
-      }
-    } else {
-      flags =
-          this.bakery2.renderToOutput(bake.state, this.bakeScratchBuffer, null, thickBranchModel);
-    }
+    int flags =
+        thickBranchModel == null
+            ? this.bakery2.renderToOutput(bake.state, this.bakeScratchBuffer)
+            : this.bakery2.renderToOutput(
+                bake.state, this.bakeScratchBuffer, null, thickBranchModel);
 
     var bakeResult =
         this.processTextureBakeResult(
@@ -1263,9 +1229,7 @@ public class ModelFactory {
             + this.variantNoQuadCount.get()
             + " no quads, "
             + this.variantExceptionCount.get()
-            + " exceptions, branchEmptyBaseFallbacks="
-            + this.branchEmptyBaseFallbackCount.get()
-            + ")");
+            + " exceptions)");
   }
 
   private interface ResultUploader {
@@ -2451,46 +2415,6 @@ public class ModelFactory {
     } catch (Throwable t) {
       Logger.warn("Could not build the bark cube for Dynamic Trees thick branch " + thickState, t);
       return Optional.empty();
-    }
-  }
-
-  /**
-   * Solid-bark cube for a Dynamic Trees branch whose real base model baked to zero quads.
-   *
-   * <p>Thin DTP mushroom branches (radius &lt;= 8) generate all their geometry from {@code
-   * ModelData}; without neighbours the base bake has no quads and dedupes to the air model, so the
-   * stems are invisible at LOD1 and are never collected as LOD0 variants (variant collection
-   * requires a non-air base model id). Reusing the thick-branch bark cube keeps the base id
-   * visible. Unlike {@link #thickBranchModelFor} this is not gated on radius, but it is only
-   * consulted after an empty bake and only for {@link
-   * DynamicTreesBranches#isSolidBarkFallbackEligible} states (roots, trunk shells and DTP cactus
-   * stay excluded).
-   */
-  private @Nullable BakedModel branchSolidBarkFallbackFor(BlockState state) {
-    if (!DynamicTreesBranches.isSolidBarkFallbackEligible(state)) {
-      return null;
-    }
-    Optional<BakedModel> cached = this.thickBranchSolidModels.get(state);
-    if (cached == null || cached.isEmpty()) {
-      cached = this.createThickBranchModel(state);
-      if (cached.isPresent()) {
-        this.thickBranchSolidModels.put(state, cached);
-      }
-    }
-    return cached.orElse(null);
-  }
-
-  /** Accounts one solid-bark substitution and WARNs once with the first state class. */
-  private void countBranchEmptyBaseFallback(BlockState state) {
-    int count = this.branchEmptyBaseFallbackCount.incrementAndGet();
-    if (this.branchEmptyBaseFallbackLogged.compareAndSet(false, true)) {
-      Logger.warn(
-          "Dynamic Trees branch base model produced no quads; substituting a solid bark cube for "
-              + state
-              + " ["
-              + state.getBlock().getClass().getName()
-              + "], branchEmptyBaseFallbacks="
-              + count);
     }
   }
 

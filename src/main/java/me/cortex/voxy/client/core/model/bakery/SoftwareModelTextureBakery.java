@@ -44,19 +44,7 @@ public class SoftwareModelTextureBakery {
   private final ReuseVertexConsumer translucentVC = new ReuseVertexConsumer(1 /* has discard */);
   private final SoftwareRasterizer rasterizer = new SoftwareRasterizer();
 
-  // Quad count of the most recent renderToOutput call. The software bakery is confined to the
-  // single Model factory processor thread, and callers read this immediately after the bake.
-  private int lastBakeQuadCount;
-
   public SoftwareModelTextureBakery() {}
-
-  /**
-   * Number of quads emitted by the most recent {@link #renderToOutput} call (0 when the model
-   * produced none, e.g. a Dynamic Trees branch baked without ModelData).
-   */
-  public int lastBakeQuadCount() {
-    return this.lastBakeQuadCount;
-  }
 
   public void setupTexture() {
     var texture =
@@ -318,12 +306,10 @@ public class SoftwareModelTextureBakery {
     boolean isAnyDarkend = false;
     boolean anyTranslucent = false;
     boolean anyDiscard = false;
-    int quadCount = 0;
     if (isBlock) {
       this.opaqueVC.reset();
       this.translucentVC.reset();
       this.bakeBlockModel(state, blockRenderLayer, neighbours, modelOverride, cube);
-      quadCount = this.opaqueVC.quadCount() + this.translucentVC.quadCount();
       isAnyShaded |= this.opaqueVC.anyShaded | this.translucentVC.anyShaded;
       isAnyDarkend |= this.opaqueVC.anyDarkendTex | this.translucentVC.anyDarkendTex;
       anyTranslucent |= !this.translucentVC.isEmpty();
@@ -349,7 +335,6 @@ public class SoftwareModelTextureBakery {
         this.opaqueVC.reset();
         this.translucentVC.reset();
         this.bakeFluidState(state, i, blockRenderLayer);
-        quadCount += this.opaqueVC.quadCount() + this.translucentVC.quadCount();
         if (this.opaqueVC.isEmpty() && this.translucentVC.isEmpty()) continue;
         isAnyShaded |= this.opaqueVC.anyShaded | this.translucentVC.anyShaded;
         isAnyDarkend |= this.opaqueVC.anyDarkendTex | this.translucentVC.anyDarkendTex;
@@ -369,7 +354,6 @@ public class SoftwareModelTextureBakery {
       }
     }
 
-    this.lastBakeQuadCount = quadCount;
     return (isAnyShaded ? 1 : 0)
         | (isAnyDarkend ? 2 : 0)
         | (anyTranslucent ? 4 : 0)

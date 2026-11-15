@@ -1,7 +1,5 @@
 package me.cortex.voxy.common.world.other;
 
-import java.util.concurrent.atomic.AtomicBoolean;
-import me.cortex.voxy.common.Logger;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.resources.ResourceLocation;
@@ -17,11 +15,9 @@ import org.jetbrains.annotations.Nullable;
  *
  * <p>Branch geometry is generated from neighbour state by {@code BranchBlock.getConnectionData}, so
  * only real branch blocks (Basic/Thick/Palm and addon subclasses) are valid variant candidates.
- * Roots extend {@code BranchBlock} but must be excluded. Among the {@code dynamictreesplus} addon
- * blocks, mushroom branches ({@code MushroomBranchBlock extends ThickBranchBlock}) are regular
- * ModelData branch models and are variant-eligible; cacti are not, because their custom {@code
- * CactusBranchBlockBakedModel} has a different contract, so the exclusion is narrowed to that class
- * instead of the whole namespace.
+ * Roots extend {@code BranchBlock} but must be excluded. {@code dynamictreesplus} cacti and
+ * mushroom stems are excluded by default because their baked models use a different ModelData
+ * contract.
  */
 public final class DynamicTreesBranches {
   public static final String BRANCH_CLASS = "com.dtteam.dynamictrees.block.branch.BranchBlock";
@@ -30,19 +26,7 @@ public final class DynamicTreesBranches {
       "com.dtteam.dynamictrees.block.branch.TrunkShellBlock";
   public static final String SURFACE_ROOT_CLASS =
       "com.dtteam.dynamictrees.block.branch.SurfaceRootBlock";
-
-  /**
-   * DynamicTreesPlus cactus branch. Verified in DynamicTreesPlus-neoforge-1.21.1-1.3.2: {@code
-   * CactusBranchBlock extends com.dtteam.dynamictrees.block.branch.BranchBlock} but uses the custom
-   * {@code CactusBranchBlockBakedModel}, so it stays excluded from the variant path.
-   */
-  public static final String CACTUS_BRANCH_CLASS =
-      "com.dtteam.dynamictreesplus.block.CactusBranchBlock";
-
-  public static final String MUSHROOM_BRANCH_CLASS =
-      "com.dtteam.dynamictreesplus.block.mushroom.MushroomBranchBlock";
-
-  private static final AtomicBoolean MUSHROOM_VARIANT_ELIGIBLE_LOGGED = new AtomicBoolean();
+  public static final String EXCLUDED_NAMESPACE = "dynamictreesplus";
 
   /**
    * Largest radius whose baked model stays inside one block cell. Branches above this (Dynamic
@@ -61,65 +45,41 @@ public final class DynamicTreesBranches {
     if (state == null || state.isAir()) {
       return false;
     }
-    // Narrow DTP exclusion: cactus is a BranchBlock subclass but its custom baked model does not
-    // follow the ModelData contract, so it must stay out of the variant/base model path.
-    if (isCactusBranch(state)) {
-      return false;
-    }
-    // The tag alone is enough: DTP mushroom branches are listed in dynamictrees:fungus_branches,
-    // and dynamictrees:branches includes that tag (verified in DynamicTreesPlus 1.3.2 data).
-    if (isBranchClass(state) || state.is(DYNAMICTREES_BRANCHES)) {
-      noteMushroomVariantEligibility(state);
-      return true;
-    }
-    return false;
-  }
-
-  /**
-   * True for a Dynamic Trees branch whose baked model cannot fit one Voxy cell (radius &gt; 8).
-   * {@code dynamictreesplus} blocks are not excluded wholesale: {@code CactusBranchBlock} is
-   * excluded by exact class, while mushroom branches are allowed; the synthetic bark cube only
-   * needs the model's particle sprite, not its ModelData contract.
-   */
-  public static boolean isThickBranch(BlockState state) {
-    if (state == null || state.isAir() || radiusOf(state) <= MAX_CELL_RADIUS) {
-      return false;
-    }
-    if (isCactusBranch(state)) {
+    Block block = state.getBlock();
+    ResourceLocation id = BuiltInRegistries.BLOCK.getKey(block);
+    if (id != null && EXCLUDED_NAMESPACE.equals(id.getNamespace())) {
       return false;
     }
     return isBranchClass(state) || state.is(DYNAMICTREES_BRANCHES);
   }
 
   /**
-   * True when the block extends the DT {@code BranchBlock} class (roots and DTP cactus excluded).
-   * Use {@link #isBranch} for the variant-eligible predicate.
+   * True for a Dynamic Trees branch whose baked model cannot fit one Voxy cell (radius &gt; 8).
+   * Unlike {@link #isBranch} this ignores the {@code dynamictreesplus} namespace exclusion: the
+   * synthetic bark cube only needs the model's particle sprite, not its ModelData contract.
+   */
+  public static boolean isThickBranch(BlockState state) {
+    if (state == null || state.isAir() || radiusOf(state) <= MAX_CELL_RADIUS) {
+      return false;
+    }
+    return isBranchClass(state) || state.is(DYNAMICTREES_BRANCHES);
+  }
+
+  /**
+   * True when the block extends the DT {@code BranchBlock} class (roots excluded, namespace not
+   * filtered). Use {@link #isBranch} for the variant-eligible predicate.
    */
   public static boolean isBranchBlockClass(BlockState state) {
     return state != null && !state.isAir() && isBranchClass(state);
   }
 
-  /**
-   * True when a base bake that produced no quads may be replaced by the synthetic solid-bark cube
-   * (see {@code ModelFactory.branchSolidBarkFallbackFor}). Covers branch blocks and tag members
-   * (roots and DTP cactus are excluded by {@link #isBranchClass}); {@code trunk_shell} is excluded
-   * because it already has its own shell fallback.
-   */
-  public static boolean isSolidBarkFallbackEligible(BlockState state) {
-    if (state == null || state.isAir() || isTrunkShell(state)) {
-      return false;
-    }
-    return isBranch(state);
-  }
-
   private static boolean isBranchClass(BlockState state) {
-    // Roots are BranchBlock subclasses and must not be treated as branches. DTP cactus is also a
-    // BranchBlock subclass but has a custom baked model, so it is excluded by its exact class.
+    // Roots are BranchBlock subclasses and must not be treated as branches.
     for (Class<?> cls = state.getBlock().getClass();
         cls != null && cls != Object.class;
         cls = cls.getSuperclass()) {
       String name = cls.getName();
-      if (ROOTS_CLASS.equals(name) || CACTUS_BRANCH_CLASS.equals(name)) {
+      if (ROOTS_CLASS.equals(name)) {
         return false;
       }
       if (BRANCH_CLASS.equals(name)) {
@@ -127,45 +87,6 @@ public final class DynamicTreesBranches {
       }
     }
     return false;
-  }
-
-  /** True when the block's class chain contains {@code className} (exact match). */
-  private static boolean isClassInChain(BlockState state, String className) {
-    for (Class<?> cls = state.getBlock().getClass();
-        cls != null && cls != Object.class;
-        cls = cls.getSuperclass()) {
-      if (className.equals(cls.getName())) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  private static boolean isCactusBranch(BlockState state) {
-    return isClassInChain(state, CACTUS_BRANCH_CLASS);
-  }
-
-  /**
-   * One-shot (per session) notice that DynamicTreesPlus mushroom branches now take the variant
-   * path. Kept out of the hot per-state log: the atomic fast path returns before the class-chain
-   * walk after the first call.
-   */
-  private static void noteMushroomVariantEligibility(BlockState state) {
-    if (MUSHROOM_VARIANT_ELIGIBLE_LOGGED.get()) {
-      return;
-    }
-    if (!isClassInChain(state, MUSHROOM_BRANCH_CLASS)) {
-      return;
-    }
-    if (MUSHROOM_VARIANT_ELIGIBLE_LOGGED.compareAndSet(false, true)) {
-      ResourceLocation id = BuiltInRegistries.BLOCK.getKey(state.getBlock());
-      Logger.info(
-          "DynamicTreesPlus mushroom branches are variant-eligible: "
-              + id
-              + " ("
-              + MUSHROOM_BRANCH_CLASS
-              + ")");
-    }
   }
 
   /**
