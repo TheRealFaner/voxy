@@ -890,7 +890,9 @@ public class ModelFactory {
             key, "variant bake failed with fallback reason " + result.fallbackReason());
         return;
       }
-      RenderType layer = PlantRenderLayerResolver.resolve(state);
+      // Resolve against the model that was actually baked (the cap-filter wrapper). Resolving
+      // against the shaper's raw model could classify the entry cutout while the bake was solid.
+      RenderType layer = PlantRenderLayerResolver.resolve(state, branchModel);
       int checkMode =
           layer == RenderType.solid()
               ? TextureUtils.WRITE_CHECK_STENCIL
@@ -916,7 +918,7 @@ public class ModelFactory {
               result.faces(),
               result.shaded(),
               result.darkenedTextures(),
-              null,
+              layer,
               result.fallbackReason(),
               key,
               null,
@@ -1094,7 +1096,9 @@ public class ModelFactory {
             key, "surface root variant failed with fallback reason " + result.fallbackReason());
         return;
       }
-      RenderType layer = PlantRenderLayerResolver.resolve(state);
+      // Resolve against the model that was actually baked (buildRootExactModel's wrapper), not
+      // the shaper's raw model, so the classification matches the baked alpha-discard data.
+      RenderType layer = PlantRenderLayerResolver.resolve(state, model);
       // TODO(Stage 3): add the depth-band plane split for the GL41 offscreen bakery. Stage 2a
       // keeps the GL41 root path single-plane; only the software (gl46) bakery emits planes.
       int checkMode =
@@ -1127,7 +1131,7 @@ public class ModelFactory {
               result.faces(),
               result.shaded(),
               result.darkenedTextures(),
-              null,
+              layer,
               result.fallbackReason(),
               null,
               null,
