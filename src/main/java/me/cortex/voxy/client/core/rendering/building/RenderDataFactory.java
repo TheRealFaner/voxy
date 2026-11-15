@@ -44,6 +44,11 @@ public class RenderDataFactory {
   private static final boolean FLUID_BRIDGE_WALLS =
       Boolean.parseBoolean(System.getProperty("voxy.fluidBridgeWalls", "true"));
 
+  // A/B switch for the LOD1 -> LOD0 render-distance seam fill. Default on; set
+  // -Dvoxy.dtSeamFill=false to compare against the pre-seam-fill mesh.
+  private static final boolean DT_SEAM_FILL =
+      Boolean.parseBoolean(System.getProperty("voxy.dtSeamFill", "true"));
+
   // TODO: MAKE a render cache that caches each WorldSection directional face generation, cause then
   // can just pull that directly
   // instead of needing to regen the entire thing
@@ -118,6 +123,8 @@ public class RenderDataFactory {
   private int seamFillOctants = 0;
   private int seamFillParentAbsent = 0;
   private int seamFillParentAir = 0;
+  // Parent octants that hold data but no trunk/branch/trunk_shell cells (one-shot diag only).
+  private int seamFillNoFillable = 0;
   private static final java.util.concurrent.atomic.AtomicBoolean SEAM_FILL_FAIL_LOG =
       new java.util.concurrent.atomic.AtomicBoolean();
   private static final java.util.concurrent.atomic.AtomicInteger SECTION_DIAG_LOGS =
@@ -996,11 +1003,25 @@ public class RenderDataFactory {
   }
 
   /**
+   * True when a seam-fill cell carries Dynamic Trees geometry worth replicating to LOD0. Only
+   * trunk/branch cells qualify: LOD1 is dominated by leaves, and replicating those on every
+   * section re-mesh inflated distant canopies.
+   */
+  private boolean isFillableSeamCell(long cellId) {
+    if (Mapper.isAir(cellId)) {
+      return false;
+    }
+    int blockId = Mapper.getBlockId(cellId);
+    return this.modelMan.isAnyBranchBlockId(blockId)
+        || this.modelMan.isTrunkShellBlockId(blockId);
+  }
+
+  /**
    * Mesh-time LOD1 octant fill for the render-distance seam. An LOD0 section is eight 16^3 octants;
    * an octant that is entirely air in LOD0 (its chunk lies beyond the vanilla render distance) but
-   * has data in the parent LOD1 section gets each non-air LOD1 cell replicated over its 2x2x2 LOD0
-   * cells. The fill goes into a transient copy of the raw array: the section and its storage are
-   * never mutated. Returns null when nothing was filled.
+   * has trunk/branch cells in the parent LOD1 section gets each fillable LOD1 cell replicated over
+   * its 2x2x2 LOD0 cells. The fill goes into a transient copy of the raw array: the section and its
+   * storage are never mutated. Returns null when nothing was filled.
    */
   private long[] tryFillSeamOctants(WorldSection section, long[] raw) {
     if (section.lvl != 0) {
@@ -1052,19 +1073,28 @@ public class RenderDataFactory {
         int pz0 = ((section.z & 1) << 4) + (((o >> 1) & 1) << 3);
         int py0 = ((section.y & 1) << 4) + (((o >> 2) & 1) << 3);
         boolean parentAir = true;
+        boolean parentHasFillable = false;
         parentScan:
         for (int cy = 0; cy < 8; cy++) {
           for (int cz = 0; cz < 8; cz++) {
             for (int cx = 0; cx < 8; cx++) {
-              if (!Mapper.isAir(parentData[WorldSection.getIndex(px0 + cx, py0 + cy, pz0 + cz)])) {
+              long cellId = parentData[WorldSection.getIndex(px0 + cx, py0 + cy, pz0 + cz)];
+              if (!Mapper.isAir(cellId)) {
                 parentAir = false;
-                break parentScan;
+                if (this.isFillableSeamCell(cellId)) {
+                  parentHasFillable = true;
+                  break parentScan;
+                }
               }
             }
           }
         }
-        if (parentAir) {
-          this.seamFillParentAir++;
+        if (!parentHasFillable) {
+          if (parentAir) {
+            this.seamFillParentAir++;
+          } else {
+            this.seamFillNoFillable++;
+          }
           continue;
         }
         if (scratch == null) {
@@ -1075,7 +1105,7 @@ public class RenderDataFactory {
           for (int cz = 0; cz < 8; cz++) {
             for (int cx = 0; cx < 8; cx++) {
               long id = parentData[WorldSection.getIndex(px0 + cx, py0 + cy, pz0 + cz)];
-              if (Mapper.isAir(id)) {
+              if (!this.isFillableSeamCell(id)) {
                 continue;
               }
               int bx = ox + (cx << 1);
@@ -3298,15 +3328,17 @@ public class RenderDataFactory {
     this.seamFillOctants = 0;
     this.seamFillParentAbsent = 0;
     this.seamFillParentAir = 0;
+    this.seamFillNoFillable = 0;
 
     // Prepare everything. Per-position Dynamic Trees variants only exist at LOD0; mips and other
     // levels keep using the plain per-BlockState model ids.
     boolean lod0 = section.lvl == 0;
     // Mesh-time seam fill: at the render-distance seam the far LOD0 octants are air while the
     // LOD1 parent still holds the trunk, and the LOD0 mesh suppresses the LOD1 parent. Mesh a
-    // transient copy with those octants filled from LOD1 so the far half of the trunk is drawn.
+    // transient copy with the trunk/branch cells of those octants filled from LOD1 so the far half
+    // of the trunk is drawn; leaf cells stay unfilled so canopies do not balloon.
     long[] rawData = section._unsafeGetRawDataArray();
-    if (lod0 && DynamicTreesBranches.PRESENT) {
+    if (lod0 && DT_SEAM_FILL && DynamicTreesBranches.PRESENT) {
       try {
         long[] filled = this.tryFillSeamOctants(section, rawData);
         if (filled != null) {
@@ -3393,6 +3425,8 @@ public class RenderDataFactory {
                 + this.seamFillParentAbsent
                 + ",parentAir:"
                 + this.seamFillParentAir
+                + ",noFillable:"
+                + this.seamFillNoFillable
                 + " branches="
                 + this.variantBlockCount
                 + " maskPatched="
