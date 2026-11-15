@@ -21,6 +21,7 @@ import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReentrantLock;
+import me.cortex.voxy.client.config.VoxyConfig;
 import me.cortex.voxy.client.core.gl.GlBuffer;
 import me.cortex.voxy.client.core.gl.GlTexture;
 import me.cortex.voxy.client.core.model.bakery.Gl41OffscreenModelTextureBakery;
@@ -44,6 +45,7 @@ import net.minecraft.resources.ResourceLocation;
 import net.minecraft.tags.BlockTags;
 import net.minecraft.world.level.BlockAndTintGetter;
 import net.minecraft.world.level.ColorResolver;
+import net.minecraft.world.level.EmptyBlockGetter;
 import net.minecraft.world.level.LightLayer;
 import net.minecraft.world.level.biome.Biome;
 import net.minecraft.world.level.biome.Biomes;
@@ -53,6 +55,8 @@ import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.block.state.properties.BlockStateProperties;
 import net.minecraft.world.level.lighting.LevelLightEngine;
 import net.minecraft.world.level.material.FluidState;
+import net.minecraft.world.phys.AABB;
+import net.minecraft.world.phys.shapes.VoxelShape;
 import org.jetbrains.annotations.Nullable;
 import org.lwjgl.system.MemoryUtil;
 
@@ -251,6 +255,11 @@ public class ModelFactory {
   // Upload-loop failure logging is rate limited so a broken atlas cannot spam the log.
   private final AtomicInteger uploadFailureLogCount = new AtomicInteger();
   private final AtomicInteger shellFailureLogCount = new AtomicInteger();
+
+  // Sparse cutout plant culling (voxy.cullSparseCutoutPlants): per-face counter of faces dropped
+  // from baked LOD models, plus a one-shot first-cull log entry.
+  private static final AtomicInteger CULLED_PLANT_FACE_COUNT = new AtomicInteger();
+  private static final AtomicBoolean CULLED_PLANT_LOG_FIRED = new AtomicBoolean();
 
   // Async-sink (gl41metal) publications are held until MaterialStore.drainUploads wrote the atlas
   // tiles; publishing earlier lets sections mesh against unwritten slots (black/white cells).
@@ -1367,6 +1376,47 @@ public class ModelFactory {
 
   // layer == null means "recompute from ItemBlockRenderTypes" (sink/gl41metal path, matching the
   // reference implementation); the gl46 path passes the layer derived from the software bakery.
+  // Sparse cutout plant culling (voxy.cullSparseCutoutPlants). Plants bake as cutout cards that do
+  // not cover the whole block; deep atlas mips collapse their sparse sprites into solid
+  // intersecting planes. This narrows the per-face sparse-cutout test to plant-like geometry so
+  // full-block cutout (glass, panes), slabs, fences, vines, iron bars and other structure blocks
+  // keep their faces. Modded cross-shaped plants that do not extend a vanilla plant class (BOP
+  // toadstool, Regions Unexplored sprouts, ...) are caught by the cross-bounds heuristic.
+  private static boolean isPlantLikeBlockState(BlockState state) {
+    Block block = state.getBlock();
+    if (block instanceof BushBlock // short/tall grass, mushrooms, waterlily, saplings, sweet
+        // berry, sea pickle, pink petals, double plants, ...
+        || block instanceof FlowerBlock
+        || block instanceof TallFlowerBlock
+        || block instanceof CropBlock
+        || block instanceof StemBlock
+        || block instanceof SugarCaneBlock) {
+      return true;
+    }
+    try {
+      VoxelShape shape = state.getShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO);
+      if (shape.isEmpty()) {
+        return false;
+      }
+      AABB bounds = shape.bounds();
+      double xExtent = bounds.maxX - bounds.minX;
+      double zExtent = bounds.maxZ - bounds.minZ;
+      // Cross-shaped plant: rooted at the block bottom, clearly below full block height, with a
+      // roughly square half-block footprint. Fences/posts/kelp/bamboo reach the full block height
+      // and fail the maxY test; torches/chains have too small a footprint.
+      return bounds.minY <= 1.0 / 16.0
+          && bounds.maxY <= 14.5 / 16.0
+          && xExtent >= 7.0 / 16.0
+          && xExtent <= 13.0 / 16.0
+          && zExtent >= 7.0 / 16.0
+          && zExtent <= 13.0 / 16.0
+          && Math.abs(xExtent - zExtent) <= 2.0 / 16.0;
+    } catch (Throwable t) {
+      // getShape is arbitrary mod code; never break a bake over the cull heuristic.
+      return false;
+    }
+  }
+
   private ModelBakeResultUpload processTextureBakeResult(
       int blockId,
       BlockState blockState,
@@ -1706,6 +1756,17 @@ public class ModelFactory {
 
     // TODO: add a bunch of control config options for overriding/setting options of metadata for
     // each face of each type
+
+    // Sparse cutout plant culling: evaluated once per baked model. DT variant/shell/root bakes
+    // must never be culled, and the bake is shared across LOD levels, so near Voxy sections lose
+    // the plant faces too; near chunks are rendered by the vanilla/Sodium pipeline instead.
+    final boolean plantFaceCullEnabled =
+        VoxyConfig.CONFIG.cullSparseCutoutPlants
+            && variantKey == null
+            && shellKey == null
+            && rootKey == null
+            && isPlantLikeBlockState(blockState);
+
     for (int face = 5;
         face != -1;
         face--) { // In reverse order to make indexing into the metadata long easier
@@ -1814,6 +1875,32 @@ public class ModelFactory {
         // with a single unwritten pixel must discard.
         needsAlphaDiscard |= writeCount < MODEL_TEXTURE_SIZE * MODEL_TEXTURE_SIZE;
       }
+
+      if (plantFaceCullEnabled
+          && layer != RenderType.solid()
+          && layer != RenderType.translucent()
+          && !faceCoversFullBlock
+          && ((float) writeCount) / area < 0.9f) {
+        // Sparse cutout plant face: do not emit it into the model. Deep atlas mips collapse such
+        // sparse sprites into solid intersecting planes, the classic "solid plant cards in the
+        // LOD" artifact. Marks the face as non-existent (identical encoding to an empty face) so
+        // every mesher (CPU meshing, gl46 MDIC, gl41metal drawlists) skips it.
+        metadata |= 0xFF;
+        MemoryUtil.memPutInt(faceUploadPtr, -1);
+        fullyOpaque = false;
+        int culledTotal = CULLED_PLANT_FACE_COUNT.incrementAndGet();
+        if (CULLED_PLANT_LOG_FIRED.compareAndSet(false, true)) {
+          Logger.info(
+              "Voxy culling sparse cutout plant faces from LOD models (voxy.cullSparseCutoutPlants=true), first cull: ",
+              blockState,
+              " face=",
+              Direction.from3DDataValue(face),
+              " total=",
+              culledTotal);
+        }
+        continue;
+      }
+
       faceModelData |= needsAlphaDiscard ? 1 << 22 : 0;
       anyFaceNeedsDiscard |= needsAlphaDiscard;
 

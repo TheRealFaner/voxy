@@ -50,6 +50,13 @@ public class VoxyConfig {
   // Range: 0-4 blocks, default 1 (original Voxy behavior)
   public int lodBoundaryBuffer = 1;
 
+  // Cull sparse cutout plant faces (cross/plant quads that do not cover their block) out of
+  // the baked Voxy LOD models. Deep atlas mips collapse these sparse sprites into solid
+  // intersecting planes; skipping the faces removes the artifact. Near chunks are still
+  // rendered by the vanilla/Sodium pipeline. Takes effect on the next model bake (new world
+  // or cleared voxy data), so toggling at runtime requires reloading the models.
+  public boolean cullSparseCutoutPlants = true;
+
   // World curvature (gl41metal): simulates standing on a spherical planet.
   // 0 = disabled (flat world), 1 = real Earth curvature (6371km radius),
   // higher values = more extreme curvature. Range: 0, or 50-5000.
