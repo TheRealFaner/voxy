@@ -2750,8 +2750,8 @@ public class ModelFactory {
    * neighbour slice, shell bake unavailable). Cells whose core is known to be non-thick are
    * DT-invalid and must stay empty; the caller makes that distinction.
    *
-   * <p>The sprite is resolved on the bakery thread in this order: the shell state's own model
-   * particle icon, the resolved core's / nearby branch state's bark sprite, then the deterministic
+   * <p>The sprite is resolved on the bakery thread in this order: the resolved core's / nearby
+   * branch state's bark sprite, the shell state's own model particle icon, then the deterministic
    * oak bark side sprite (one-shot WARN per shell block id). The bake is queued lazily, so the
    * first caller gets {@link #VARIANT_MODEL_NOT_READY} and must retry the section.
    *
@@ -3185,23 +3185,26 @@ public class ModelFactory {
   }
 
   /**
-   * Resolves the fail-safe cube sprite on the bakery thread: the shell state's own model particle
-   * icon, then the resolved core's / nearby branch state's bark sprite, then the deterministic oak
+   * Resolves the fail-safe cube sprite on the bakery thread: the resolved core's / nearby branch
+   * state's bark sprite, then the shell state's own model particle icon, then the deterministic oak
    * bark side sprite (one-shot WARN per shell block id). The missing-texture sprite is used only as
    * an absolute last resort, so the cube always has geometry and the caller never falls back to the
    * empty model.
    */
   private TextureAtlasSprite resolveShellSolidBaseSprite(
       ShellSolidBaseKey key, BlockState shellState) {
-    TextureAtlasSprite sprite = barkSpriteOrNull(shellState);
-    if (sprite != null) {
-      return sprite;
-    }
+    // Species bark first: a trunk_shell's own particle icon can be a generic oak placeholder, so
+    // preferring it made non-oak thick trunks (e.g. birch) render oak bark at the seam.
     if (key.barkSourceBlockId() > 0) {
-      sprite = barkSpriteOrNull(this.mapper.getBlockStateFromBlockId(key.barkSourceBlockId()));
+      TextureAtlasSprite sprite =
+          barkSpriteOrNull(this.mapper.getBlockStateFromBlockId(key.barkSourceBlockId()));
       if (sprite != null) {
         return sprite;
       }
+    }
+    TextureAtlasSprite sprite = barkSpriteOrNull(shellState);
+    if (sprite != null) {
+      return sprite;
     }
     sprite = barkSpriteOrNull(Blocks.OAK_LOG.defaultBlockState());
     if (sprite != null) {
