@@ -112,6 +112,7 @@ import me.cortex.voxy.client.core.gl.shader.ShaderLoader;
 import me.cortex.voxy.client.core.gl.shader.ShaderType;
 import me.cortex.voxy.client.core.model.ColourDepthTextureData;
 import me.cortex.voxy.client.core.model.ModelQuadsAccess;
+import me.cortex.voxy.client.core.model.PlantRenderLayerResolver;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.ItemBlockRenderTypes;
 import net.minecraft.client.renderer.RenderType;
@@ -125,7 +126,6 @@ import net.minecraft.world.level.BlockAndTintGetter;
 import net.minecraft.world.level.ColorResolver;
 import net.minecraft.world.level.LightLayer;
 import net.minecraft.world.level.block.Blocks;
-import net.minecraft.world.level.block.LeavesBlock;
 import net.minecraft.world.level.block.LiquidBlock;
 import net.minecraft.world.level.block.RenderShape;
 import net.minecraft.world.level.block.entity.BlockEntity;
@@ -321,10 +321,7 @@ public final class Gl41OffscreenModelTextureBakery implements AutoCloseable {
       return new Result(emptyFaces, false, false, FALLBACK_INVISIBLE);
     }
 
-    RenderType layer =
-        state.getBlock() instanceof LeavesBlock
-            ? RenderType.solid()
-            : ItemBlockRenderTypes.getChunkRenderType(state);
+    RenderType layer = PlantRenderLayerResolver.resolve(state, modelOverride);
     this.vertexConsumer.reset();
     this.collectBlockModelQuads(state, layer, neighbours, modelOverride, cube);
     if (this.vertexConsumer.isEmpty()) {

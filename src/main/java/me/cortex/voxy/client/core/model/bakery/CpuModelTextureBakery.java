@@ -12,14 +12,13 @@ import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
 import me.cortex.voxy.client.core.model.ColourDepthTextureData;
+import me.cortex.voxy.client.core.model.PlantRenderLayerResolver;
 import net.minecraft.client.Minecraft;
-import net.minecraft.client.renderer.ItemBlockRenderTypes;
 import net.minecraft.client.renderer.RenderType;
 import net.minecraft.client.renderer.block.model.BakedQuad;
 import net.minecraft.client.renderer.texture.TextureAtlasSprite;
 import net.minecraft.core.Direction;
 import net.minecraft.util.RandomSource;
-import net.minecraft.world.level.block.LeavesBlock;
 import net.minecraft.world.level.block.LiquidBlock;
 import net.minecraft.world.level.block.RenderShape;
 import net.minecraft.world.level.block.state.BlockState;
@@ -55,13 +54,10 @@ public final class CpuModelTextureBakery {
       return new Result(faces, false, false, FALLBACK_FLUID_ONLY);
     }
 
-    RenderType layer =
-        state.getBlock() instanceof LeavesBlock
-            ? RenderType.solid()
-            : ItemBlockRenderTypes.getChunkRenderType(state);
-    int meta = ModelTextureBakery.getMetaFromLayer(layer);
     var model =
         Minecraft.getInstance().getModelManager().getBlockModelShaper().getBlockModel(state);
+    RenderType layer = PlantRenderLayerResolver.resolve(state, model);
+    int meta = ModelTextureBakery.getMetaFromLayer(layer);
     RandomSource random = new SingleThreadedRandomSource(42L);
     boolean shaded = false;
     boolean hasDirectionalQuads = false;

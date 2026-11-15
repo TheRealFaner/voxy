@@ -33,7 +33,6 @@ import me.cortex.voxy.common.world.other.DynamicTreesBranches;
 import me.cortex.voxy.common.world.other.Mapper;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.color.block.BlockColor;
-import net.minecraft.client.renderer.ItemBlockRenderTypes;
 import net.minecraft.client.renderer.RenderType;
 import net.minecraft.client.renderer.texture.TextureAtlasSprite;
 import net.minecraft.client.resources.model.BakedModel;
@@ -729,10 +728,7 @@ public class ModelFactory {
             key, "variant bake failed with fallback reason " + result.fallbackReason());
         return;
       }
-      RenderType layer = ItemBlockRenderTypes.getChunkRenderType(state);
-      if (state.getBlock() instanceof LeavesBlock) {
-        layer = RenderType.solid();
-      }
+      RenderType layer = PlantRenderLayerResolver.resolve(state);
       int checkMode =
           layer == RenderType.solid()
               ? TextureUtils.WRITE_CHECK_STENCIL
@@ -870,7 +866,7 @@ public class ModelFactory {
             key, "surface root variant failed with fallback reason " + result.fallbackReason());
         return;
       }
-      RenderType layer = ItemBlockRenderTypes.getChunkRenderType(state);
+      RenderType layer = PlantRenderLayerResolver.resolve(state);
       int checkMode =
           layer == RenderType.solid()
               ? TextureUtils.WRITE_CHECK_STENCIL
@@ -1377,8 +1373,9 @@ public class ModelFactory {
     }
   }
 
-  // layer == null means "recompute from ItemBlockRenderTypes" (sink/gl41metal path, matching the
-  // reference implementation); the gl46 path passes the layer derived from the software bakery.
+  // layer == null means "resolve from the model/registered block render types through
+  // PlantRenderLayerResolver" (sink/gl41metal path); the gl46 path passes the layer derived from
+  // the software bakery.
   private ModelBakeResultUpload processTextureBakeResult(
       int blockId,
       BlockState blockState,
@@ -1479,14 +1476,9 @@ public class ModelFactory {
     }
 
     if (layer == null) {
-      // Reference (sink path) render layer computation
-      if (blockState.getBlock() instanceof LiquidBlock) {
-        layer = ItemBlockRenderTypes.getRenderLayer(blockState.getFluidState());
-      } else if (blockState.getBlock() instanceof LeavesBlock) {
-        layer = RenderType.solid();
-      } else {
-        layer = ItemBlockRenderTypes.getChunkRenderType(blockState);
-      }
+      // Sink (gl41metal) path: no layer came from the bake, resolve it the same way as the
+      // bake paths so the model entry classification matches the baked alpha-discard data.
+      layer = PlantRenderLayerResolver.resolve(blockState);
     }
     int renderLayer = classifyRenderLayer(blockState, layer, isFluid);
 

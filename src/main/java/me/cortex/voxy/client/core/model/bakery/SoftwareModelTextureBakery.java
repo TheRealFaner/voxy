@@ -9,9 +9,9 @@ import com.mojang.blaze3d.vertex.VertexConsumer;
 import java.util.concurrent.CompletableFuture;
 import me.cortex.voxy.client.core.model.ModelFactory;
 import me.cortex.voxy.client.core.model.ModelQuadsAccess;
+import me.cortex.voxy.client.core.model.PlantRenderLayerResolver;
 import me.cortex.voxy.common.util.UnsafeUtil;
 import net.minecraft.client.Minecraft;
-import net.minecraft.client.renderer.ItemBlockRenderTypes;
 import net.minecraft.client.renderer.RenderType;
 import net.minecraft.client.resources.model.BakedModel;
 import net.minecraft.core.BlockPos;
@@ -22,7 +22,6 @@ import net.minecraft.world.level.BlockAndTintGetter;
 import net.minecraft.world.level.ColorResolver;
 import net.minecraft.world.level.LightLayer;
 import net.minecraft.world.level.block.Blocks;
-import net.minecraft.world.level.block.LeavesBlock;
 import net.minecraft.world.level.block.LiquidBlock;
 import net.minecraft.world.level.block.RenderShape;
 import net.minecraft.world.level.block.entity.BlockEntity;
@@ -285,16 +284,7 @@ public class SoftwareModelTextureBakery {
       isBlock = false;
     }
 
-    RenderType blockRenderLayer = null;
-    if (state.getBlock() instanceof LiquidBlock) {
-      blockRenderLayer = ItemBlockRenderTypes.getRenderLayer(state.getFluidState());
-    } else {
-      if (state.getBlock() instanceof LeavesBlock) {
-        blockRenderLayer = RenderType.solid();
-      } else {
-        blockRenderLayer = ItemBlockRenderTypes.getChunkRenderType(state);
-      }
-    }
+    RenderType blockRenderLayer = PlantRenderLayerResolver.resolve(state, modelOverride);
 
     // TODO: support block model entities
     // BakedBlockEntityModel bbem = null;

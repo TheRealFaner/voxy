@@ -5,8 +5,8 @@ import static org.lwjgl.opengl.GL30.*;
 import static org.lwjgl.opengl.GL45.glTextureBarrier;
 
 import com.mojang.blaze3d.vertex.PoseStack;
+import me.cortex.voxy.client.core.model.PlantRenderLayerResolver;
 import net.minecraft.client.Minecraft;
-import net.minecraft.client.renderer.ItemBlockRenderTypes;
 import net.minecraft.client.renderer.RenderType;
 import net.minecraft.client.renderer.texture.TextureAtlas;
 import net.minecraft.core.BlockPos;
@@ -15,7 +15,6 @@ import net.minecraft.world.level.BlockAndTintGetter;
 import net.minecraft.world.level.ColorResolver;
 import net.minecraft.world.level.LightLayer;
 import net.minecraft.world.level.block.Blocks;
-import net.minecraft.world.level.block.LeavesBlock;
 import net.minecraft.world.level.block.LiquidBlock;
 import net.minecraft.world.level.block.RenderShape;
 import net.minecraft.world.level.block.entity.BlockEntity;
@@ -200,18 +199,8 @@ public class ModelTextureBakery {
 
   public int renderToStream(BlockState state, int streamBuffer, int streamOffset) {
     this.capture.clear();
-    boolean isBlock = true;
-    RenderType layer;
-    if (state.getBlock() instanceof LiquidBlock) {
-      layer = ItemBlockRenderTypes.getRenderLayer(state.getFluidState());
-      isBlock = false;
-    } else {
-      if (state.getBlock() instanceof LeavesBlock) {
-        layer = RenderType.solid();
-      } else {
-        layer = ItemBlockRenderTypes.getChunkRenderType(state);
-      }
-    }
+    boolean isBlock = !(state.getBlock() instanceof LiquidBlock);
+    RenderType layer = PlantRenderLayerResolver.resolve(state);
 
     // TODO: support block model entities
     // BakedBlockEntityModel bbem = null;
