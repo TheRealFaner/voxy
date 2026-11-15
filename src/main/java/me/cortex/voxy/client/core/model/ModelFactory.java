@@ -265,8 +265,9 @@ public class ModelFactory {
   private final byte[] thickBranchCache = new byte[1 << 20];
   private final byte[] trunkShellCache = new byte[1 << 20];
 
-  // Synthetic full-bark-cube models for Dynamic Trees thick branch states (radius > 8), see
-  // thickBranchModelFor. Optional.empty() caches a failed sprite lookup so it is attempted once.
+  // Synthetic full-bark-cube models for Dynamic Trees thick branch states (radius > 8) and
+  // DynamicTreesPlus mushroom stems (on the neighbour-less base path), see thickBranchModelFor and
+  // mushroomStemModelFor. A failed sprite lookup is not retained, so it is retried on a later call.
   private final ConcurrentHashMap<BlockState, Optional<BakedModel>> thickBranchSolidModels =
       new ConcurrentHashMap<>();
 
@@ -488,7 +489,13 @@ public class ModelFactory {
     }
 
     BakedModel thickBranchModel = this.thickBranchModelFor(blockState);
-    var result = this.gl41OffscreenBakery.bake(blockState, null, thickBranchModel);
+    // Mushroom stems need the solid bark cube on the neighbour-less base bake: their real model
+    // bakes no usable geometry without ModelData. Chosen once, passed to the single bake call.
+    BakedModel baseModel = this.mushroomStemModelFor(blockState);
+    if (baseModel == null) {
+      baseModel = thickBranchModel;
+    }
+    var result = this.gl41OffscreenBakery.bake(blockState, null, baseModel);
     var upload =
         this.processTextureBakeResult(
             blockId,
@@ -550,11 +557,16 @@ public class ModelFactory {
     if (bake == null) return false;
 
     BakedModel thickBranchModel = this.thickBranchModelFor(bake.state);
+    // Same upfront override as the GL41 path: mushroom stems bake no usable geometry without
+    // ModelData, so substitute the solid bark cube in this single bake instead of re-baking.
+    BakedModel baseModel = this.mushroomStemModelFor(bake.state);
+    if (baseModel == null) {
+      baseModel = thickBranchModel;
+    }
     int flags =
-        thickBranchModel == null
+        baseModel == null
             ? this.bakery2.renderToOutput(bake.state, this.bakeScratchBuffer)
-            : this.bakery2.renderToOutput(
-                bake.state, this.bakeScratchBuffer, null, thickBranchModel);
+            : this.bakery2.renderToOutput(bake.state, this.bakeScratchBuffer, null, baseModel);
 
     var bakeResult =
         this.processTextureBakeResult(
@@ -2391,6 +2403,32 @@ public class ModelFactory {
       // Never cache an empty Optional permanently: the particle-sprite lookup can fail
       // transiently during a resource reload, and computeIfAbsent used to make the trunk prism
       // and every composite root shell disappear for the rest of the session.
+      cached = this.createThickBranchModel(state);
+      if (cached.isPresent()) {
+        this.thickBranchSolidModels.put(state, cached);
+      }
+    }
+    return cached.orElse(null);
+  }
+
+  /**
+   * Solid-bark base model for DynamicTreesPlus mushroom stems. Their real model derives all
+   * geometry from neighbour-supplied ModelData; on the neighbour-less base-bake path (ModelData
+   * .EMPTY) it produces degenerate quads and dedupes to the air model, which hides stems at LOD1
+   * and fails the LOD0 variant gate ({@code modelId != 0}). A full cube using the model's bark
+   * particle sprite ({@code minecraft:block/mushroom_stem} for {@code mushroom_branch}) keeps the
+   * base id visible. Neighbour-aware variant bakes keep using the real dynamic model.
+   *
+   * <p>Returns null for every other block.
+   */
+  private @Nullable BakedModel mushroomStemModelFor(BlockState state) {
+    if (!DynamicTreesBranches.isMushroomBranch(state)) {
+      return null;
+    }
+    Optional<BakedModel> cached = this.thickBranchSolidModels.get(state);
+    if (cached == null || cached.isEmpty()) {
+      // Same policy as thickBranchModelFor: never cache an empty Optional permanently, the
+      // particle-sprite lookup can fail transiently during a resource reload.
       cached = this.createThickBranchModel(state);
       if (cached.isPresent()) {
         this.thickBranchSolidModels.put(state, cached);

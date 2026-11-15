@@ -15,9 +15,10 @@ import org.jetbrains.annotations.Nullable;
  *
  * <p>Branch geometry is generated from neighbour state by {@code BranchBlock.getConnectionData}, so
  * only real branch blocks (Basic/Thick/Palm and addon subclasses) are valid variant candidates.
- * Roots extend {@code BranchBlock} but must be excluded. {@code dynamictreesplus} cacti and
- * mushroom stems are excluded by default because their baked models use a different ModelData
- * contract.
+ * Roots extend {@code BranchBlock} but must be excluded. The {@code dynamictreesplus} namespace is
+ * excluded by default because its cacti use a different ModelData contract, with one carve-out:
+ * mushroom stems ({@code MushroomBranchBlock extends ThickBranchBlock}) are regular DT branch
+ * models and stay variant-eligible.
  */
 public final class DynamicTreesBranches {
   public static final String BRANCH_CLASS = "com.dtteam.dynamictrees.block.branch.BranchBlock";
@@ -27,6 +28,16 @@ public final class DynamicTreesBranches {
   public static final String SURFACE_ROOT_CLASS =
       "com.dtteam.dynamictrees.block.branch.SurfaceRootBlock";
   public static final String EXCLUDED_NAMESPACE = "dynamictreesplus";
+
+  /**
+   * DynamicTreesPlus mushroom stem ({@code dynamictreesplus:mushroom_branch}). Its class chain
+   * extends DT {@code ThickBranchBlock}, and its model is a regular DT branch model whose bark
+   * sprite is {@code minecraft:block/mushroom_stem}, so it is the only {@code dynamictreesplus}
+   * block allowed through {@link #EXCLUDED_NAMESPACE}. Cacti and every other addon block stay
+   * excluded.
+   */
+  public static final String MUSHROOM_BRANCH_CLASS =
+      "com.dtteam.dynamictreesplus.block.mushroom.MushroomBranchBlock";
 
   /**
    * Largest radius whose baked model stays inside one block cell. Branches above this (Dynamic
@@ -47,10 +58,17 @@ public final class DynamicTreesBranches {
     }
     Block block = state.getBlock();
     ResourceLocation id = BuiltInRegistries.BLOCK.getKey(block);
-    if (id != null && EXCLUDED_NAMESPACE.equals(id.getNamespace())) {
+    if (id != null
+        && EXCLUDED_NAMESPACE.equals(id.getNamespace())
+        && !isClassInChain(state, MUSHROOM_BRANCH_CLASS)) {
       return false;
     }
     return isBranchClass(state) || state.is(DYNAMICTREES_BRANCHES);
+  }
+
+  /** True for DTP mushroom stems, the one {@code dynamictreesplus} block allowed as a branch. */
+  public static boolean isMushroomBranch(BlockState state) {
+    return state != null && !state.isAir() && isClassInChain(state, MUSHROOM_BRANCH_CLASS);
   }
 
   /**
@@ -71,6 +89,18 @@ public final class DynamicTreesBranches {
    */
   public static boolean isBranchBlockClass(BlockState state) {
     return state != null && !state.isAir() && isBranchClass(state);
+  }
+
+  /** Walks the block's superclass chain and compares fully-qualified class names exactly. */
+  private static boolean isClassInChain(BlockState state, String className) {
+    for (Class<?> cls = state.getBlock().getClass();
+        cls != null && cls != Object.class;
+        cls = cls.getSuperclass()) {
+      if (className.equals(cls.getName())) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private static boolean isBranchClass(BlockState state) {
