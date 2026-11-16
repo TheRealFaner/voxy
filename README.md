@@ -83,11 +83,16 @@ limit, not a limit of 15 ordinary GLSL uniforms.
 All switches keep the production default when unset; none changes rendering
 unless explicitly enabled.
 
-- `/voxy dump <x> <y> <z> [radius] [level]` — read-only LOD cell dump for
-  evidence gathering. `radius` is 0..2 cells and `level` is 0..4. Every line is
-  prefixed `[VoxyDump]` and written to `latest.log`; chat shows at most 200
-  lines. The dump reports the section/cell key, Mapper block id and state,
-  Dynamic Trees classification, base model metadata and per-face face data, the
+- `/voxy dump <x> <y> <z> [radius] [level]` — read-only (no world writes) LOD
+  cell dump for evidence gathering. `radius` is 0..2 cells and `level` is 0..4.
+  Every line is prefixed `[VoxyDump]` and written to `latest.log`; chat shows at
+  most 200 lines. Sections come from `WorldEngine.acquireIfExists`: cached
+  sections are reused, but a section stored on disk but not cached may be loaded
+  synchronously, so radius >1 far from the player can hitch; prefer radius 0..1
+  near the player. With `-Dvoxy.dtRemeshOnMaterialize=true` (default off),
+  materializing a stored section may additionally enqueue neighbour remeshes.
+  The dump reports the section/cell key, Mapper block id and state, Dynamic
+  Trees classification, base model metadata and per-face face data, the
   raw/canonical variant key slots and variant registry state, the section mask
   bits and `maskPatched` status, the branch cap-filter/drop mask/depth mode, and
   a kept-vs-dropped re-run of the quad pipeline for the cell.

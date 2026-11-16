@@ -35,10 +35,14 @@ import net.minecraft.world.level.levelgen.SingleThreadedRandomSource;
  * same neighbour context and {@link RootVertFilterBakedModel} predicate, listing kept vs dropped
  * quads with plane/extents.
  *
- * <p>Inert by default: nothing runs unless the command is executed. Sections are only read through
- * {@link WorldEngine#acquireIfExists} (never force-loaded) and released before returning. No
- * variant request is queued; the registry is read, not mutated (canonical slot representatives are
- * stored exactly as normal meshing already does).
+ * <p>Inert by default: nothing runs unless the command is executed. Sections are obtained through
+ * {@link WorldEngine#acquireIfExists}: cached sections are reused, a section present on storage but
+ * not cached may be loaded synchronously (a radius-2 dump far from the player can therefore hitch),
+ * and a stored-empty section reads as unavailable/air. All acquired sections are released before
+ * returning. No variant request is queued; the registry is read, not mutated (canonical slot
+ * representatives are stored exactly as normal meshing already does). With {@code
+ * -Dvoxy.dtRemeshOnMaterialize=true} (default off) materializing a stored section may also enqueue
+ * neighbour remeshes through the normal dirty path.
  */
 public final class LodDump {
   public static final int MAX_RADIUS = 2;
@@ -158,15 +162,39 @@ public final class LodDump {
             int gx = centerGx + dx;
             int gy = centerGy + dy;
             int gz = centerGz + dz;
-            dumpCell(out, sections, factory, gx, gy, gz, lvl, cellIndex++, voxyActive);
+            int index = cellIndex++;
+            try {
+              dumpCell(out, sections, factory, gx, gy, gz, lvl, index, voxyActive);
+            } catch (Throwable t) {
+              // Isolate a broken cell (bad model, mapper or section state) so the rest of the
+              // radius still produces evidence; sections are released by the outer finally.
+              out.line(
+                  "cell index="
+                      + index
+                      + " cell=["
+                      + gx
+                      + ","
+                      + gy
+                      + ","
+                      + gz
+                      + "] error="
+                      + t.getClass().getName()
+                      + " message=\""
+                      + String.valueOf(t.getMessage())
+                      + "\"");
+            }
             if (out.truncated) {
-              out.line("dumpTruncated lines=" + out.lines + " reason=MAX_LINES");
+              out.marker("dumpTruncated lines=" + out.lines + " reason=MAX_LINES");
               return out.lines;
             }
           }
         }
       }
       out.line("footer cells=" + cellIndex + " lines=" + out.lines + " truncated=" + out.truncated);
+      if (out.truncated) {
+        // The footer itself can hit the budget boundary; always mark a truncated dump.
+        out.marker("dumpTruncated lines=" + out.lines + " reason=MAX_LINES");
+      }
       return out.lines;
     } finally {
       sections.close();
@@ -885,11 +913,20 @@ public final class LodDump {
       this.lines++;
       this.sink.accept("[VoxyDump] " + text);
     }
+
+    /** Bypasses the budget so a truncated dump is always marked in the log. */
+    private void marker(String text) {
+      this.lines++;
+      this.sink.accept("[VoxyDump] " + text);
+    }
   }
 
   /**
-   * Read-only section cache for one LOD. Uses {@link WorldEngine#acquireIfExists} so a dump never
-   * force-loads a section or touches storage; absent sections read as unavailable/air.
+   * Read-only section cache for one LOD. {@link WorldEngine#acquireIfExists} reuses cached
+   * sections, synchronously loads a section present on storage but not cached (this can hitch for
+   * radius &gt; 1 far from the player and, with {@code -Dvoxy.dtRemeshOnMaterialize=true}, may
+   * enqueue neighbour remeshes), and returns null for a stored-empty section, which reads as
+   * unavailable/air.
    */
   private static final class SectionCache {
     private final WorldEngine engine;

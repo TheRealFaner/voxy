@@ -178,6 +178,13 @@ public class VoxyCommands {
       return 1;
     }
 
+    if (radius > 1) {
+      sendErrorToPlayer(
+          Component.literal(
+              "[VoxyDump] radius>1 can synchronously load stored sections and hitch; prefer"
+                  + " radius<=1 near the player"));
+    }
+
     int[] chatLines = {0};
     int lines =
         LodDump.run(
