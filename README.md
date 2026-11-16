@@ -78,6 +78,30 @@ limit, not a limit of 15 ordinary GLSL uniforms.
   `mc_1211-aero` branch.
 - Formatting and source layout standardized for ongoing maintenance.
 
+## Diagnostics and A/B switches
+
+All switches keep the production default when unset; none changes rendering
+unless explicitly enabled.
+
+- `/voxy dump <x> <y> <z> [radius] [level]` — read-only LOD cell dump for
+  evidence gathering. `radius` is 0..2 cells and `level` is 0..4. Every line is
+  prefixed `[VoxyDump]` and written to `latest.log`; chat shows at most 200
+  lines. The dump reports the section/cell key, Mapper block id and state,
+  Dynamic Trees classification, base model metadata and per-face face data, the
+  raw/canonical variant key slots and variant registry state, the section mask
+  bits and `maskPatched` status, the branch cap-filter/drop mask/depth mode, and
+  a kept-vs-dropped re-run of the quad pipeline for the cell.
+- `-Dvoxy.vanillaTerrain=true` — makes `VoxyClient.disableSodiumChunkRender()`
+  return `true` (default `false`). The runtime toggle is
+  `/voxy vanillaTerrain on|off`; `/voxy vanillaTerrain` prints the state.
+- `-Dvoxy.dtVariants=false` — forces every Dynamic Trees branch/surface-root
+  variant request to `UNAVAILABLE` without inserting a key or touching the cap,
+  so LOD0 keeps the base models. Default `true`.
+- `-Dvoxy.dtBranchCapFilter=all|per-side|none` — existing branch boundary-cap
+  filter mode. Default `all`.
+- `-Dvoxy.dtBranchDepthMode=max|avg|min` — existing branch variant face depth
+  mode. Default `max`.
+
 ## Known limitations
 
 - GL41Metal is experimental and requires macOS plus bundled native and Metal

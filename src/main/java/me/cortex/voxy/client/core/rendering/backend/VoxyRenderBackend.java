@@ -1,11 +1,20 @@
 package me.cortex.voxy.client.core.rendering.backend;
 
 import java.util.List;
+import me.cortex.voxy.client.core.model.ModelFactory;
 import me.cortex.voxy.client.core.rendering.Viewport;
 import net.caffeinemc.mods.sodium.client.render.chunk.lists.ChunkRenderListIterable;
 
 public interface VoxyRenderBackend extends AutoCloseable {
   RenderBackendId id();
+
+  /**
+   * Diagnostic accessor: the model factory this backend bakes block models into, or {@code null}
+   * when the backend does not own one. Used by {@code /voxy dump} and the LOD A/B switches only.
+   */
+  default ModelFactory getModelFactory() {
+    return null;
+  }
 
   boolean rendersLodTerrain();
 

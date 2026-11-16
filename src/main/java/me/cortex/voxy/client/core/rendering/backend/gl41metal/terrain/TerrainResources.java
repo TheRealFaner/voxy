@@ -91,6 +91,11 @@ public final class TerrainResources implements AutoCloseable {
     Logger.info("Created GL41Metal Metal LOD/culling worklist resources");
   }
 
+  /** Diagnostic accessor: the model factory backing this backend's bakery. */
+  public me.cortex.voxy.client.core.model.ModelFactory getModelFactory() {
+    return this.modelService.factory;
+  }
+
   public void tick(RenderFrameContext frameContext, long nativeHandle) {
     this.syncIrisBlockStateMapping();
     this.ensureNativeResources(nativeHandle);

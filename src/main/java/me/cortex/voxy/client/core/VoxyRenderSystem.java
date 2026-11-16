@@ -239,4 +239,9 @@ public class VoxyRenderSystem {
   public WorldEngine getEngine() {
     return this.worldIn;
   }
+
+  /** Diagnostic accessor: the ModelFactory of the active backend, or {@code null}. */
+  public me.cortex.voxy.client.core.model.ModelFactory getModelFactory() {
+    return this.backend.getModelFactory();
+  }
 }

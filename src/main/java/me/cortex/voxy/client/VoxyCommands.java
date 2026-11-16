@@ -1,6 +1,7 @@
 package me.cortex.voxy.client;
 
 import com.mojang.brigadier.arguments.BoolArgumentType;
+import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 import com.mojang.brigadier.builder.RequiredArgumentBuilder;
@@ -14,7 +15,10 @@ import java.nio.file.Path;
 import java.util.Locale;
 import java.util.concurrent.CompletableFuture;
 import me.cortex.voxy.client.core.IVoxyRenderSystemHolder;
+import me.cortex.voxy.client.core.model.LodDump;
 import me.cortex.voxy.common.DebugUtils;
+import me.cortex.voxy.common.Logger;
+import me.cortex.voxy.common.world.WorldEngine;
 import me.cortex.voxy.commonImpl.VoxyCommon;
 import me.cortex.voxy.commonImpl.WorldIdentifier;
 import me.cortex.voxy.commonImpl.importers.DHImporter;
@@ -91,13 +95,159 @@ public class VoxyCommands {
                                     verifyTLNs(
                                         ctx, BoolArgumentType.getBool(ctx, "attemptRepair")))));
 
+    var dump =
+        LiteralArgumentBuilder.<CommandSourceStack>literal("dump")
+            .then(
+                RequiredArgumentBuilder.<CommandSourceStack, Integer>argument(
+                        "x", IntegerArgumentType.integer())
+                    .then(
+                        RequiredArgumentBuilder.<CommandSourceStack, Integer>argument(
+                                "y", IntegerArgumentType.integer())
+                            .then(
+                                RequiredArgumentBuilder.<CommandSourceStack, Integer>argument(
+                                        "z", IntegerArgumentType.integer())
+                                    .executes(VoxyCommands::dump)
+                                    .then(
+                                        RequiredArgumentBuilder
+                                            .<CommandSourceStack, Integer>argument(
+                                                "radius",
+                                                IntegerArgumentType.integer(0, LodDump.MAX_RADIUS))
+                                            .executes(VoxyCommands::dump)
+                                            .then(
+                                                RequiredArgumentBuilder
+                                                    .<CommandSourceStack, Integer>argument(
+                                                        "level",
+                                                        IntegerArgumentType.integer(
+                                                            0, WorldEngine.MAX_LOD_LAYER))
+                                                    .executes(VoxyCommands::dump))))));
+
+    var vanillaTerrain =
+        LiteralArgumentBuilder.<CommandSourceStack>literal("vanillaTerrain")
+            .executes(VoxyCommands::vanillaTerrainStatus)
+            .then(
+                LiteralArgumentBuilder.<CommandSourceStack>literal("on")
+                    .executes(ctx -> setVanillaTerrain(ctx, true)))
+            .then(
+                LiteralArgumentBuilder.<CommandSourceStack>literal("off")
+                    .executes(ctx -> setVanillaTerrain(ctx, false)));
+
     return LiteralArgumentBuilder.<CommandSourceStack>literal(
             "voxy") // .requires((ctx)-> VoxyCommon.getInstance() != null)
         .then(
             LiteralArgumentBuilder.<CommandSourceStack>literal("reload")
                 .executes(VoxyCommands::reloadInstance))
+        .then(dump)
+        .then(vanillaTerrain)
         .then(imports)
         .then(debug);
+  }
+
+  /** Chat budget for dump lines; the complete output always goes to latest.log. */
+  private static final int DUMP_CHAT_LINE_LIMIT = 200;
+
+  private static int dump(CommandContext<CommandSourceStack> ctx) {
+    int x = IntegerArgumentType.getInteger(ctx, "x");
+    int y = IntegerArgumentType.getInteger(ctx, "y");
+    int z = IntegerArgumentType.getInteger(ctx, "z");
+    int radius = optionalInt(ctx, "radius", 0);
+    int level = optionalInt(ctx, "level", 0);
+    if (radius < 0 || radius > LodDump.MAX_RADIUS) {
+      sendErrorToPlayer(Component.literal("voxy dump: radius must be 0.." + LodDump.MAX_RADIUS));
+      return 0;
+    }
+    if (level < 0 || level > WorldEngine.MAX_LOD_LAYER) {
+      sendErrorToPlayer(
+          Component.literal("voxy dump: level must be 0.." + WorldEngine.MAX_LOD_LAYER));
+      return 0;
+    }
+    var renderSystem = IVoxyRenderSystemHolder.getNullable();
+    if (renderSystem == null) {
+      sendErrorToPlayer(
+          Component.literal("voxy dump: no active Voxy render system (Voxy disabled?)"));
+      return 1;
+    }
+    var engine = renderSystem.getEngine();
+    if (engine == null || !engine.isLive()) {
+      sendErrorToPlayer(Component.literal("voxy dump: world engine is not live"));
+      return 1;
+    }
+    var factory = renderSystem.getModelFactory();
+    if (factory == null) {
+      sendErrorToPlayer(
+          Component.literal("voxy dump: active backend does not expose a ModelFactory"));
+      return 1;
+    }
+
+    int[] chatLines = {0};
+    int lines =
+        LodDump.run(
+            engine,
+            factory,
+            x,
+            y,
+            z,
+            radius,
+            level,
+            true,
+            line -> {
+              Logger.info(line);
+              var player = Minecraft.getInstance().player;
+              if (player == null) {
+                return;
+              }
+              if (chatLines[0] < DUMP_CHAT_LINE_LIMIT) {
+                player.displayClientMessage(Component.literal(line), false);
+                chatLines[0]++;
+              } else if (chatLines[0] == DUMP_CHAT_LINE_LIMIT) {
+                chatLines[0]++;
+                player.displayClientMessage(
+                    Component.literal(
+                        "[VoxyDump] chat display truncated at "
+                            + DUMP_CHAT_LINE_LIMIT
+                            + " lines; the full dump is in latest.log"),
+                    false);
+              }
+            });
+    Logger.info("voxy dump complete: lines=" + lines);
+    return 0;
+  }
+
+  private static int optionalInt(
+      CommandContext<CommandSourceStack> ctx, String name, int fallback) {
+    try {
+      return IntegerArgumentType.getInteger(ctx, name);
+    } catch (IllegalArgumentException e) {
+      return fallback;
+    }
+  }
+
+  private static int setVanillaTerrain(CommandContext<CommandSourceStack> ctx, boolean enabled) {
+    VoxyClient.setVanillaTerrain(enabled);
+    Logger.info(
+        "voxy vanillaTerrain set to "
+            + enabled
+            + " (disableSodiumChunkRender="
+            + VoxyClient.disableSodiumChunkRender()
+            + ") at runtime");
+    sendErrorToPlayer(
+        Component.literal(
+            "Voxy vanillaTerrain="
+                + VoxyClient.isVanillaTerrain()
+                + " (disableSodiumChunkRender="
+                + VoxyClient.disableSodiumChunkRender()
+                + ")"));
+    return 0;
+  }
+
+  private static int vanillaTerrainStatus(CommandContext<CommandSourceStack> ctx) {
+    sendErrorToPlayer(
+        Component.literal(
+            "Voxy vanillaTerrain="
+                + VoxyClient.isVanillaTerrain()
+                + " (disableSodiumChunkRender="
+                + VoxyClient.disableSodiumChunkRender()
+                + "); toggle with /voxy vanillaTerrain on|off"));
+    return 0;
   }
 
   private static int reloadInstance(CommandContext<CommandSourceStack> ctx) {

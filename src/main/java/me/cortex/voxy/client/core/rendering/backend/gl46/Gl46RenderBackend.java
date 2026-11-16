@@ -203,6 +203,11 @@ public final class Gl46RenderBackend implements VoxyRenderBackend {
   }
 
   @Override
+  public me.cortex.voxy.client.core.model.ModelFactory getModelFactory() {
+    return this.modelService.factory;
+  }
+
+  @Override
   public boolean rendersLodTerrain() {
     return true;
   }

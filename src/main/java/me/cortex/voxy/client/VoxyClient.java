@@ -95,7 +95,29 @@ public abstract class VoxyClient {
     return 0;
   }
 
+  /**
+   * A/B switch for the near-terrain renderer. Default {@code false} (unchanged behaviour).
+   *
+   * <p>{@code -Dvoxy.vanillaTerrain=true} makes this method report {@code true} for the whole
+   * session; the flag can also be toggled at runtime with {@code /voxy vanillaTerrain on|off}. All
+   * existing consumers (the Sodium chunk-render mixin, the GL46 chunk-bound pass and the GL41Metal
+   * near-plane selection) already branch on this method, so toggling it switches the near scene
+   * between the Voxy LOD0 path and the vanilla/Sodium chunk path without touching any other code.
+   */
+  private static volatile boolean vanillaTerrain =
+      Boolean.parseBoolean(System.getProperty("voxy.vanillaTerrain", "false"));
+
   public static boolean disableSodiumChunkRender() {
-    return false; // getOcclusionDebugState() != 0;
+    return vanillaTerrain; // getOcclusionDebugState() != 0;
+  }
+
+  /** Current value of the {@code -Dvoxy.vanillaTerrain} A/B switch (true = vanilla terrain). */
+  public static boolean isVanillaTerrain() {
+    return vanillaTerrain;
+  }
+
+  /** Runtime toggle for the {@code -Dvoxy.vanillaTerrain} A/B switch (command-only). */
+  public static void setVanillaTerrain(boolean enabled) {
+    vanillaTerrain = enabled;
   }
 }

@@ -123,7 +123,9 @@ public class ModelFactory {
    * bits cover the whole range; a 4-bit field would alias radius 16..24 with 0..8.
    */
   private static final int VARIANT_SLOT_RADIUS_BITS = 5;
+
   private static final int VARIANT_SLOT_RADIUS_MASK = (1 << VARIANT_SLOT_RADIUS_BITS) - 1;
+
   /** Payload bits below {@link #VARIANT_SLOT_CANONICAL_TAG}: registry block id and radius. */
   private static final int VARIANT_SLOT_CANONICAL_PAYLOAD_MASK = 0x0FFFFFFF;
 
@@ -240,6 +242,10 @@ public class ModelFactory {
   // idk
   private final long[] metadataCache;
   private final int[] fluidStateLUT;
+  // Diagnostic mirror of the per-face int written into the model atlas (ModelBakeResultUpload):
+  // [modelId * 6 + face]. Indexed exactly like metadataCache. Read by /voxy dump only; never
+  // consulted by rendering. A face that does not exist stays -1.
+  private final int[] faceDataCache = new int[MAX_MODEL_ID_COUNT * 6];
 
   // Provides a map from id -> model id as multiple ids might have the same internal model id
   private final int[] idMappings;
@@ -482,6 +488,40 @@ public class ModelFactory {
     };
   }
 
+  /**
+   * A/B switch for every neighbour-context Dynamic Trees variant (branch and surface root). Default
+   * on. {@code -Dvoxy.dtVariants=false} makes every variant request return {@link
+   * #VARIANT_MODEL_UNAVAILABLE} immediately: no key is inserted, no bake is queued and no cap is
+   * touched, so LOD0 meshing keeps the base models. Read once at class initialisation; the value
+   * cannot change at runtime.
+   */
+  private static final boolean DT_VARIANTS_ENABLED =
+      !"false".equalsIgnoreCase(System.getProperty("voxy.dtVariants", "true"));
+
+  /** True unless {@code -Dvoxy.dtVariants=false} disabled neighbour-aware DT variants. */
+  public static boolean dtVariantsEnabled() {
+    return DT_VARIANTS_ENABLED;
+  }
+
+  /**
+   * Actual branch-variant face depth mode id for diagnostics: {@code max}, {@code avg}, {@code
+   * min}.
+   */
+  public static String branchDepthModeName() {
+    return BRANCH_DEPTH_MODE == TextureUtils.DEPTH_MODE_MAX
+        ? "max"
+        : (BRANCH_DEPTH_MODE == TextureUtils.DEPTH_MODE_AVG ? "avg" : "min");
+  }
+
+  /**
+   * Diagnostic wrapper for {@link #computeDropCapSidesMask}: the boundary-cap side mask a branch
+   * variant bake would use for the given state and six neighbour states (Direction order DOWN, UP,
+   * NORTH, SOUTH, WEST, EAST).
+   */
+  public static int dumpDropCapSidesMask(BlockState self, BlockState[] neighbours) {
+    return computeDropCapSidesMask(self, neighbours);
+  }
+
   private final ConcurrentHashMap<RootCrownKey, Integer> rootVariantAttempts =
       new ConcurrentHashMap<>();
   private final byte[] surfaceRootCache = new byte[1 << 20];
@@ -526,6 +566,7 @@ public class ModelFactory {
     this.idMappings = new int[1 << 20]; // Max of 1 million blockstates mapping to 65k model states
     Arrays.fill(this.idMappings, -1);
     Arrays.fill(this.fluidStateLUT, -1);
+    Arrays.fill(this.faceDataCache, -1);
 
     this.modelTexture2id.defaultReturnValue(-1);
     this.addEntry(0); // Add air as the first entry
@@ -2237,6 +2278,8 @@ public class ModelFactory {
         metadata |= 0xFF; // Mark the face as non-existent
         // Set to -1 as safepoint
         MemoryUtil.memPutInt(faceUploadPtr, -1);
+        // Diagnostic mirror only (new models have a fresh id; a stale dedupe slot cannot occur).
+        this.faceDataCache[modelId * 6 + face] = -1;
 
         fullyOpaque = false;
         continue;
@@ -2365,6 +2408,9 @@ public class ModelFactory {
       }
 
       MemoryUtil.memPutInt(faceUploadPtr, faceModelData);
+      // Diagnostic mirror of the GPU face word, so /voxy dump can decode per-face bounds, indent,
+      // cutout/tint flags and per-pixel-depth without a GPU readback. Not read by rendering.
+      this.faceDataCache[modelId * 6 + face] = faceModelData;
     }
 
     metadata |= fullyOpaque ? (1L << (48 + 6)) : 0;
@@ -2921,9 +2967,9 @@ public class ModelFactory {
       int coreDx,
       int coreDz,
       BlockState[] cube) {
-    if (!DTRootGeometryCache.ROOTS_ENABLED) {
-      // Master switch off: fail-safe, never queue a RootCrownKey bake. The LOD0 resolver
-      // suppresses root cells without requesting a variant.
+    if (!DTRootGeometryCache.ROOTS_ENABLED || !DT_VARIANTS_ENABLED) {
+      // Master switch (or the -Dvoxy.dtVariants=false A/B switch) off: fail-safe, never queue a
+      // RootCrownKey bake. The LOD0 resolver suppresses root cells without requesting a variant.
       return VARIANT_MODEL_UNAVAILABLE;
     }
     if (!this.variantBakingSupported || cube == null) {
@@ -3094,9 +3140,9 @@ public class ModelFactory {
    * column spans the full cell height at the branch's own radius, using the branch model's particle
    * (bark) sprite.
    *
-   * <p>Returns null for mushroom stems (the bark-cube override wins), thick branches (radius
-   * &gt; 8, the bark-cube override wins), roots and non-branch blocks. Branches without a usable
-   * {@code radius} property also return null and keep DT's real model.
+   * <p>Returns null for mushroom stems (the bark-cube override wins), thick branches (radius &gt;
+   * 8, the bark-cube override wins), roots and non-branch blocks. Branches without a usable {@code
+   * radius} property also return null and keep DT's real model.
    */
   private @Nullable BakedModel thinBranchColumnModelFor(BlockState state) {
     if (!DynamicTreesBranches.isBranch(state)
@@ -3444,7 +3490,8 @@ public class ModelFactory {
    */
   public int getVariantModelId(
       int blockId, int down, int up, int north, int south, int west, int east) {
-    if (!this.variantBakingSupported) {
+    if (!this.variantBakingSupported || !DT_VARIANTS_ENABLED) {
+      // -Dvoxy.dtVariants=false: base-model A/B. No key insertion, no bake, no cap.
       return VARIANT_MODEL_UNAVAILABLE;
     }
     VariantKey key =
@@ -3591,6 +3638,113 @@ public class ModelFactory {
   /** High-water mark of the shared model id space (base, variant and root models). */
   public int getModelIdCount() {
     return this.modelIdCount.get();
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Diagnostic accessors for /voxy dump. Read-only: no request is queued, no cap is changed and
+  // no model id is published. Canonicalizing a slot mirrors what meshing already does for the same
+  // block ids (it stores the first-seen representative), so rendering is unaffected.
+  // ---------------------------------------------------------------------------------------------
+
+  /** Number of entries in the variant id registry, in every state (pending, baked, failed). */
+  public int getVariantRegistrySize() {
+    return this.variantModelIds.size();
+  }
+
+  /** Branch variants still pending (queued, baking or baked-not-yet-published). */
+  public int getVariantPendingCount() {
+    return this.variantActiveCount.get();
+  }
+
+  /** Branch variants that permanently consumed a model id slot. */
+  public int getVariantLiveCount() {
+    return this.variantLiveCount.get();
+  }
+
+  /** True once the branch variant feature disabled itself for the rest of the session. */
+  public boolean areVariantsCapped() {
+    return this.variantsCapped;
+  }
+
+  /**
+   * Diagnostic mirror of the per-face model word written to the atlas. Bits: 0..15 bounds (two
+   * 4-bit min/max pairs per axis), 16..21 indent ({@code round(offset*64)}, clamp 62), 22 alpha
+   * discard, 23 discard override, 24..25 tint (1 partial, 2 full), 26 per-pixel depth. Returns -1
+   * for an out-of-range id or a face that does not exist.
+   */
+  public int getFaceData(int modelId, int face) {
+    if (modelId < 0 || modelId >= MAX_MODEL_ID_COUNT || face < 0 || face > 5) {
+      return -1;
+    }
+    return this.faceDataCache[modelId * 6 + face];
+  }
+
+  /**
+   * Canonical form of one variant key slot (Mapper block id in, raw or tagged canonical id out).
+   */
+  public int dumpCanonicalVariantSlot(int blockId) {
+    return this.canonicalizeVariantSlot(blockId);
+  }
+
+  /** Resolves a variant key slot (raw Mapper id or canonical tagged id) to a BlockState. */
+  public BlockState dumpResolveVariantSlot(int slot) {
+    return this.resolveVariantSlot(slot);
+  }
+
+  /** Bounds-checked metadata lookup for a model id (base or variant); 0 for an invalid id. */
+  public long dumpModelMetadata(int modelId) {
+    if (modelId < 0 || modelId >= this.metadataCache.length) {
+      return 0L;
+    }
+    return this.metadataCache[modelId];
+  }
+
+  /**
+   * Non-requesting variant registry lookup: the value the mesher would get for this key, or {@code
+   * null} when the key is ABSENT. Does not insert a NOT_READY entry or queue a bake.
+   */
+  public @Nullable Integer dumpPeekVariantModelId(
+      int blockId, int down, int up, int north, int south, int west, int east) {
+    VariantKey key =
+        new VariantKey(
+            this.canonicalizeVariantSlot(blockId),
+            this.canonicalizeVariantSlot(down),
+            this.canonicalizeVariantSlot(up),
+            this.canonicalizeVariantSlot(north),
+            this.canonicalizeVariantSlot(south),
+            this.canonicalizeVariantSlot(west),
+            this.canonicalizeVariantSlot(east));
+    return this.variantModelIds.get(key);
+  }
+
+  /** Human/machine readable form of a variant key slot for /voxy dump. */
+  public String dumpDescribeVariantSlot(int slot) {
+    if (slot < 0) {
+      return "unavailable(" + slot + ")";
+    }
+    if ((slot & VARIANT_SLOT_CANONICAL_TAG) == 0) {
+      BlockState state =
+          slot == 0 ? Blocks.AIR.defaultBlockState() : this.mapper.getBlockStateFromBlockId(slot);
+      return "raw mapperId=" + slot + " state=" + state;
+    }
+    int registryBlockId = (slot & VARIANT_SLOT_CANONICAL_PAYLOAD_MASK) >>> VARIANT_SLOT_RADIUS_BITS;
+    int radius = slot & VARIANT_SLOT_RADIUS_MASK;
+    BlockState representative = this.variantSlotRepresentatives.get(slot);
+    String rep;
+    if (representative != null) {
+      rep = representative.toString();
+    } else {
+      Block block = BuiltInRegistries.BLOCK.byId(registryBlockId);
+      rep = block == null ? "unknown" : block.defaultBlockState().toString();
+    }
+    return "canonical slot=0x"
+        + Integer.toHexString(slot)
+        + " registryBlock="
+        + registryBlockId
+        + " radius="
+        + radius
+        + " rep="
+        + rep;
   }
 
   public int getFluidClientStateId(int clientBlockStateId) {

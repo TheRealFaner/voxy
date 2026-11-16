@@ -83,7 +83,7 @@ final class RootVertFilterBakedModel implements BakedModel {
    * legitimate boundary faces (for example a thick trunk's 16x16 top) are kept. Plane-to-side
    * mapping: x=0 → WEST, x=16 → EAST, y=0 → DOWN, y=16 → UP, z=0 → NORTH, z=16 → SOUTH.
    */
-  private static boolean isBoundaryCap(BakedQuad quad, int dropCapSidesMask) {
+  static boolean isBoundaryCap(BakedQuad quad, int dropCapSidesMask) {
     if (dropCapSidesMask == 0) {
       return false;
     }
@@ -147,7 +147,7 @@ final class RootVertFilterBakedModel implements BakedModel {
     return Math.abs(value - target) < 1.0e-3f;
   }
 
-  private static boolean withinHeight(BakedQuad quad, float maxY) {
+  static boolean withinHeight(BakedQuad quad, float maxY) {
     int[] vertices = quad.getVertices();
     for (int i = 0; i < 4; i++) {
       float y = Float.intBitsToFloat(vertices[i * 8 + 1]);
