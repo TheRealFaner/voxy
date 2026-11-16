@@ -18,6 +18,23 @@ public class ActiveSectionTracker {
   // One-shot so a repeated failure during shutdown cannot spam the log.
   private static final AtomicBoolean NEIGHBOR_INVALIDATION_WARNED = new AtomicBoolean();
 
+  /**
+   * A/B gate for the DT remesh-on-materialize hook in {@link #acquire(long, boolean)}. That hook
+   * cascades a neighbour remesh for every section that materializes from storage; after a long
+   * flight the churn can empty freshly built LOD0 meshes and starve the LOD tree, so whole areas
+   * fall back to coarse LOD1/LOD2 parents. Disabled by default; {@code
+   * -Dvoxy.dtRemeshOnMaterialize=true} restores the hook for A/B testing.
+   */
+  private static final boolean REMESH_ON_MATERIALIZE =
+      Boolean.parseBoolean(System.getProperty("voxy.dtRemeshOnMaterialize", "false"));
+
+  static {
+    // One-shot, silent unless the A/B gate is explicitly enabled.
+    if (REMESH_ON_MATERIALIZE) {
+      Logger.info("DT remesh-on-materialize ENABLED (voxy.dtRemeshOnMaterialize=true)");
+    }
+  }
+
   // Deserialize into the supplied section, returns true on success, false on failure
   public interface SectionLoader {
     int load(WorldSection section);
@@ -212,7 +229,8 @@ public class ActiveSectionTracker {
         // section is published above first so a re-entrant acquire by the callback cannot spin.
         // This neighbour remesh is a DT-only correctness fix (thick-trunk/root patches read
         // across section borders); vanilla worlds never map DT states and skip it entirely.
-        if (DynamicTreesBranches.PRESENT) {
+        // Gated by REMESH_ON_MATERIALIZE (default off; -Dvoxy.dtRemeshOnMaterialize=true for A/B).
+        if (REMESH_ON_MATERIALIZE && DynamicTreesBranches.PRESENT) {
           try {
             this.engine.markDirty(
                 section,
