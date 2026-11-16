@@ -39,6 +39,7 @@ import net.minecraft.client.renderer.texture.TextureAtlasSprite;
 import net.minecraft.client.resources.model.BakedModel;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.tags.BlockTags;
@@ -99,11 +100,32 @@ public class ModelFactory {
   public static final int VARIANT_MODEL_UNAVAILABLE = -2;
 
   /**
-   * Per-position model key for Dynamic Trees branches: the six neighbour block state ids in {@link
-   * Direction#get3DDataValue()} order (DOWN, UP, NORTH, SOUTH, WEST, EAST).
+   * Per-position model key for Dynamic Trees branches: the block's own slot and the six neighbour
+   * block state ids in {@link Direction#get3DDataValue()} order (DOWN, UP, NORTH, SOUTH, WEST,
+   * EAST). Every slot is either a raw Mapper block-state id (non-branch states) or a canonical
+   * branch slot (see {@link #canonicalizeVariantSlot}).
    */
   private record VariantKey(
       int blockId, int down, int up, int north, int south, int west, int east) {}
+
+  /**
+   * Tag bit marking a {@link VariantKey} slot that holds a canonicalized Dynamic Trees branch
+   * (block registry id + radius) instead of a raw Mapper block-state id. Raw Mapper block ids are
+   * 20-bit (see {@link Mapper#getBlockId}) and the canonical payload stays below bit 28 for every
+   * real block registry (ids are far below {@code 1 << 23}), so a tagged slot can never collide
+   * with a raw id.
+   */
+  private static final int VARIANT_SLOT_CANONICAL_TAG = 0x10000000;
+
+  /**
+   * Radius bits in a canonical branch slot. Dynamic Trees radii are 1..24 ({@link
+   * DynamicTreesBranches#MAX_CELL_RADIUS} caps LOD0 variants at 8; thick branches reach 24), so 5
+   * bits cover the whole range; a 4-bit field would alias radius 16..24 with 0..8.
+   */
+  private static final int VARIANT_SLOT_RADIUS_BITS = 5;
+  private static final int VARIANT_SLOT_RADIUS_MASK = (1 << VARIANT_SLOT_RADIUS_BITS) - 1;
+  /** Payload bits below {@link #VARIANT_SLOT_CANONICAL_TAG}: registry block id and radius. */
+  private static final int VARIANT_SLOT_CANONICAL_PAYLOAD_MASK = 0x0FFFFFFF;
 
   /** A thick-trunk shell cell: core block state id plus the cell offset (x/z in -1..1). */
   /** {@code capBits} bit0 = UP end cap, bit1 = DOWN end cap. */
@@ -271,6 +293,13 @@ public class ModelFactory {
   private final AtomicBoolean variantSummaryLogged = new AtomicBoolean();
   // Bounded retries for transient variant bake exceptions (key -> attempts).
   private final ConcurrentHashMap<VariantKey, Integer> variantAttempts = new ConcurrentHashMap<>();
+  // Canonical VariantKey branch slot -> first-seen real branch state. A canonical slot encodes the
+  // geometric essence (block registry id + radius), not the exact state: DT's redstone `signal` is
+  // part of the state id but not of the model, so exact ids multiplied every branch context by up
+  // to 16. The bake resolves canonical slots through this map; every other slot stays a raw id.
+  // Written on meshing threads while a key is built, read on the bakery threads.
+  private final ConcurrentHashMap<Integer, BlockState> variantSlotRepresentatives =
+      new ConcurrentHashMap<>();
   // Upload-loop failure logging is rate limited so a broken atlas cannot spam the log.
   private final AtomicInteger uploadFailureLogCount = new AtomicInteger();
   private final AtomicInteger shellFailureLogCount = new AtomicInteger();
@@ -747,14 +776,41 @@ public class ModelFactory {
     return false;
   }
 
+  /**
+   * Resolves a {@link VariantKey} slot back to a real {@link BlockState} for the bake. Canonical
+   * branch slots decode through {@link #variantSlotRepresentatives}; raw slots resolve exactly as
+   * before.
+   */
+  private BlockState resolveVariantSlot(int slotId) {
+    if (slotId < 0) {
+      // The caller's "neighbour unavailable" sentinel is filtered before keying; never let it
+      // index the mapper.
+      return Blocks.AIR.defaultBlockState();
+    }
+    if ((slotId & VARIANT_SLOT_CANONICAL_TAG) == 0) {
+      return this.mapper.getBlockStateFromBlockId(slotId);
+    }
+    BlockState representative = this.variantSlotRepresentatives.get(slotId);
+    if (representative != null) {
+      return representative;
+    }
+    // Defensive fallback only: a representative is stored before its key can be queued, so this
+    // is unreachable in practice. Decode the registry block id and use that block's default
+    // state, which is still a real state of the correct branch block.
+    int registryBlockId =
+        (slotId & VARIANT_SLOT_CANONICAL_PAYLOAD_MASK) >>> VARIANT_SLOT_RADIUS_BITS;
+    Block block = BuiltInRegistries.BLOCK.byId(registryBlockId);
+    return block == null ? Blocks.AIR.defaultBlockState() : block.defaultBlockState();
+  }
+
   private BlockState[] resolveVariantNeighbours(VariantKey key) {
     BlockState[] neighbours = new BlockState[6];
-    neighbours[0] = this.mapper.getBlockStateFromBlockId(key.down());
-    neighbours[1] = this.mapper.getBlockStateFromBlockId(key.up());
-    neighbours[2] = this.mapper.getBlockStateFromBlockId(key.north());
-    neighbours[3] = this.mapper.getBlockStateFromBlockId(key.south());
-    neighbours[4] = this.mapper.getBlockStateFromBlockId(key.west());
-    neighbours[5] = this.mapper.getBlockStateFromBlockId(key.east());
+    neighbours[0] = this.resolveVariantSlot(key.down());
+    neighbours[1] = this.resolveVariantSlot(key.up());
+    neighbours[2] = this.resolveVariantSlot(key.north());
+    neighbours[3] = this.resolveVariantSlot(key.south());
+    neighbours[4] = this.resolveVariantSlot(key.west());
+    neighbours[5] = this.resolveVariantSlot(key.east());
     return neighbours;
   }
 
@@ -807,7 +863,7 @@ public class ModelFactory {
 
   private void bakeVariantSoftware(VariantKey key) {
     try {
-      BlockState state = this.mapper.getBlockStateFromBlockId(key.blockId());
+      BlockState state = this.resolveVariantSlot(key.blockId());
       BlockState[] neighbours = this.resolveVariantNeighbours(key);
       int dropCapSidesMask = computeDropCapSidesMask(state, neighbours);
       BakedModel branchModel = null;
@@ -852,7 +908,7 @@ public class ModelFactory {
       }
       var upload =
           this.processTextureBakeResult(
-              key.blockId(),
+              this.mapper.getIdForBlockState(state),
               state,
               textureData,
               (flags & 1) != 0,
@@ -878,7 +934,7 @@ public class ModelFactory {
 
   private void bakeVariantGl41(VariantKey key) {
     try {
-      BlockState state = this.mapper.getBlockStateFromBlockId(key.blockId());
+      BlockState state = this.resolveVariantSlot(key.blockId());
       BlockState[] neighbours = this.resolveVariantNeighbours(key);
       int dropCapSidesMask = computeDropCapSidesMask(state, neighbours);
       BakedModel branchModel = null;
@@ -927,7 +983,7 @@ public class ModelFactory {
       }
       var upload =
           this.processTextureBakeResult(
-              key.blockId(),
+              this.mapper.getIdForBlockState(state),
               state,
               result.faces(),
               result.shaded(),
@@ -3282,8 +3338,38 @@ public class ModelFactory {
   }
 
   /**
-   * Looks up the per-position model id for a Dynamic Trees branch. The six ints are the neighbour
-   * block state ids in Direction.get3DDataValue order (DOWN, UP, NORTH, SOUTH, WEST, EAST).
+   * Canonicalizes one {@link VariantKey} slot to the geometric essence of the block. A Dynamic
+   * Trees branch state carries a redstone {@code signal} (0..15) that is not read by its model, so
+   * exact state ids split one branch shape into up to 16 keys that bake identical geometry. Branch
+   * slots therefore become {@code TAG | (block registry id << 5) | radius}; every non-branch state
+   * keeps its exact raw id. The first-seen state per canonical id is retained so the bakery can
+   * resolve the slot back to a real {@link BlockState} (see {@link #resolveVariantSlot}).
+   */
+  private int canonicalizeVariantSlot(int blockId) {
+    // 0 is air and negative ids are the caller's "neighbour unavailable" sentinel: never branches.
+    if (blockId <= 0 || !this.isAnyBranchBlockId(blockId)) {
+      return blockId;
+    }
+    BlockState state = this.mapper.getBlockStateFromBlockId(blockId);
+    int registryBlockId = BuiltInRegistries.BLOCK.getId(state.getBlock());
+    if (registryBlockId < 0
+        || registryBlockId > (VARIANT_SLOT_CANONICAL_PAYLOAD_MASK >>> VARIANT_SLOT_RADIUS_BITS)) {
+      // Unregistered block or an id that would overflow the tagged payload: keep the exact id.
+      return blockId;
+    }
+    int radius = DynamicTreesBranches.radiusOf(state);
+    int canonical =
+        VARIANT_SLOT_CANONICAL_TAG
+            | (registryBlockId << VARIANT_SLOT_RADIUS_BITS)
+            | (radius & VARIANT_SLOT_RADIUS_MASK);
+    this.variantSlotRepresentatives.putIfAbsent(canonical, state);
+    return canonical;
+  }
+
+  /**
+   * Looks up the per-position model id for a Dynamic Trees branch. The seven ints are raw Mapper
+   * block-state ids (own block plus the six neighbours in Direction.get3DDataValue order DOWN, UP,
+   * NORTH, SOUTH, WEST, EAST); branch slots are canonicalized to block + radius before keying.
    *
    * @return the variant model id, {@link #VARIANT_MODEL_NOT_READY} if a bake was requested and the
    *     caller must retry, or {@link #VARIANT_MODEL_UNAVAILABLE} if the base model must be used
@@ -3293,7 +3379,15 @@ public class ModelFactory {
     if (!this.variantBakingSupported) {
       return VARIANT_MODEL_UNAVAILABLE;
     }
-    VariantKey key = new VariantKey(blockId, down, up, north, south, west, east);
+    VariantKey key =
+        new VariantKey(
+            this.canonicalizeVariantSlot(blockId),
+            this.canonicalizeVariantSlot(down),
+            this.canonicalizeVariantSlot(up),
+            this.canonicalizeVariantSlot(north),
+            this.canonicalizeVariantSlot(south),
+            this.canonicalizeVariantSlot(west),
+            this.canonicalizeVariantSlot(east));
     // Existing entries stay usable even after the cap fired: disabling only new requests avoids
     // silently reverting already-baked geometry to the base model on remesh.
     Integer existing = this.variantModelIds.get(key);
