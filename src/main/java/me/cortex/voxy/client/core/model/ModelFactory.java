@@ -325,6 +325,13 @@ public class ModelFactory {
   private final ConcurrentHashMap<BlockState, Optional<BakedModel>> thickBranchSolidModels =
       new ConcurrentHashMap<>();
 
+  // Synthetic bark columns for Dynamic Trees thin branch states (radius 1..8) on the neighbour-less
+  // base path (LOD1+ and any LOD0 fallback without a variant), see thinBranchColumnModelFor. Keyed
+  // per BlockState, so bounded by the registered branch states (species x radius); failed sprite
+  // lookups are not retained, same as thickBranchSolidModels.
+  private final ConcurrentHashMap<BlockState, Optional<BakedModel>> thinBranchColumnModels =
+      new ConcurrentHashMap<>();
+
   // Per-shell-cell models of the thick-trunk prism, keyed by core state + cell offset. Baked
   // together with the core's solid cube and patched into trunk_shell cells at LOD0 meshing time.
   private final ConcurrentHashMap<ShellModelKey, Integer> shellModelIds = new ConcurrentHashMap<>();
@@ -631,9 +638,14 @@ public class ModelFactory {
     }
 
     BakedModel thickBranchModel = this.thickBranchModelFor(blockState);
-    // Mushroom stems need the solid bark cube on the neighbour-less base bake: their real model
-    // bakes no usable geometry without ModelData. Chosen once, passed to the single bake call.
+    // Base-bake model priority: mushroom stems need the solid bark cube (their real model bakes no
+    // usable geometry without ModelData), thin branches need a continuous bark column instead of
+    // DT's connectionless centre stick, and thick branches need the full bark cube. All three are
+    // neighbour-less base-bake overrides only; variant bakes keep using the real DT model.
     BakedModel baseModel = this.mushroomStemModelFor(blockState);
+    if (baseModel == null) {
+      baseModel = this.thinBranchColumnModelFor(blockState);
+    }
     if (baseModel == null) {
       baseModel = thickBranchModel;
     }
@@ -699,9 +711,13 @@ public class ModelFactory {
     if (bake == null) return false;
 
     BakedModel thickBranchModel = this.thickBranchModelFor(bake.state);
-    // Same upfront override as the GL41 path: mushroom stems bake no usable geometry without
-    // ModelData, so substitute the solid bark cube in this single bake instead of re-baking.
+    // Same upfront override and priority as the GL41 path: mushroom stem bark cube, then thin
+    // branch bark column, then thick branch bark cube, so the neighbour-less base bake never falls
+    // back to a model that renders as a stubbed centre stick.
     BakedModel baseModel = this.mushroomStemModelFor(bake.state);
+    if (baseModel == null) {
+      baseModel = this.thinBranchColumnModelFor(bake.state);
+    }
     if (baseModel == null) {
       baseModel = thickBranchModel;
     }
@@ -3067,6 +3083,58 @@ public class ModelFactory {
       return Optional.of(new SolidBarkBakedModel(sprite));
     } catch (Throwable t) {
       Logger.warn("Could not build the bark cube for Dynamic Trees thick branch " + thickState, t);
+      return Optional.empty();
+    }
+  }
+
+  /**
+   * Continuous bark column for Dynamic Trees thin branches (radius 1..8) on the neighbour-less base
+   * bake. DT's connectionless fallback model only emits the centre band/stick, so LOD1+ (variants
+   * are LOD0-only) and any LOD0 bake without a variant rendered thin trunks as dashed slivers. The
+   * column spans the full cell height at the branch's own radius, using the branch model's particle
+   * (bark) sprite.
+   *
+   * <p>Returns null for mushroom stems (the bark-cube override wins), thick branches (radius
+   * &gt; 8, the bark-cube override wins), roots and non-branch blocks. Branches without a usable
+   * {@code radius} property also return null and keep DT's real model.
+   */
+  private @Nullable BakedModel thinBranchColumnModelFor(BlockState state) {
+    if (!DynamicTreesBranches.isBranch(state)
+        || DynamicTreesBranches.isMushroomBranch(state)
+        || DynamicTreesBranches.isThickBranch(state)) {
+      return null;
+    }
+    int radius = DynamicTreesBranches.radiusOf(state);
+    if (radius < 1 || radius > DynamicTreesBranches.MAX_CELL_RADIUS) {
+      return null;
+    }
+    Optional<BakedModel> cached = this.thinBranchColumnModels.get(state);
+    if (cached == null || cached.isEmpty()) {
+      // Same policy as thickBranchModelFor: never cache an empty Optional permanently, the
+      // particle-sprite lookup can fail transiently during a resource reload.
+      cached = this.createThinBranchColumnModel(state, radius);
+      if (cached.isPresent()) {
+        this.thinBranchColumnModels.put(state, cached);
+      }
+    }
+    return cached.orElse(null);
+  }
+
+  private Optional<BakedModel> createThinBranchColumnModel(BlockState state, int radius) {
+    try {
+      TextureAtlasSprite sprite =
+          Minecraft.getInstance()
+              .getModelManager()
+              .getBlockModelShaper()
+              .getBlockModel(state)
+              .getParticleIcon();
+      if (sprite == null) {
+        Logger.warn("No particle sprite for Dynamic Trees thin branch " + state);
+        return Optional.empty();
+      }
+      return Optional.of(new ThinBranchColumnBakedModel(sprite, radius));
+    } catch (Throwable t) {
+      Logger.warn("Could not build the bark column for Dynamic Trees thin branch " + state, t);
       return Optional.empty();
     }
   }
