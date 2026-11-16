@@ -84,6 +84,14 @@ public class ModelFactory {
   private static final int MAX_VARIANT_MODEL_COUNT = 1 << 15; // 32768 distinct variants
   private static final int BASE_MODEL_ID_RESERVE = 1 << 13; // 8192 ids kept for normal blocks
 
+  /**
+   * Pending-variant backpressure threshold. A burst of new branch contexts over this many
+   * outstanding (queued/baking/baked-but-unpublished) variants pauses NEW requests instead of
+   * permanently disabling variants. Back-pressured keys are not cached, so a later remesh asks
+   * again and picks the variant up once the backlog drains (self-healing).
+   */
+  private static final int VARIANT_PENDING_BACKPRESSURE = 1 << 13; // 8192 pending variants
+
   /** Returned by {@link #getVariantModelId} while the variant bake is queued/running. */
   public static final int VARIANT_MODEL_NOT_READY = -1;
 
@@ -241,7 +249,12 @@ public class ModelFactory {
   private final ConcurrentHashMap<VariantKey, Integer> variantModelIds = new ConcurrentHashMap<>();
   private final ConcurrentLinkedDeque<VariantKey> variantBakeQueue = new ConcurrentLinkedDeque<>();
   private final AtomicInteger variantInflightCount = new AtomicInteger();
+  // Pending branch variants only: NOT_READY entries (queued, baking, or baked-not-yet-published).
+  // Every NOT_READY -> resolved transition (publish, failure, retry removal) releases one slot.
   private final AtomicInteger variantActiveCount = new AtomicInteger();
+  // Branch variants that were assigned a genuinely new model id (dedupes excluded). Such an id
+  // occupies the 16-bit id space for the rest of the session, so this drives the hard live cap.
+  private final AtomicInteger variantLiveCount = new AtomicInteger();
   private final AtomicInteger variantRequestCount = new AtomicInteger();
   private final AtomicInteger variantFailureCount = new AtomicInteger();
   private final AtomicInteger variantSuccessCount = new AtomicInteger();
@@ -254,6 +267,7 @@ public class ModelFactory {
   private final AtomicInteger variantNoQuadCount = new AtomicInteger();
   private final AtomicInteger variantExceptionCount = new AtomicInteger();
   private final AtomicBoolean variantBakeActiveLogged = new AtomicBoolean();
+  private final AtomicBoolean variantBackpressureLogged = new AtomicBoolean();
   private final AtomicBoolean variantSummaryLogged = new AtomicBoolean();
   // Bounded retries for transient variant bake exceptions (key -> attempts).
   private final ConcurrentHashMap<VariantKey, Integer> variantAttempts = new ConcurrentHashMap<>();
@@ -1291,7 +1305,7 @@ public class ModelFactory {
     int attempt = this.variantAttempts.merge(key, 1, Integer::sum);
     if (attempt < 3) {
       if (this.variantModelIds.remove(key, VARIANT_MODEL_NOT_READY)) {
-        this.variantActiveCount.decrementAndGet();
+        this.releasePendingVariantSlot();
       }
       if (this.variantFailureCount.incrementAndGet() <= 32) {
         Logger.warn(
@@ -1311,8 +1325,16 @@ public class ModelFactory {
   private void markVariantUnavailable(VariantKey key) {
     Integer previous = this.variantModelIds.put(key, VARIANT_MODEL_UNAVAILABLE);
     if (previous != null && previous == VARIANT_MODEL_NOT_READY) {
-      this.variantActiveCount.decrementAndGet();
+      this.releasePendingVariantSlot();
     }
+  }
+
+  /**
+   * Releases one pending slot. Called exactly once per NOT_READY -> resolved transition (publish,
+   * failure, or retry removal); the clamp keeps a double release from driving the count negative.
+   */
+  private void releasePendingVariantSlot() {
+    this.variantActiveCount.updateAndGet(pending -> pending > 0 ? pending - 1 : 0);
   }
 
   private final ConcurrentLinkedDeque<Mapper.BiomeEntry> biomeQueue = new ConcurrentLinkedDeque<>();
@@ -1453,7 +1475,12 @@ public class ModelFactory {
       return;
     }
     if (modelPublish.variantKey != null) {
-      this.variantModelIds.put(modelPublish.variantKey, modelPublish.modelId);
+      Integer previous = this.variantModelIds.put(modelPublish.variantKey, modelPublish.modelId);
+      if (previous != null && previous == VARIANT_MODEL_NOT_READY) {
+        // The pending entry is resolved by this publication; release its slot exactly once.
+        // (Dedupe publications resolve a NOT_READY entry the same way as fresh bakes.)
+        this.releasePendingVariantSlot();
+      }
       // A dedupe to an existing (non-air) model still resolves the branch position correctly.
       this.branchVariantSuccessCount.incrementAndGet();
       if (modelPublish.dedupedToBase) {
@@ -1999,6 +2026,11 @@ public class ModelFactory {
         // this.idMappings[blockId] = modelId;
         this.modelTexture2id.put(entry, modelId);
         this.modelIdCount.lazySet(modelId + 1);
+        if (variantKey != null) {
+          // Dedupes return before this branch, so this is a genuinely new variant model id that
+          // permanently consumes one slot of the 16-bit id space: count it toward the live cap.
+          this.variantLiveCount.incrementAndGet();
+        }
       }
     }
 
@@ -3003,10 +3035,10 @@ public class ModelFactory {
     if (radius <= DynamicTreesBranches.MAX_CELL_RADIUS) {
       return;
     }
-    if (this.variantsCapped
-        || this.modelIdCount.get() >= MAX_MODEL_ID_COUNT - BASE_MODEL_ID_RESERVE) {
-      // Shell models are derived variants and must respect the same id-space guard as branches
-      // and roots; 4 cap variants per cell multiply their consumption.
+    if (this.modelIdCount.get() >= MAX_MODEL_ID_COUNT - BASE_MODEL_ID_RESERVE) {
+      // Shell prisms have their own per-cell budget and must only yield to the hard 16-bit id
+      // space guard, never to the branch variant cap: a transient branch backlog must not turn
+      // thick trunks back into solid bark cubes. 4 cap variants per cell multiply consumption.
       for (int dx = -1; dx <= 1; dx++) {
         for (int dz = -1; dz <= 1; dz++) {
           if (dx == 0 && dz == 0) {
@@ -3269,6 +3301,8 @@ public class ModelFactory {
       return existing;
     }
     if (this.variantsCapped || !this.canRequestVariantModel()) {
+      // No entry is inserted here: a capped/back-pressured key must be requestable again on a
+      // later remesh instead of being cached as a permanent -2 fallback.
       return VARIANT_MODEL_UNAVAILABLE;
     }
     existing = this.variantModelIds.putIfAbsent(key, VARIANT_MODEL_NOT_READY);
@@ -3284,14 +3318,36 @@ public class ModelFactory {
   }
 
   private boolean canRequestVariantModel() {
+    // Hard exhaustion of the shared id space: the one condition that may disable variants for the
+    // session, because every further variant bake would have to steal ids from the base reserve.
     if (this.modelIdCount.get() >= MAX_MODEL_ID_COUNT - BASE_MODEL_ID_RESERVE) {
       this.capVariants("16-bit model id space is nearly full");
       return false;
     }
-    // Failed (-2) entries do not consume a slot; only live/in-flight variants count toward the
-    // soft cap, otherwise a burst of failures would disable the feature for the session.
-    if (this.variantActiveCount.get() >= MAX_VARIANT_MODEL_COUNT) {
-      this.capVariants("variant model cap (" + MAX_VARIANT_MODEL_COUNT + ") reached");
+    // Live variants at the branch budget are genuine exhaustion too: no id will ever be freed, so
+    // new keys would only grow past the reserve.
+    if (this.variantLiveCount.get() >= MAX_VARIANT_MODEL_COUNT) {
+      this.capVariants("variant live cap (" + MAX_VARIANT_MODEL_COUNT + ") reached");
+      return false;
+    }
+    // A transient pending backlog must NOT disable the feature permanently. Reject new keys only;
+    // they are not cached (no poisoned -2 entry), so a later remesh requests them again once the
+    // queue drains. Failed (-2) entries and published variants never count as pending.
+    if (this.variantActiveCount.get() >= VARIANT_PENDING_BACKPRESSURE) {
+      if (this.variantBackpressureLogged.compareAndSet(false, true)) {
+        Logger.info(
+            "Dynamic Trees LOD0 branch variant requests back-pressured (pending="
+                + this.variantActiveCount.get()
+                + " >= "
+                + VARIANT_PENDING_BACKPRESSURE
+                + ", live="
+                + this.variantLiveCount.get()
+                + ", modelIds="
+                + this.modelIdCount.get()
+                + ", requests="
+                + this.variantRequestCount.get()
+                + "): new variants wait for the queue to drain, baked ones stay active");
+      }
       return false;
     }
     return true;
@@ -3301,7 +3357,17 @@ public class ModelFactory {
     if (!this.variantsCapped) {
       this.variantsCapped = true;
       Logger.warn(
-          "Dynamic Trees LOD0 branch variants disabled, falling back to base models: " + reason);
+          "Dynamic Trees LOD0 branch variants disabled, falling back to base models: "
+              + reason
+              + " (pending="
+              + this.variantActiveCount.get()
+              + ", live="
+              + this.variantLiveCount.get()
+              + ", modelIds="
+              + this.modelIdCount.get()
+              + ", requests="
+              + this.variantRequestCount.get()
+              + ")");
     }
   }
 
@@ -3353,9 +3419,11 @@ public class ModelFactory {
     return this.rootVariantSuccessCount.get();
   }
 
-  /** Live branch + root variant entries currently holding a model id slot. */
+  /** Pending branch/root variants plus published branch variants holding a model id slot. */
   public int getVariantActiveCount() {
-    return this.variantActiveCount.get() + this.rootVariantActive.get();
+    return this.variantActiveCount.get()
+        + this.variantLiveCount.get()
+        + this.rootVariantActive.get();
   }
 
   /** High-water mark of the shared model id space (base, variant and root models). */
