@@ -140,6 +140,16 @@ jobs:
             --expected-min-os "$MIN_OS" \
             --run-load-probe | tee "$LOG" | tee -a "$GITHUB_STEP_SUMMARY"
 
+      - name: Surface verification failure
+        if: failure()
+        shell: bash
+        run: |
+          if [ -f build/macos-verification/verify-macos-artifact.log ]; then
+            grep -E '^(FAIL|WARN)' build/macos-verification/verify-macos-artifact.log | while IFS= read -r line; do
+              echo "::error title=macOS artifact verification::${line}"
+            done
+          fi
+
       - name: Upload macOS jar
         if: always() && steps.artifact.outputs.canonical != ''
         uses: actions/upload-artifact@v4
