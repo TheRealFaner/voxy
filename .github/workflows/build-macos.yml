@@ -79,7 +79,17 @@ jobs:
         run: |
           set -euo pipefail
           ./gradlew spotlessCheck :neoforge:build :neoforge:verifyMacNatives \
-            -PrequireMacNatives=true --stacktrace --no-daemon
+            -PrequireMacNatives=true --stacktrace --no-daemon 2>&1 | tee build-macos.log
+
+      - name: Surface Gradle failure
+        if: failure()
+        shell: bash
+        run: |
+          if [ -f build-macos.log ]; then
+            tail -n 80 build-macos.log | while IFS= read -r line; do
+              echo "::error title=Gradle failure::${line}"
+            done
+          fi
 
       - name: Resolve canonical jar
         id: artifact
