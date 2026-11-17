@@ -41,7 +41,10 @@ public abstract class MixinDefaultChunkRenderer extends ShaderChunkRenderer {
     if (renderPass.isTranslucent() && !IrisUtil.irisShaderPackEnabled()) {
       this.renderVoxyTranslucent(matrices, camera);
     }
-    if (VoxyClient.disableSodiumChunkRender()) {
+    // Occlusion-debug path only: Voxy replaces Sodium's near chunks. The diagnostic
+    // vanillaTerrain switch must never cancel Sodium's own chunk pass, otherwise both renderers
+    // end up off for near chunks (transparent terrain).
+    if (VoxyClient.disableSodiumChunkRender() && !VoxyClient.isVanillaTerrain()) {
       super.begin(renderPass);
       this.doRender(matrices, renderLists, renderPass, camera);
       super.end(renderPass);
@@ -80,7 +83,15 @@ public abstract class MixinDefaultChunkRenderer extends ShaderChunkRenderer {
       return;
     }
 
+    // vanillaTerrain: Sodium's own chunk pass already drew the near scene, so do not feed its
+    // render lists into Voxy's LOD0 sync stages. The distant OPAQUE stage keeps running, so Voxy
+    // still renders LOD beyond the vanilla render distance.
+    boolean vanillaTerrain = VoxyClient.isVanillaTerrain();
+
     if (renderPass == DefaultTerrainRenderPasses.SOLID) {
+      if (vanillaTerrain) {
+        return;
+      }
       renderer.beginVanillaRenderSectionSync();
       renderer.syncVanillaRenderSections(renderLists, renderPass.isTranslucent());
       RenderFrameStageState.store(
@@ -97,18 +108,21 @@ public abstract class MixinDefaultChunkRenderer extends ShaderChunkRenderer {
     }
 
     if (renderPass == DefaultTerrainRenderPasses.CUTOUT) {
-      renderer.syncVanillaRenderSections(renderLists, renderPass.isTranslucent());
       boolean shaderPackActive = IrisUtil.irisShaderPackEnabled();
-      var frame =
-          renderer.runFrameStage(
-              RenderStage.SODIUM_CUTOUT_SYNC,
-              RenderFrameStageState.currentFrame(),
-              matrices,
-              camera.x,
-              camera.y,
-              camera.z,
-              IrisUtil.IRIS_INSTALLED,
-              shaderPackActive);
+      var frame = RenderFrameStageState.currentFrame();
+      if (!vanillaTerrain) {
+        renderer.syncVanillaRenderSections(renderLists, renderPass.isTranslucent());
+        frame =
+            renderer.runFrameStage(
+                RenderStage.SODIUM_CUTOUT_SYNC,
+                RenderFrameStageState.currentFrame(),
+                matrices,
+                camera.x,
+                camera.y,
+                camera.z,
+                IrisUtil.IRIS_INSTALLED,
+                shaderPackActive);
+      }
       frame =
           renderer.runFrameStage(
               RenderStage.OPAQUE,

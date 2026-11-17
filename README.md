@@ -96,9 +96,14 @@ unless explicitly enabled.
   raw/canonical variant key slots and variant registry state, the section mask
   bits and `maskPatched` status, the branch cap-filter/drop mask/depth mode, and
   a kept-vs-dropped re-run of the quad pipeline for the cell.
-- `-Dvoxy.vanillaTerrain=true` — makes `VoxyClient.disableSodiumChunkRender()`
-  return `true` (default `false`). The runtime toggle is
-  `/voxy vanillaTerrain on|off`; `/voxy vanillaTerrain` prints the state.
+- `-Dvoxy.vanillaTerrain=true` — near-terrain A/B switch (default `false`). When
+  on, Voxy does not cancel Sodium's chunk pass and skips its own near-chunk LOD0
+  sync stages, so Sodium/vanilla renders the near scene normally; Voxy still
+  renders LOD beyond the vanilla render distance. Independent of
+  `VoxyClient.disableSodiumChunkRender()`, which is the occlusion-debug path
+  where Voxy replaces Sodium's near chunks and stays `false` by default. The
+  runtime toggle is `/voxy vanillaTerrain on|off`; `/voxy vanillaTerrain` prints
+  the state.
 - `-Dvoxy.dtVariants=false` — forces every Dynamic Trees branch/surface-root
   variant request to `UNAVAILABLE` without inserting a key or touching the cap,
   so LOD0 keeps the base models. Default `true`.

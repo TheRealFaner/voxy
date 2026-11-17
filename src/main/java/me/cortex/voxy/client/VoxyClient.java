@@ -96,19 +96,28 @@ public abstract class VoxyClient {
   }
 
   /**
-   * A/B switch for the near-terrain renderer. Default {@code false} (unchanged behaviour).
+   * Diagnostic near-terrain A/B switch. Default {@code false} (unchanged behaviour).
    *
-   * <p>{@code -Dvoxy.vanillaTerrain=true} makes this method report {@code true} for the whole
-   * session; the flag can also be toggled at runtime with {@code /voxy vanillaTerrain on|off}. All
-   * existing consumers (the Sodium chunk-render mixin, the GL46 chunk-bound pass and the GL41Metal
-   * near-plane selection) already branch on this method, so toggling it switches the near scene
-   * between the Voxy LOD0 path and the vanilla/Sodium chunk path without touching any other code.
+   * <p>{@code -Dvoxy.vanillaTerrain=true} for the whole session, or {@code /voxy vanillaTerrain
+   * on|off} at runtime, makes Voxy leave the near scene to Sodium/vanilla: the Sodium chunk-render
+   * hook neither cancels Sodium's chunk pass nor feeds its render lists into Voxy's LOD0 sync
+   * stages. Voxy still draws LOD beyond the vanilla render distance.
+   *
+   * <p>Deliberately independent of {@link #disableSodiumChunkRender()}: that is the occlusion-debug
+   * path where Voxy itself replaces Sodium's near chunks, and this diagnostic flag must never turn
+   * Sodium's chunk rendering off.
    */
   private static volatile boolean vanillaTerrain =
       Boolean.parseBoolean(System.getProperty("voxy.vanillaTerrain", "false"));
 
+  /**
+   * Whether Voxy should take over and replace Sodium's near-chunk rendering (the occlusion-debug
+   * path). Default {@code false}: Sodium renders near chunks and Voxy renders LOD beyond the
+   * vanilla render distance. This is not the diagnostic {@code vanillaTerrain} switch; see {@link
+   * #isVanillaTerrain()}.
+   */
   public static boolean disableSodiumChunkRender() {
-    return vanillaTerrain; // getOcclusionDebugState() != 0;
+    return getOcclusionDebugState() != 0;
   }
 
   /** Current value of the {@code -Dvoxy.vanillaTerrain} A/B switch (true = vanilla terrain). */
