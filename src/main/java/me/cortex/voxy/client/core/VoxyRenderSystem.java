@@ -51,6 +51,12 @@ public class VoxyRenderSystem {
     try {
       this.backend = this.createBackend(new BackendContext(world, sm, this.backendSelection));
     } catch (RuntimeException e) {
+      Logger.error(
+          "Failed to create Voxy render backend '"
+              + this.backendSelection.id()
+              + "': "
+              + e.getMessage(),
+          e);
       world.releaseRef(); // If something goes wrong, we must release the world first
       throw e;
     }

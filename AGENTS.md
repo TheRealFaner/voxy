@@ -97,6 +97,31 @@ For Iris 1.21.1:
 - Strict bridge output is skipped when the shader-pack bridge payload is
   unavailable.
 
+### macOS Compatibility Floor
+
+`gl41metal_msl_std` and `gl41metal_macos_min` in `gradle.properties` are
+PROVISIONAL until a `macos-metal-probe` run confirms them. Do not change either
+value without re-running the probe and updating `docs/MACOS_COMPATIBILITY.md`;
+the build validates property format only.
+
+Shader library candidates are tried in this order: `voxy_gl41metal.metallib`,
+then `voxy_gl41metal-current.metallib` when `gl41metal_ship_fallback=true`.
+`-Dvoxy.gl41metal.shaderCandidate=<substring>` selects a candidate;
+`missing` / `none` exercises the graceful-failure path.
+
+macOS-only verification (jars built on Windows/Linux contain no
+`natives/macos`):
+
+```text
+./gradlew :neoforge:verifyMacNatives -PrequireMacNatives=true
+bash scripts/macos/verify-macos-artifact.sh <jar> --expected-msl-std <value> --expected-min-os <value> --run-load-probe
+```
+
+The probe is the `macos-metal-probe` workflow or
+`scripts/macos/probe-metal-compat.sh` locally. Never claim Intel runtime or
+in-game support, or empirical Big Sur testing: Intel is build/CI-load verified
+only, and CI cannot run macOS 11 on Apple Silicon.
+
 ## Loaded-Volume Bound
 
 The `gl41metal` loaded-volume bound handles near/far water overlap. It is a

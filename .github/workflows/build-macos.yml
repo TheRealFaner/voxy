@@ -2,20 +2,66 @@ name: build-macos
 
 on:
   workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the verified jar to the neoforge-latest release (multiversion only)
+        type: boolean
+        default: false
   push:
     branches:
       - multiversion
+      - feature/macos-full-support
 
 permissions:
   contents: write
 
+concurrency:
+  group: build-macos-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
-    runs-on: macos-latest
-    timeout-minutes: 60
+    runs-on: macos-26
+    timeout-minutes: 90
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Select Xcode
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -d /Applications/Xcode.app/Contents/Developer ]; then
+            sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          else
+            echo "Xcode.app not present; using $(xcode-select -p)"
+          fi
+
+      - name: Ensure Metal toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Xcode 26+ ships the Metal toolchain as a separately downloaded component.
+          xcodebuild -downloadComponent MetalToolchain || true
+          if ! xcrun metal --version; then
+            echo "::error title=Metal toolchain unavailable::xcrun metal --version failed"
+            exit 1
+          fi
+          if ! xcrun -sdk macosx metallib --version; then
+            echo "::error title=Metal toolchain unavailable::xcrun -sdk macosx metallib --version failed"
+            exit 1
+          fi
+
+      - name: Log runner and toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          sw_vers
+          uname -m
+          xcodebuild -version
+          xcrun metal --version
+          xcrun -sdk macosx metallib --version
 
       - name: Set up Java 21
         uses: actions/setup-java@v4
@@ -23,42 +69,137 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      - name: Select Xcode
-        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: false
 
-      - name: Ensure Metal toolchain
+      - name: Build NeoForge jar with macOS natives
+        shell: bash
         run: |
-          # Xcode 26+ ships the Metal toolchain as a separate component.
-          xcodebuild -downloadComponent MetalToolchain || true
-          xcrun metal --version
-          xcrun -sdk macosx metallib --version
+          set -euo pipefail
+          ./gradlew spotlessCheck :neoforge:build :neoforge:verifyMacNatives \
+            -PrequireMacNatives=true --stacktrace --no-daemon
 
-      - name: Build NeoForge jar
-        run: ./gradlew :neoforge:build --stacktrace --no-daemon
-
-      - name: Verify macOS natives in jar
+      - name: Resolve canonical jar
+        id: artifact
+        shell: bash
         run: |
-          JAR=$(ls neoforge/build/libs/*.jar | head -n 1)
-          echo "Built: $JAR"
-          unzip -l "$JAR" | grep -E 'natives/macos/libvoxy_gl41metal\.dylib|natives/macos/gl41metal/voxy_gl41metal\.metallib'
-          test -n "$(unzip -l "$JAR" | grep 'natives/macos/libvoxy_gl41metal.dylib')"
-          test -n "$(unzip -l "$JAR" | grep 'natives/macos/gl41metal/voxy_gl41metal.metallib')"
+          set -euo pipefail
+          PROP=gradle.properties
+          BASE=$(sed -n 's/^archives_base_name[[:space:]]*=[[:space:]]*//p' "$PROP" | tail -n 1 | tr -d '\r[:space:]')
+          MOD_VERSION=$(sed -n 's/^mod_version[[:space:]]*=[[:space:]]*//p' "$PROP" | tail -n 1 | tr -d '\r[:space:]')
+          MC_VERSION=$(sed -n 's/^minecraft_version[[:space:]]*=[[:space:]]*//p' "$PROP" | tail -n 1 | tr -d '\r[:space:]')
+          CANONICAL="${BASE}-${MOD_VERSION}+${MC_VERSION}-neoforge.jar"
+          JAR="neoforge/build/libs/${CANONICAL}"
+          if [ ! -f "$JAR" ]; then
+            echo "::error title=Canonical jar missing::Expected $JAR"
+            ls -la neoforge/build/libs || true
+            exit 1
+          fi
+          echo "canonical=$CANONICAL" >> "$GITHUB_OUTPUT"
+          echo "jar=$JAR" >> "$GITHUB_OUTPUT"
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+          echo "mod_version=$MOD_VERSION" >> "$GITHUB_OUTPUT"
+          echo "mc_version=$MC_VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Publish jar to rolling release
+      - name: Verify macOS artifact
+        id: verify
+        shell: bash
+        env:
+          JAR_PATH: ${{ steps.artifact.outputs.jar }}
+        run: |
+          set -euo pipefail
+          PROP=gradle.properties
+          MSL_STD=$(sed -n 's/^gl41metal_msl_std=//p' "$PROP" | tail -n 1 | tr -d '\r[:space:]')
+          MIN_OS=$(sed -n 's/^gl41metal_macos_min=//p' "$PROP" | tail -n 1 | tr -d '\r[:space:]')
+          if [ -z "$MSL_STD" ] || [ -z "$MIN_OS" ]; then
+            echo "::error title=Missing gl41metal properties::gl41metal_msl_std and gl41metal_macos_min must be set in gradle.properties"
+            exit 1
+          fi
+          mkdir -p build/macos-verification
+          LOG=build/macos-verification/verify-macos-artifact.log
+          set -o pipefail
+          bash scripts/macos/verify-macos-artifact.sh "$JAR_PATH" \
+            --expected-msl-std "$MSL_STD" \
+            --expected-min-os "$MIN_OS" \
+            --run-load-probe | tee "$LOG" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload macOS jar
+        if: always() && steps.artifact.outputs.canonical != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: voxy-neoforge-macos-jar
+          path: neoforge/build/libs/${{ steps.artifact.outputs.canonical }}
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload verification log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: voxy-neoforge-macos-verification-log
+          path: build/macos-verification/verify-macos-artifact.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Publish to neoforge-latest
+        if: |
+          (github.event_name == 'workflow_dispatch' && inputs.publish == true && github.ref == 'refs/heads/multiversion') ||
+          (github.event_name == 'push' && github.ref == 'refs/heads/multiversion')
+        shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          JAR_PATH: ${{ steps.artifact.outputs.jar }}
+          CANONICAL: ${{ steps.artifact.outputs.canonical }}
+          BASE: ${{ steps.artifact.outputs.base }}
+          MOD_VERSION: ${{ steps.artifact.outputs.mod_version }}
+          MC_VERSION: ${{ steps.artifact.outputs.mc_version }}
         run: |
+          set -euo pipefail
           TAG=neoforge-latest
-          BASE=$(sed -n 's/^archives_base_name[[:space:]]*=[[:space:]]*//p' gradle.properties)
-          MOD=$(sed -n 's/^mod_version[[:space:]]*=[[:space:]]*//p' gradle.properties)
-          MC=$(sed -n 's/^minecraft_version[[:space:]]*=[[:space:]]*//p' gradle.properties)
-          CANONICAL="${BASE}-${MOD}+${MC}-neoforge.jar"
-          JAR=$(ls neoforge/build/libs/*.jar | head -n 1)
-          if [ "$(basename "$JAR")" != "$CANONICAL" ]; then
-            cp "$JAR" "neoforge/build/libs/$CANONICAL"
-          fi
+          OUT_DIR=neoforge/build/libs
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          STAMPED="${BASE}-${MOD_VERSION}+${MC_VERSION}-neoforge-${SHORT_SHA}.jar"
+          cp "$JAR_PATH" "$OUT_DIR/$STAMPED"
+          (cd "$OUT_DIR" && shasum -a 256 "$CANONICAL" "$STAMPED" > SHA256SUMS)
+
+          XCODE_VERSION=$(xcodebuild -version | tr '\n' ' ' | sed 's/[[:space:]]*$//')
+          METAL_VERSION=$(xcrun metal --version | awk 'NR == 1')
+          MACOS_VERSION=$(sw_vers -productVersion)
+          HOST_ARCH=$(uname -m)
+          MSL_STD=$(sed -n 's/^gl41metal_msl_std=//p' gradle.properties | tail -n 1 | tr -d '\r[:space:]')
+          MIN_OS=$(sed -n 's/^gl41metal_macos_min=//p' gradle.properties | tail -n 1 | tr -d '\r[:space:]')
+          COMMIT=$(git rev-parse HEAD)
+
+          {
+            echo "## Voxy NeoForge macOS build"
+            echo ""
+            echo "Built from commit $COMMIT on macOS $MACOS_VERSION ($HOST_ARCH)."
+            echo ""
+            echo "- Xcode: $XCODE_VERSION"
+            echo "- Metal toolchain: $METAL_VERSION"
+            echo "- MSL standard: $MSL_STD"
+            echo "- Deployment target: macOS $MIN_OS"
+            echo ""
+            echo "### Support"
+            echo ""
+            echo "- Apple Silicon (arm64): supported (GL41Metal); deployment target macOS $MIN_OS (configured value; probe-pending until the probe report is applied)."
+            echo "- Intel (x86_64): experimental — universal dylib and CI load checks only, no in-game validation."
+            echo "- Requires a Metal-capable GPU and OpenGL 4.1."
+            echo ""
+            echo "### Packaging"
+            echo ""
+            echo "- This jar contains natives/macos; Windows/Linux-built jars do not."
+            echo "- Assets: $CANONICAL (canonical), $STAMPED (commit-stamped), SHA256SUMS."
+            echo ""
+            echo "Verify with: shasum -a 256 -c SHA256SUMS"
+          } > release-notes.md
+
           gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" \
             --title "Voxy NeoForge builds" \
-            --notes "Universal NeoForge jar for Windows/Linux/Apple Silicon (arm64 Metal natives included). Intel Macs not supported." \
+            --target "$GITHUB_SHA" \
+            --notes-file release-notes.md \
             --prerelease --latest=false
-          gh release upload "$TAG" "neoforge/build/libs/$CANONICAL" --clobber
+          gh release upload "$TAG" "$OUT_DIR/$CANONICAL" "$OUT_DIR/$STAMPED" "$OUT_DIR/SHA256SUMS" --clobber
+          gh release edit "$TAG" --notes-file release-notes.md

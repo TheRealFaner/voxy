@@ -55,6 +55,20 @@ near-scene depth occlusion.
 Backend selection is automatic: capable systems use GL46, while supported
 macOS systems fall back to GL41Metal when GL46 is unavailable.
 
+#### macOS support
+
+- Apple Silicon (M1-M4) is supported. The current compatibility floor is macOS
+  11.0 with MSL 2.1 (`gl41metal_msl_std` / `gl41metal_macos_min` in
+  `gradle.properties`); these values are provisional until the
+  `macos-metal-probe` workflow confirms them.
+- Intel Macs are experimental: the dylib is universal (x86_64 + arm64), but
+  Intel is covered by build and CI load checks only, with no in-game
+  validation.
+- A Metal-capable GPU and OpenGL 4.1 are required. Macs without a Metal device
+  are unsupported.
+- See [docs/MACOS_COMPATIBILITY.md](docs/MACOS_COMPATIBILITY.md) for the full
+  matrix, evidence levels, and the probe procedure.
+
 ## Shader-pack support
 
 Iris shader packs are supported through a bridge that exposes Voxy depth,
@@ -111,11 +125,34 @@ unless explicitly enabled.
   filter mode. Default `all`.
 - `-Dvoxy.dtBranchDepthMode=max|avg|min` — existing branch variant face depth
   mode. Default `max`.
+- `-Dvoxy.gl41metal.shaderCandidate=<value>` — GL41Metal shader library
+  candidate control. A non-empty value is a case-insensitive substring match
+  (`current` selects `voxy_gl41metal-current.metallib`); `missing` or `none`
+  disables candidates to exercise the graceful-failure path. By default the
+  bundled `voxy_gl41metal.metallib` is tried first, then
+  `voxy_gl41metal-current.metallib` when the fallback was shipped.
+
+GL41Metal also logs `Voxy macOS runtime: ...` (OS, version, arch, native
+source, shader candidates, build info, Metal device) once per launch, plus
+`GL41Metal shader library candidate '<name>' loaded` and
+`Created Voxy GL41Metal drawlist backend: ...`. The pre-selection probe turns
+unusable natives into a `DISABLED` backend with a precise reason; if backend
+creation still throws later, `VoxyRenderSystem` logs and rethrows it
+(`MixinLevelRenderer` may disable Iris shaders, otherwise the exception
+propagates).
 
 ## Known limitations
 
-- GL41Metal is experimental and requires macOS plus bundled native and Metal
-  shader assets.
+- GL41Metal is experimental and requires macOS, a Metal-capable GPU, OpenGL
+  4.1, and the bundled native and Metal shader assets. Apple Silicon is
+  supported at the documented macOS floor; Intel is experimental, with
+  build/CI load checks only and no in-game validation.
+- The `natives/macos` assets are packaged only by builds that run on macOS.
+  Jars built on Windows or Linux cannot use GL41Metal on a Mac; use the
+  macOS-built jar from the `neoforge-latest` release.
+- macOS 11.0 (Big Sur) is not runtime-tested in CI: Apple Silicon CI runners
+  cannot run macOS 11. The floor is evidenced by the MSL/AIR deployment target
+  and the dylib `minos`, not by an in-game run.
 - Iris support does not guarantee compatibility with every shader pack.
 - Shader packs exceeding the safe GL41Metal sampler budget cannot use its
   direct shader bridge.
@@ -151,6 +188,21 @@ Loader-specific builds remain available:
 ```
 
 GL41Metal native code and Metal shaders are built and packaged on macOS.
+macOS-only verification:
+
+```shell
+./gradlew :neoforge:verifyMacNatives -PrequireMacNatives=true
+bash scripts/macos/verify-macos-artifact.sh \
+  neoforge/build/libs/voxy-<version>+1.21.1-neoforge.jar \
+  --expected-msl-std <value> --expected-min-os <value> --run-load-probe
+```
+
+The compatibility floor is measured with the `macos-metal-probe` workflow
+(Actions -> macos-metal-probe, also scheduled monthly). See
+[docs/MACOS_COMPATIBILITY.md](docs/MACOS_COMPATIBILITY.md) before changing
+`gl41metal_msl_std` or `gl41metal_macos_min`. On non-macOS hosts the jar is
+built without macOS natives, and `verifyMacNatives` only warns unless
+`-PrequireMacNatives=true` is set.
 
 ## Upstream and credits
 

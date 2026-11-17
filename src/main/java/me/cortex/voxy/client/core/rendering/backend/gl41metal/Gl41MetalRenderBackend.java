@@ -56,7 +56,11 @@ public final class Gl41MetalRenderBackend implements VoxyRenderBackend {
             TerrainResources.maxResidentSections(), TerrainResources.geometryCapacityBytes());
     this.terrainResources.setAtlasMirror(this.drawlistRenderer);
     this.terrainResources.setDrawlistMirror(this.drawlistRenderer);
-    Logger.info("Created Voxy GL41Metal drawlist backend: " + this.slots.description());
+    Logger.info(
+        "Created Voxy GL41Metal drawlist backend: "
+            + this.slots.description()
+            + ", "
+            + NativeBindings.runtimeDescription());
   }
 
   @Override

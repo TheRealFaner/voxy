@@ -60,7 +60,11 @@ public abstract class VoxyClient {
       }
 
     } else if (renderBackendSelection.id() == RenderBackendId.GL41METAL) {
-      Logger.warn("Voxy GL41Metal backend selected.");
+      Logger.warn(
+          "Voxy GL41Metal backend selected [experimental]: macOS "
+              + System.getProperty("os.version", "unknown")
+              + ", arch="
+              + System.getProperty("os.arch", "unknown"));
       VoxyCommon.setInstanceFactory(VoxyClientInstance::new);
     } else {
       Logger.error(

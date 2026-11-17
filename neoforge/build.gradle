@@ -81,6 +81,7 @@ processResources {
     if (isMacOsHost) {
         dependsOn rootProject.tasks.named('compileGl41MetalNative')
         dependsOn rootProject.tasks.named('compileGl41MetalShaders')
+        dependsOn rootProject.tasks.named('generateGl41MetalBuildInfo')
 
         from(rootProject.ext.gl41MetalNativeDir) {
             include 'libvoxy_gl41metal.dylib'
@@ -90,6 +91,21 @@ processResources {
             include 'voxy_gl41metal.metallib'
             into 'natives/macos/gl41metal'
         }
+        from(rootProject.ext.gl41MetalNativeDir) {
+            include 'build-info.properties'
+            into 'natives/macos/gl41metal'
+        }
+        if (rootProject.ext.gl41MetalShipFallback) {
+            dependsOn rootProject.tasks.named('compileGl41MetalFallbackShaders')
+            from(rootProject.ext.gl41MetalShaderDir) {
+                include 'voxy_gl41metal-current.metallib'
+                into 'natives/macos/gl41metal'
+            }
+        }
+    } else {
+        logger.warn("GL41Metal natives not packaged: host is ${System.getProperty('os.name')}; " +
+                'this jar cannot use GL41Metal on macOS. Build the macOS jar with ' +
+                '.github/workflows/build-macos.yml (or on a macOS host) instead.')
     }
 }
 
@@ -320,5 +336,67 @@ jar {
         if (!hash.equals("<UnknownCommit>")) {
             archiveClassifier.set(hash);
         }
+    }
+}
+
+tasks.register('verifyMacNatives') {
+    description = 'Verifies that the built NeoForge jar contains the macOS GL41Metal natives'
+    group = 'verification'
+    dependsOn tasks.named('jar')
+
+    def jarArchiveFile = tasks.named('jar', Jar).flatMap { it.archiveFile }
+    def shipFallback = rootProject.ext.gl41MetalShipFallback
+    def verifyOnMac = isMacOsHost
+    def requireMacNatives =
+            project.findProperty('requireMacNatives')?.toString()?.toBoolean() == true
+    def hostDescription = "${System.getProperty('os.name')} ${System.getProperty('os.arch')}"
+    def requiredEntries = ['natives/macos/libvoxy_gl41metal.dylib',
+                           'natives/macos/gl41metal/voxy_gl41metal.metallib']
+    if (shipFallback) {
+        requiredEntries.add('natives/macos/gl41metal/voxy_gl41metal-current.metallib')
+    }
+    if (verifyOnMac) {
+        requiredEntries.add('natives/macos/gl41metal/build-info.properties')
+    }
+
+    doLast {
+        def jarFile = jarArchiveFile.get().asFile
+        if (!jarFile.exists()) {
+            throw new GradleException("verifyMacNatives: jar not found at ${jarFile}")
+        }
+        def missing = []
+        new java.util.zip.ZipFile(jarFile).withCloseable { zipFile ->
+            requiredEntries.each { entryName ->
+                def entry = zipFile.getEntry(entryName)
+                if (entry == null || entry.getSize() <= 0) {
+                    missing.add(entryName)
+                }
+            }
+        }
+
+        if (missing.isEmpty()) {
+            logger.lifecycle("verifyMacNatives: macOS GL41Metal natives are present in ${jarFile.name}")
+            return
+        }
+
+        def message = "Missing or empty macOS GL41Metal natives in ${jarFile}: " +
+                "${missing.join(', ')}. " +
+                (verifyOnMac
+                        ? 'The macOS build failed to package its natives; inspect ' +
+                        'compileGl41MetalNative/compileGl41MetalShaders/generateGl41MetalBuildInfo ' +
+                        'and the processResources wiring.'
+                        : "This jar was built on ${hostDescription}. macOS natives are packaged only " +
+                        'when the build runs on macOS; use the jar produced by ' +
+                        '.github/workflows/build-macos.yml.')
+        if (verifyOnMac || requireMacNatives) {
+            throw new GradleException(message)
+        }
+        logger.warn(message)
+    }
+}
+
+if (isMacOsHost) {
+    tasks.named('check') {
+        dependsOn tasks.named('verifyMacNatives')
     }
 }

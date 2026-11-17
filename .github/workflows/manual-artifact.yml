@@ -28,26 +28,49 @@ jobs:
       - name: Gradle build
         run: ./gradlew build
 
+      - name: Document absence of macOS natives
+        shell: bash
+        run: |
+          set -euo pipefail
+          for jar in neoforge/build/libs/*-neoforge.jar fabric/build/libs/*-fabric.jar; do
+            [ -f "$jar" ] || continue
+            echo "== $jar =="
+            if unzip -Z1 "$jar" | grep '^natives/macos/' >/dev/null; then
+              echo "::warning::Unexpected natives/macos entries in Linux-built jar: $jar"
+              unzip -Z1 "$jar" | grep '^natives/macos/' || true
+            else
+              echo "OK: $(basename "$jar") contains no natives/macos entries."
+              echo "    Linux-built jar: macOS users must use the macOS-built neoforge-latest release."
+            fi
+          done
+
       - name: Publish jars to rolling release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           TAG=manual-latest
-          BASE=$(sed -n 's/^archives_base_name[[:space:]]*=[[:space:]]*//p' gradle.properties)
-          MOD=$(sed -n 's/^mod_version[[:space:]]*=[[:space:]]*//p' gradle.properties)
-          MC=$(sed -n 's/^minecraft_version[[:space:]]*=[[:space:]]*//p' gradle.properties)
-          NEO="${BASE}-${MOD}+${MC}-neoforge.jar"
-          FAB="${BASE}-${MOD}+${MC}-fabric.jar"
-          NEO_JAR=$(ls neoforge/build/libs/*.jar | head -n 1)
-          FAB_JAR=$(ls fabric/build/libs/*.jar | head -n 1)
+          BASE=$(sed -n 's/^archives_base_name[[:space:]]*=[[:space:]]*//p' gradle.properties | tail -n 1 | tr -d '\r[:space:]')
+          MOD_VERSION=$(sed -n 's/^mod_version[[:space:]]*=[[:space:]]*//p' gradle.properties | tail -n 1 | tr -d '\r[:space:]')
+          MC_VERSION=$(sed -n 's/^minecraft_version[[:space:]]*=[[:space:]]*//p' gradle.properties | tail -n 1 | tr -d '\r[:space:]')
+          NEO="${BASE}-${MOD_VERSION}+${MC_VERSION}-neoforge.jar"
+          FAB="${BASE}-${MOD_VERSION}+${MC_VERSION}-fabric.jar"
+          NEO_JAR=$(ls neoforge/build/libs/*.jar | sed -n '1p')
+          FAB_JAR=$(ls fabric/build/libs/*.jar | sed -n '1p')
           if [ "$(basename "$NEO_JAR")" != "$NEO" ]; then
             cp "$NEO_JAR" "neoforge/build/libs/$NEO"
           fi
           if [ "$(basename "$FAB_JAR")" != "$FAB" ]; then
             cp "$FAB_JAR" "fabric/build/libs/$FAB"
           fi
+          cat > release-notes.md <<'EOF'
+          Rolling manual Voxy builds for NeoForge and Fabric, built on Linux.
+
+          These jars do NOT contain macOS natives. macOS users must use the macOS-built neoforge-latest release instead.
+          EOF
           gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" \
             --title "Manual builds" \
-            --notes "Rolling manual Voxy builds for NeoForge and Fabric. Updated on every manual run." \
+            --notes-file release-notes.md \
             --prerelease --latest=false
           gh release upload "$TAG" "neoforge/build/libs/$NEO" "fabric/build/libs/$FAB" --clobber
+          gh release edit "$TAG" --notes-file release-notes.md

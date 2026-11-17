@@ -1,0 +1,178 @@
+name: macos-metal-probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      stds:
+        description: 'Comma-separated MSL stds to probe'
+        required: false
+        default: 'metal2.0,metal2.1,metal2.2,metal2.3,metal2.4,metal3.0'
+        type: string
+      min_os:
+        description: 'Comma-separated minimum macOS deployment targets'
+        required: false
+        default: '11.0,11.3,12.0,13.0'
+        type: string
+      intel_probe:
+        description: 'Also run the probe on macos-15-intel (never publishes)'
+        required: false
+        default: false
+        type: boolean
+  push:
+    branches:
+      - feature/macos-full-support
+  schedule:
+    - cron: '0 6 1 * *'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: probe (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-26]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -d /Applications/Xcode.app/Contents/Developer ]; then
+            sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          else
+            echo "Xcode.app not present; using $(xcode-select -p)"
+          fi
+
+      - name: Log host environment
+        run: |
+          sw_vers
+          uname -m
+          xcode-select -p || true
+          xcodebuild -version || true
+          xcrun --sdk macosx --show-sdk-version || true
+
+      - name: Ensure Metal toolchain
+        run: xcodebuild -downloadComponent MetalToolchain || true
+
+      - name: Check Metal toolchain (hard failure)
+        run: |
+          xcrun metal --version
+          xcrun -sdk macosx metallib --version
+
+      - name: Build load probe harness
+        run: |
+          mkdir -p build/macos-metal-probe
+          xcrun --sdk macosx clang++ -std=c++17 -fobjc-arc -O2 -Wall \
+            scripts/macos/load-metal-probe.mm \
+            -framework Foundation -framework Metal \
+            -o build/macos-metal-probe/load-metal-probe
+
+      - name: Run Metal compatibility probe
+        env:
+          STDS_INPUT: ${{ inputs.stds }}
+          MIN_OS_INPUT: ${{ inputs.min_os }}
+        run: |
+          STDS="${STDS_INPUT:-metal2.0,metal2.1,metal2.2,metal2.3,metal2.4,metal3.0}"
+          MIN_OS="${MIN_OS_INPUT:-11.0,11.3,12.0,13.0}"
+          sh scripts/macos/probe-metal-compat.sh \
+            --stds "$STDS" \
+            --min-os "$MIN_OS" \
+            --load-probe build/macos-metal-probe/load-metal-probe \
+            --out build/gl41metal-probe
+
+      - name: Append report to job summary
+        if: always()
+        run: |
+          if [ -f build/gl41metal-probe/report.md ]; then
+            cat build/gl41metal-probe/report.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "probe report was not produced" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload probe artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: metal-probe-${{ matrix.os }}
+          path: build/gl41metal-probe/
+          if-no-files-found: warn
+
+  probe-intel:
+    name: probe (macos-15-intel)
+    if: ${{ inputs.intel_probe == true }}
+    runs-on: macos-15-intel
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -d /Applications/Xcode.app/Contents/Developer ]; then
+            sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          else
+            echo "Xcode.app not present; using $(xcode-select -p)"
+          fi
+
+      - name: Log host environment
+        run: |
+          sw_vers
+          uname -m
+          xcode-select -p || true
+          xcodebuild -version || true
+          xcrun --sdk macosx --show-sdk-version || true
+
+      - name: Ensure Metal toolchain
+        run: xcodebuild -downloadComponent MetalToolchain || true
+
+      - name: Check Metal toolchain (hard failure)
+        run: |
+          xcrun metal --version
+          xcrun -sdk macosx metallib --version
+
+      - name: Build load probe harness
+        run: |
+          mkdir -p build/macos-metal-probe
+          xcrun --sdk macosx clang++ -std=c++17 -fobjc-arc -O2 -Wall \
+            scripts/macos/load-metal-probe.mm \
+            -framework Foundation -framework Metal \
+            -o build/macos-metal-probe/load-metal-probe
+
+      - name: Run Metal compatibility probe
+        env:
+          STDS_INPUT: ${{ inputs.stds }}
+          MIN_OS_INPUT: ${{ inputs.min_os }}
+        run: |
+          STDS="${STDS_INPUT:-metal2.0,metal2.1,metal2.2,metal2.3,metal2.4,metal3.0}"
+          MIN_OS="${MIN_OS_INPUT:-11.0,11.3,12.0,13.0}"
+          sh scripts/macos/probe-metal-compat.sh \
+            --stds "$STDS" \
+            --min-os "$MIN_OS" \
+            --load-probe build/macos-metal-probe/load-metal-probe \
+            --out build/gl41metal-probe
+
+      - name: Append report to job summary
+        if: always()
+        run: |
+          if [ -f build/gl41metal-probe/report.md ]; then
+            cat build/gl41metal-probe/report.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "probe report was not produced" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload probe artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: metal-probe-macos-15-intel
+          path: build/gl41metal-probe/
+          if-no-files-found: warn

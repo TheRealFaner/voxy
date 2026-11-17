@@ -50,6 +50,17 @@ Metal 负责远景地形选择；OpenGL 和 Iris 继续负责光栅化、近景�
 后端会自动选择：能力足够的系统使用 GL46；GL46 不可用时，受支持的 macOS
 系统会回退到 GL41Metal。
 
+#### macOS 支持
+
+- Apple Silicon（M1–M4）已支持。当前兼容下限为 macOS 11.0 + MSL 2.1
+  （`gradle.properties` 中的 `gl41metal_msl_std` / `gl41metal_macos_min`）；
+  在 `macos-metal-probe` workflow 确认前，这些值为暂定值。
+- Intel Mac 为实验性支持：dylib 为 universal（x86_64 + arm64），仅通过构建
+  和 CI 加载检查验证，未进行游戏内验证。
+- 需要支持 Metal 的 GPU 和 OpenGL 4.1；没有 Metal 设备的 Mac 不受支持。
+- 完整矩阵、证据等级和 probe 流程见
+  [docs/MACOS_COMPATIBILITY.md](docs/MACOS_COMPATIBILITY.md)。
+
 ## 光影包支持
 
 本分支通过 Iris bridge 向远景地形 pass 提供 Voxy 深度、sampler、矩阵和兼容的
@@ -70,9 +81,32 @@ unit，但使用全部 16 个可能导致驱动在链接 program 时崩溃。因
 - 从 M4G4MED 的 `mc_1211-aero` 分支移植并适配 Sable/Aero 载具兼容。
 - 统一代码格式和源码结构，便于后续维护。
 
+## 诊断
+
+- `-Dvoxy.gl41metal.shaderCandidate=<value>` — 控制 GL41Metal shader 库候选。
+  非空值按大小写不敏感的子串匹配（`current` 选择
+  `voxy_gl41metal-current.metallib`）；`missing` 或 `none` 禁用候选，用于验证
+  优雅失败路径。默认先尝试打包的 `voxy_gl41metal.metallib`，再尝试随包发布
+  的 `voxy_gl41metal-current.metallib`。
+
+GL41Metal 每次启动还会输出 `Voxy macOS runtime: ...`（OS、版本、架构、原生库
+来源、shader 候选、构建信息、Metal 设备），以及
+`GL41Metal shader library candidate '<name>' loaded` 和
+`Created Voxy GL41Metal drawlist backend: ...`。预选探测会把不可用的原生库转为
+带明确原因的 `DISABLED` 后端；如果之后创建后端仍然抛异常，`VoxyRenderSystem`
+会记录日志并重新抛出（`MixinLevelRenderer` 可能因此禁用 Iris shader，否则异常会
+继续向上传播）。
+
 ## 已知限制
 
-- GL41Metal 仍是实验性功能，需要 macOS，以及打包进模组的原生库和 Metal shader。
+- GL41Metal 仍是实验性功能，需要 macOS、支持 Metal 的 GPU、OpenGL 4.1，以及
+  打包进模组的原生库和 Metal shader。Apple Silicon 在文档所载的 macOS 下限上
+  受支持；Intel 为实验性支持，仅通过构建/CI 加载检查验证，未进行游戏内验证。
+- `natives/macos` 资源只在 macOS 上构建时打包。Windows/Linux 构建的 jar 无法
+  在 Mac 上使用 GL41Metal；请使用 `neoforge-latest` 发布中的 macOS 构建 jar。
+- CI 无法在 macOS 11.0（Big Sur）上实际运行测试：Apple Silicon CI runner 不能
+  运行 macOS 11。该下限由 MSL/AIR deployment target 和 dylib `minos` 证明，
+  而非游戏内实测。
 - 支持 Iris 不代表兼容所有光影包。
 - 超出 GL41Metal 安全 sampler 上限的光影包无法使用其直接 shader bridge。
 - GL46 与 GL41Metal 的画面和性能尚未完全一致。
@@ -102,7 +136,20 @@ unit，但使用全部 16 个可能导致驱动在链接 program 时崩溃。因
 ./gradlew :neoforge:build
 ```
 
-GL41Metal 原生代码与 Metal shader 会在 macOS 上构建并打包。
+GL41Metal 原生代码与 Metal shader 会在 macOS 上构建并打包。macOS 专用验证：
+
+```shell
+./gradlew :neoforge:verifyMacNatives -PrequireMacNatives=true
+bash scripts/macos/verify-macos-artifact.sh \
+  neoforge/build/libs/voxy-<version>+1.21.1-neoforge.jar \
+  --expected-msl-std <value> --expected-min-os <value> --run-load-probe
+```
+
+兼容性下限通过 `macos-metal-probe` workflow 测量（Actions -> macos-metal-probe，
+另有每月定时运行）。修改 `gl41metal_msl_std` 或 `gl41metal_macos_min` 前请先阅读
+[docs/MACOS_COMPATIBILITY.md](docs/MACOS_COMPATIBILITY.md)。在非 macOS 主机上，
+jar 不包含 macOS 原生库，`verifyMacNatives` 只会给出警告，除非传入
+`-PrequireMacNatives=true`。
 
 ## 上游与致谢
 

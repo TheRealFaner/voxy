@@ -52,14 +52,77 @@ def gl41MetalShaderDir = layout.buildDirectory.dir("gl41metal-shaders")
 ext.gl41MetalNativeDir = gl41MetalNativeDir
 ext.gl41MetalShaderDir = gl41MetalShaderDir
 
+// GL41Metal macOS compatibility floor; provisional until the probe confirms it.
+def gl41MetalMslStd = providers.gradleProperty('gl41metal_msl_std').getOrElse('metal2.1')
+def gl41MetalMacosMin = providers.gradleProperty('gl41metal_macos_min').getOrElse('11.0')
+def gl41MetalShipFallback =
+        providers.gradleProperty('gl41metal_ship_fallback').getOrElse('false').toBoolean()
+def gl41MetalFallbackMslStd =
+        providers.gradleProperty('gl41metal_fallback_msl_std').getOrElse('metal3.2')
+def gl41MetalFallbackMacosMin =
+        providers.gradleProperty('gl41metal_fallback_macos_min').getOrElse('15.0')
+
+def gl41MetalMslStdPattern = ~/^(macos-|osx-)?metal[0-9]+\.[0-9]+$/
+def gl41MetalMacosMinPattern = ~/^[0-9]+\.[0-9]+$/
+def gl41MetalPropertyHint = 'Re-run the macOS Metal probe ' +
+        '(.github/workflows/macos-metal-probe.yml) and update gradle.properties with the ' +
+        'measured values; see docs/MACOS_COMPATIBILITY.md.'
+[
+        'gl41metal_msl_std'         : gl41MetalMslStd,
+        'gl41metal_fallback_msl_std': gl41MetalFallbackMslStd,
+].each { name, value ->
+    if (!(value ==~ gl41MetalMslStdPattern)) {
+        throw new GradleException("Invalid ${name}='${value}': expected a Metal Shading Language " +
+                "standard such as 'metal2.1' (optionally prefixed with macos-/osx-). " +
+                gl41MetalPropertyHint)
+    }
+}
+[
+        'gl41metal_macos_min'         : gl41MetalMacosMin,
+        'gl41metal_fallback_macos_min': gl41MetalFallbackMacosMin,
+].each { name, value ->
+    if (!(value ==~ gl41MetalMacosMinPattern)) {
+        throw new GradleException("Invalid ${name}='${value}': expected a macOS deployment target " +
+                "such as '11.0'. " + gl41MetalPropertyHint)
+    }
+}
+
+ext.gl41MetalMslStd = gl41MetalMslStd
+ext.gl41MetalMacosMin = gl41MetalMacosMin
+ext.gl41MetalShipFallback = gl41MetalShipFallback
+ext.gl41MetalFallbackMslStd = gl41MetalFallbackMslStd
+ext.gl41MetalFallbackMacosMin = gl41MetalFallbackMacosMin
+
 tasks.register('compileGl41MetalNative', Exec) {
     description = 'Compiles the macOS GL41Metal JNI library'
     group = 'build'
-    onlyIf { isMacOsHost }
+    onlyIf {
+        if (isMacOsHost) {
+            return true
+        }
+        logger.lifecycle(
+                "Skipping compileGl41MetalNative: macOS native compilation requires a macOS host " +
+                        "(current host: ${System.getProperty('os.name')} ${System.getProperty('os.arch')})")
+        return false
+    }
 
     def outputDir = gl41MetalNativeDir.get().asFile
     def outputLib = new File(outputDir, 'libvoxy_gl41metal.dylib')
     def javaHome = System.getProperty('java.home')
+    def clangFlags = ['-std=c++17',
+                      '-ObjC++',
+                      '-fobjc-arc',
+                      '-O3',
+                      '-DNDEBUG',
+                      '-Wall',
+                      '-Wextra',
+                      '-Werror',
+                      '-Wno-deprecated-declarations',
+                      '-dynamiclib',
+                      '-install_name', '@rpath/libvoxy_gl41metal.dylib',
+                      '-arch', 'x86_64',
+                      '-arch', 'arm64',
+                      "-mmacosx-version-min=${gl41MetalMacosMin}"]
     def nativeSources = fileTree('src/main/native/gl41metal') {
         include '**/*.mm'
     }
@@ -69,39 +132,38 @@ tasks.register('compileGl41MetalNative', Exec) {
 
     inputs.files(nativeSources)
     inputs.files(nativeHeaders)
+    inputs.property('macosMin', gl41MetalMacosMin)
+    inputs.property('clangFlags', clangFlags.join(' '))
+    inputs.property('javaHome', javaHome)
     outputs.file(outputLib)
 
     doFirst {
         outputDir.mkdirs()
         def sources = nativeSources.files.sort { it.path }.collect { it.path }
-        commandLine(
-                ['clang++',
-                 '-std=c++17',
-                 '-ObjC++',
-                 '-fobjc-arc',
-                 '-O3',
-                 '-DNDEBUG',
-                 '-Wall',
-                 '-Wextra',
-                 '-Werror',
-                 '-Wno-deprecated-declarations',
-                 '-dynamiclib',
-                 '-arch', 'x86_64',
-                 '-arch', 'arm64',
-                 '-I', "${javaHome}/include",
+        commandLine(['clang++'] +
+                clangFlags +
+                ['-I', "${javaHome}/include",
                  '-I', "${javaHome}/include/darwin",
                  '-I', 'src/main/native/gl41metal'] +
-                        sources +
-                        ['-framework', 'Foundation',
-                         '-framework', 'Metal',
-                         '-o', outputLib.absolutePath])
+                sources +
+                ['-framework', 'Foundation',
+                 '-framework', 'Metal',
+                 '-o', outputLib.absolutePath])
     }
 }
 
 tasks.register('compileGl41MetalShaders', Exec) {
     description = 'Compiles GL41Metal Metal shaders into a build-time library'
     group = 'build'
-    onlyIf { isMacOsHost }
+    onlyIf {
+        if (isMacOsHost) {
+            return true
+        }
+        logger.lifecycle(
+                "Skipping compileGl41MetalShaders: the Metal toolchain requires a macOS host " +
+                        "(current host: ${System.getProperty('os.name')} ${System.getProperty('os.arch')})")
+        return false
+    }
 
     def outputDir = gl41MetalShaderDir.get().asFile
     def outputLibrary = new File(outputDir, 'voxy_gl41metal.metallib')
@@ -110,7 +172,10 @@ tasks.register('compileGl41MetalShaders', Exec) {
     }
 
     inputs.files(shaderSources)
+    inputs.property('mslStd', gl41MetalMslStd)
+    inputs.property('macosMin', gl41MetalMacosMin)
     outputs.file(outputLibrary)
+    environment 'MACOSX_DEPLOYMENT_TARGET', gl41MetalMacosMin
 
     doFirst {
         outputDir.mkdirs()
@@ -118,7 +183,113 @@ tasks.register('compileGl41MetalShaders', Exec) {
         if (sources.isEmpty()) {
             throw new GradleException('No GL41Metal shader sources found')
         }
-        commandLine(['xcrun', 'metal', '-std=metal3.0', '-O'] + sources + ['-o', outputLibrary.absolutePath])
+        commandLine(['xcrun', 'metal',
+                     "-std=${gl41MetalMslStd}",
+                     "-mmacosx-version-min=${gl41MetalMacosMin}",
+                     '-O'] + sources + ['-o', outputLibrary.absolutePath])
+    }
+}
+
+def gl41MetalFallbackShaderLibrary =
+        new File(gl41MetalShaderDir.get().asFile, 'voxy_gl41metal-current.metallib')
+ext.gl41MetalFallbackShaderLibrary = gl41MetalFallbackShaderLibrary
+
+if (gl41MetalShipFallback) {
+    tasks.register('compileGl41MetalFallbackShaders', Exec) {
+        description = 'Compiles the current-toolchain GL41Metal shader library used as a fallback'
+        group = 'build'
+        onlyIf {
+            if (isMacOsHost) {
+                return true
+            }
+            logger.lifecycle(
+                    "Skipping compileGl41MetalFallbackShaders: the Metal toolchain requires a macOS host " +
+                            "(current host: ${System.getProperty('os.name')} ${System.getProperty('os.arch')})")
+            return false
+        }
+
+        def outputDir = gl41MetalShaderDir.get().asFile
+        def outputLibrary = gl41MetalFallbackShaderLibrary
+        def shaderSources = fileTree('src/main/native/gl41metal/shaders') {
+            include '**/*.metal'
+        }
+
+        inputs.files(shaderSources)
+        inputs.property('fallbackMslStd', gl41MetalFallbackMslStd)
+        inputs.property('fallbackMacosMin', gl41MetalFallbackMacosMin)
+        outputs.file(outputLibrary)
+        environment 'MACOSX_DEPLOYMENT_TARGET', gl41MetalFallbackMacosMin
+
+        doFirst {
+            outputDir.mkdirs()
+            def sources = shaderSources.files.sort { it.path }.collect { it.path }
+            if (sources.isEmpty()) {
+                throw new GradleException('No GL41Metal shader sources found')
+            }
+            commandLine(['xcrun', 'metal',
+                         "-std=${gl41MetalFallbackMslStd}",
+                         "-mmacosx-version-min=${gl41MetalFallbackMacosMin}",
+                         '-O'] + sources + ['-o', outputLibrary.absolutePath])
+        }
+    }
+}
+
+def gl41MetalBuildInfoFile = new File(gl41MetalNativeDir.get().asFile, 'build-info.properties')
+ext.gl41MetalBuildInfoFile = gl41MetalBuildInfoFile
+
+tasks.register('generateGl41MetalBuildInfo') {
+    description = 'Writes GL41Metal toolchain metadata used for runtime diagnostics'
+    group = 'build'
+    onlyIf {
+        if (isMacOsHost) {
+            return true
+        }
+        logger.lifecycle(
+                "Skipping generateGl41MetalBuildInfo: macOS toolchain metadata is only available " +
+                        "on a macOS host (current host: ${System.getProperty('os.name')} " +
+                        "${System.getProperty('os.arch')})")
+        return false
+    }
+
+    def outputFile = gl41MetalBuildInfoFile
+    // Configuration-cache-safe providers: the commands run only when the provider is queried
+    // (input snapshot/execution), never during configuration.
+    def xcodeExec = providers.exec {
+        commandLine(['xcrun', 'xcodebuild', '-version'])
+        ignoreExitValue = true
+    }
+    def metalExec = providers.exec {
+        commandLine(['xcrun', 'metal', '--version'])
+        ignoreExitValue = true
+    }
+    def xcodeVersion = xcodeExec.result.zip(xcodeExec.standardOutput.asText) { result, output ->
+        result.exitValue == 0 ? output.strip().replaceAll(/\s+/, ' ') : '<unavailable>'
+    }
+    def metalVersion = metalExec.result.zip(metalExec.standardOutput.asText) { result, output ->
+        result.exitValue == 0 ? output.strip().replaceAll(/\s+/, ' ') : '<unavailable>'
+    }
+
+    def commit = rootProject.ext.gitCommitHash()
+
+    inputs.property('mslStd', gl41MetalMslStd)
+    inputs.property('macosMin', gl41MetalMacosMin)
+    inputs.property('commit', commit)
+    inputs.property('xcodeVersion', xcodeVersion)
+    inputs.property('metalVersion', metalVersion)
+    outputs.file(outputFile)
+
+    doLast {
+        outputFile.parentFile.mkdirs()
+        def xcodeVersionValue = xcodeVersion.get()
+        def metalVersionValue = metalVersion.get()
+        def buildTime = System.currentTimeSeconds()
+        outputFile.text = """xcode_version=${xcodeVersionValue}
+metal_version=${metalVersionValue}
+msl_std=${gl41MetalMslStd}
+macos_min=${gl41MetalMacosMin}
+commit=${commit}
+build_time=${buildTime}
+"""
     }
 }
 
