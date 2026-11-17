@@ -35,6 +35,12 @@ import org.jetbrains.annotations.Nullable;
  * forward into a visible fin/sliver. Large boundary faces (for example a thick trunk's 16x16 top)
  * are kept.
  *
+ * <p>Dynamic Trees bakes branch models in a 0..1 vertex space where a full block face spans 1.0,
+ * while Voxy's synthetic models (for example {@link SolidBarkBakedModel}) use the usual 0..16
+ * space. The filter detects the space per quad and scales 0..1 coordinates to block units before
+ * the plane and extent tests, so the plane at 1.0 and a full 16x16 DT face are handled like their
+ * 0..16 counterparts, and a one-unit twig cap still measures 1 and is dropped.
+ *
  * <p>The caps are dropped per side: {@code dropCapSidesMask} bit {@code i} (where {@code i} is
  * {@link Direction#get3DDataValue()}) means that side's boundary cap may be dropped. {@link
  * #ALL_SIDES_MASK} enables every side (the default {@code all} branch-cap-filter mode); the {@code
@@ -45,6 +51,12 @@ import org.jetbrains.annotations.Nullable;
  */
 final class RootVertFilterBakedModel implements BakedModel {
   static final int ALL_SIDES_MASK = 0x3F;
+
+  /** Largest absolute coordinate of a Dynamic Trees quad in its native 0..1 model space. */
+  private static final float UNIT_SPACE_MAX = 1.0005f;
+
+  /** Block-unit size of that 0..1 model cube: one DT unit is one sixteenth of a block. */
+  private static final float UNIT_SPACE_SCALE = 16.0f;
 
   private final BakedModel delegate;
   private final float maxY;
@@ -82,12 +94,17 @@ final class RootVertFilterBakedModel implements BakedModel {
    * z} = 0 or 16) on a side whose mask bit is set. The two in-plane extents must be small so large
    * legitimate boundary faces (for example a thick trunk's 16x16 top) are kept. Plane-to-side
    * mapping: x=0 → WEST, x=16 → EAST, y=0 → DOWN, y=16 → UP, z=0 → NORTH, z=16 → SOUTH.
+   *
+   * <p>Coordinates are first converted to block units with {@link #vertexSpaceScale(int[])}: DT
+   * branch quads span 0..1, so their plane 1.0 becomes 16 and a full face measures 16 (kept), while
+   * a one-unit twig cap measures 1 (dropped). Voxy synthetic 0..16 quads keep scale 1.
    */
   static boolean isBoundaryCap(BakedQuad quad, int dropCapSidesMask) {
     if (dropCapSidesMask == 0) {
       return false;
     }
     int[] vertices = quad.getVertices();
+    float scale = vertexSpaceScale(vertices);
     float minX = Float.POSITIVE_INFINITY;
     float minY = Float.POSITIVE_INFINITY;
     float minZ = Float.POSITIVE_INFINITY;
@@ -95,9 +112,9 @@ final class RootVertFilterBakedModel implements BakedModel {
     float maxY = Float.NEGATIVE_INFINITY;
     float maxZ = Float.NEGATIVE_INFINITY;
     for (int i = 0; i < 4; i++) {
-      float x = Float.intBitsToFloat(vertices[i * 8]);
-      float y = Float.intBitsToFloat(vertices[i * 8 + 1]);
-      float z = Float.intBitsToFloat(vertices[i * 8 + 2]);
+      float x = Float.intBitsToFloat(vertices[i * 8]) * scale;
+      float y = Float.intBitsToFloat(vertices[i * 8 + 1]) * scale;
+      float z = Float.intBitsToFloat(vertices[i * 8 + 2]) * scale;
       minX = Math.min(minX, x);
       maxX = Math.max(maxX, x);
       minY = Math.min(minY, y);
@@ -147,10 +164,35 @@ final class RootVertFilterBakedModel implements BakedModel {
     return Math.abs(value - target) < 1.0e-3f;
   }
 
+  /**
+   * Block-unit scale factor for the quad's vertex space.
+   *
+   * <p>Dynamic Trees branch models emit quads in a 0..1 space (a full block face spans 1.0);
+   * vanilla-baked and Voxy synthetic models use 0..16. A quad whose every coordinate fits inside
+   * the unit cube is treated as DT and scaled by {@link #UNIT_SPACE_SCALE}; anything larger keeps
+   * scale 1, so 0..16 quads stay bit-identical to the previous untransformed behaviour.
+   */
+  private static float vertexSpaceScale(int[] vertices) {
+    float maxAbs = 0.0f;
+    for (int i = 0; i < 4; i++) {
+      int base = i * 8;
+      maxAbs = Math.max(maxAbs, Math.abs(Float.intBitsToFloat(vertices[base])));
+      maxAbs = Math.max(maxAbs, Math.abs(Float.intBitsToFloat(vertices[base + 1])));
+      maxAbs = Math.max(maxAbs, Math.abs(Float.intBitsToFloat(vertices[base + 2])));
+    }
+    return maxAbs <= UNIT_SPACE_MAX ? UNIT_SPACE_SCALE : 1.0f;
+  }
+
+  /**
+   * True when no vertex is above the cap height {@code maxY}, expressed in block units. The
+   * comparison is scale-aware like {@link #isBoundaryCap}: DT 0..1 quads are scaled by 16 first,
+   * so the limit keeps its block-unit meaning for both vertex spaces.
+   */
   static boolean withinHeight(BakedQuad quad, float maxY) {
     int[] vertices = quad.getVertices();
+    float scale = vertexSpaceScale(vertices);
     for (int i = 0; i < 4; i++) {
-      float y = Float.intBitsToFloat(vertices[i * 8 + 1]);
+      float y = Float.intBitsToFloat(vertices[i * 8 + 1]) * scale;
       if (y > maxY) {
         return false;
       }
