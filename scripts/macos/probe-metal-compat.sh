@@ -108,17 +108,22 @@ file_size() { if [ -f "$1" ]; then wc -c <"$1" | tr -d ' '; else echo 0; fi; }
 
 detect_air_target() { # $1 = metallib, $2 = per-tuple log
   air_target=""
+  # Some toolchains advertise --air-version in --help but print the full usage
+  # text for it. Only accept output that actually contains an AIR triple.
   if xcrun --sdk macosx metal-objdump --help 2>/dev/null | grep -q -e '--air-version'; then
-    air_target=$(xcrun --sdk macosx metal-objdump --air-version "$1" 2>/dev/null | oneline)
+    candidate=$(xcrun --sdk macosx metal-objdump --air-version "$1" 2>/dev/null | oneline)
+    case "$candidate" in
+      *air64*) air_target="$candidate" ;;
+    esac
   fi
   triple=$(strings -a "$1" 2>/dev/null | grep -aoE 'air64[^[:space:]]+' | sort -u | paste -s -d ',' -)
   if [ -n "$triple" ]; then
     echo "air triple(s): $triple" >>"$2"
   fi
-  if [ -n "$air_target" ]; then
-    printf '%s\n' "$air_target"
-  elif [ -n "$triple" ]; then
+  if [ -n "$triple" ]; then
     printf '%s\n' "$triple"
+  elif [ -n "$air_target" ]; then
+    printf '%s\n' "$air_target"
   else
     printf '%s\n' "unknown"
   fi

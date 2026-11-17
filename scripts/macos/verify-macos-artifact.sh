@@ -381,10 +381,11 @@ for entry in $METALLIBS; do
     fi
 
     if xcrun -f metal-objdump >/dev/null 2>&1; then
-        if xcrun metal-objdump --air-version "$OUT" > "$WORKDIR/metal-objdump-$BASE_NAME.txt" 2>&1; then
+        if xcrun metal-objdump --air-version "$OUT" > "$WORKDIR/metal-objdump-$BASE_NAME.txt" 2>&1 \
+            && grep -q 'air64' "$WORKDIR/metal-objdump-$BASE_NAME.txt"; then
             pass "metal-objdump --air-version ($BASE_NAME)" "$(tr '\n' ' ' < "$WORKDIR/metal-objdump-$BASE_NAME.txt" | cut -c1-200)"
         else
-            warn "metal-objdump --air-version ($BASE_NAME)" "$(sed -n '1p' "$WORKDIR/metal-objdump-$BASE_NAME.txt")"
+            warn "metal-objdump --air-version ($BASE_NAME)" "unsupported option on this toolchain; using the strings AIR target below"
         fi
     else
         skip "metal-objdump --air-version ($BASE_NAME)" "tool not available"

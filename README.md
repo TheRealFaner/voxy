@@ -58,9 +58,10 @@ macOS systems fall back to GL41Metal when GL46 is unavailable.
 #### macOS support
 
 - Apple Silicon (M1-M4) is supported. The current compatibility floor is macOS
-  11.0 with MSL 2.1 (`gl41metal_msl_std` / `gl41metal_macos_min` in
-  `gradle.properties`); these values are provisional until the
-  `macos-metal-probe` workflow confirms them.
+  11.0 with MSL `macos-metal2.0` (`gl41metal_msl_std` / `gl41metal_macos_min` in
+  `gradle.properties`), confirmed by the `macos-metal-probe` workflow on
+  2026-11-18. The arm64 CI runner was unavailable at that time; the metallib is
+  architecture-independent and the universal dylib is verified on both slices.
 - Intel Macs are experimental: the dylib is universal (x86_64 + arm64), but
   Intel is covered by build and CI load checks only, with no in-game
   validation.

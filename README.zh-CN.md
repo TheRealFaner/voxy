@@ -52,9 +52,11 @@ Metal 负责远景地形选择；OpenGL 和 Iris 继续负责光栅化、近景�
 
 #### macOS 支持
 
-- Apple Silicon（M1–M4）已支持。当前兼容下限为 macOS 11.0 + MSL 2.1
-  （`gradle.properties` 中的 `gl41metal_msl_std` / `gl41metal_macos_min`）；
-  在 `macos-metal-probe` workflow 确认前，这些值为暂定值。
+- Apple Silicon（M1–M4）已支持。当前兼容下限为 macOS 11.0 + MSL
+  `macos-metal2.0`（`gradle.properties` 中的 `gl41metal_msl_std` /
+  `gl41metal_macos_min`），已由 `macos-metal-probe` workflow 于 2026-11-18
+  确认。当时 arm64 CI runner 不可用；metallib 与架构无关，universal dylib
+  的两个切片均已验证。
 - Intel Mac 为实验性支持：dylib 为 universal（x86_64 + arm64），仅通过构建
   和 CI 加载检查验证，未进行游戏内验证。
 - 需要支持 Metal 的 GPU 和 OpenGL 4.1；没有 Metal 设备的 Mac 不受支持。

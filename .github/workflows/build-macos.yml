@@ -86,7 +86,12 @@ jobs:
         shell: bash
         run: |
           if [ -f build-macos.log ]; then
-            tail -n 80 build-macos.log | while IFS= read -r line; do
+            start=$(grep -n 'FAILURE: Build failed' build-macos.log | head -n 1 | cut -d: -f1)
+            if [ -n "$start" ]; then
+              sed -n "${start},$((start + 40))p" build-macos.log
+            else
+              tail -n 50 build-macos.log
+            fi | while IFS= read -r line; do
               echo "::error title=Gradle failure::${line}"
             done
           fi

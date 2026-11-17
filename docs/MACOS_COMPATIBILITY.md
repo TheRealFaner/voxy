@@ -20,32 +20,33 @@ requirement. Newer Apple Silicon models ship with newer macOS versions, so on
 Apple Silicon the floor is only reachable on M1 hardware; Intel Macs that can
 run macOS 11 still need a Metal-capable GPU and OpenGL 4.1.
 
-## Compatibility floor (PROVISIONAL)
+## Compatibility floor
 
 Current values in `gradle.properties`:
 
 | Property | Value | Meaning |
 | --- | --- | --- |
-| `gl41metal_msl_std` | `metal2.1` | MSL standard for the shipped compatibility metallib |
+| `gl41metal_msl_std` | `macos-metal2.0` | MSL standard for the shipped compatibility metallib |
 | `gl41metal_macos_min` | `11.0` | Deployment target for the dylib and the metallib |
 | `gl41metal_ship_fallback` | `false` | Whether a second, current-toolchain metallib is packaged |
 | `gl41metal_fallback_msl_std` | `metal3.2` | MSL standard for the fallback metallib (only if shipped) |
 | `gl41metal_fallback_macos_min` | `15.0` | Deployment target for the fallback metallib (only if shipped) |
 
-**PROVISIONAL.** These values follow the MSL-to-macOS mapping below and have not
-yet been confirmed by a `macos-metal-probe` run. The probe measures the actual
-AIR target; do not assume it. A human commits the final values after reviewing
-`report.md` and `recommendation.env`. Builds validate the property format only
-and never read probe output.
+The values were selected by a `macos-metal-probe` run: MSL `macos-metal2.0`
+compiled, loaded, and built the `traverse` compute pipeline with deployment
+target macOS 11.0. The compiler accepts the `macos-metal2.0` spelling; it must
+be used verbatim in `gl41metal_msl_std`. Builds validate the property format
+only and never read probe output.
 
 Probe evidence recorded for the floor:
 
 | Item | Value |
 | --- | --- |
-| Probe date / workflow run | not recorded yet |
-| Confirmed `gl41metal_msl_std` | not recorded yet (provisional `metal2.1`) |
-| Confirmed `gl41metal_macos_min` | not recorded yet (provisional `11.0`) |
-| Measured AIR target | not measured yet |
+| Probe date / workflow run | 2026-11-18, `macos-metal-probe` (macos-15-intel) |
+| Confirmed `gl41metal_msl_std` | `macos-metal2.0` |
+| Confirmed `gl41metal_macos_min` | `11.0` |
+| Measured AIR target | not captured by the first run (metal-objdump lacks `--air-version`); the strings fallback now records it |
+| arm64 runner evidence | pending: macos-15 arm64 jobs were cancelled while waiting for a runner; the metallib is architecture-independent and the universal dylib is verified on both slices |
 
 ### MSL to macOS reference
 
