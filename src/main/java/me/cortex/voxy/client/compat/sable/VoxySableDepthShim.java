@@ -61,8 +61,8 @@ import static org.lwjgl.opengl.GL45C.glNamedFramebufferDrawBuffers;
 import static org.lwjgl.opengl.GL45C.glNamedFramebufferRenderbuffer;
 import static org.lwjgl.opengl.GL45C.glNamedFramebufferTexture;
 
-import me.cortex.voxy.client.core.VoxyRenderSystem;
 import me.cortex.voxy.client.core.IVoxyRenderSystemHolder;
+import me.cortex.voxy.client.core.VoxyRenderSystem;
 import me.cortex.voxy.client.core.gl.GlFramebuffer;
 import me.cortex.voxy.client.core.rendering.Viewport;
 import me.cortex.voxy.client.core.rendering.backend.gl46.util.FullscreenBlit;

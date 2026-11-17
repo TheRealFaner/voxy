@@ -1004,16 +1004,15 @@ public class RenderDataFactory {
 
   /**
    * True when a seam-fill cell carries Dynamic Trees geometry worth replicating to LOD0. Only
-   * trunk/branch cells qualify: LOD1 is dominated by leaves, and replicating those on every
-   * section re-mesh inflated distant canopies.
+   * trunk/branch cells qualify: LOD1 is dominated by leaves, and replicating those on every section
+   * re-mesh inflated distant canopies.
    */
   private boolean isFillableSeamCell(long cellId) {
     if (Mapper.isAir(cellId)) {
       return false;
     }
     int blockId = Mapper.getBlockId(cellId);
-    return this.modelMan.isAnyBranchBlockId(blockId)
-        || this.modelMan.isTrunkShellBlockId(blockId);
+    return this.modelMan.isAnyBranchBlockId(blockId) || this.modelMan.isTrunkShellBlockId(blockId);
   }
 
   /**

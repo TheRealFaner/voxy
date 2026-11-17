@@ -240,8 +240,7 @@ public class ActiveSectionTracker {
             // Never let an invalidation failure leak the section refcount during shutdown.
             if (NEIGHBOR_INVALIDATION_WARNED.compareAndSet(false, true)) {
               Logger.warn(
-                  "Failed to enqueue neighbour remesh for "
-                      + WorldEngine.pprintPos(section.key),
+                  "Failed to enqueue neighbour remesh for " + WorldEngine.pprintPos(section.key),
                   t);
             }
           }

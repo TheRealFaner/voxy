@@ -2,8 +2,8 @@ package me.cortex.voxy.client.mixin.sodium;
 
 import me.cortex.voxy.client.ClientChunkCacheAccess;
 import me.cortex.voxy.client.config.VoxyConfig;
-import me.cortex.voxy.client.core.VoxyRenderSystem;
 import me.cortex.voxy.client.core.IVoxyRenderSystemHolder;
+import me.cortex.voxy.client.core.VoxyRenderSystem;
 import me.cortex.voxy.common.VoxyFlags;
 import me.cortex.voxy.common.platform.PlatformAccess;
 import me.cortex.voxy.common.world.service.VoxelIngestService;
