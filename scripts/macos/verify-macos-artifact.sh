@@ -274,8 +274,8 @@ if [ -s "$DYLIB" ]; then
 
     LIPO_INFO=$(lipo -info "$DYLIB" 2>&1 || true)
     LIPO_MISSING=""
-    lipo -verify_arch x86_64 "$DYLIB" >/dev/null 2>&1 || LIPO_MISSING="$LIPO_MISSING x86_64"
-    lipo -verify_arch arm64 "$DYLIB" >/dev/null 2>&1 || LIPO_MISSING="$LIPO_MISSING arm64"
+    printf '%s' "$LIPO_INFO" | grep -q 'x86_64' || LIPO_MISSING="$LIPO_MISSING x86_64"
+    printf '%s' "$LIPO_INFO" | grep -q 'arm64' || LIPO_MISSING="$LIPO_MISSING arm64"
     if [ -z "$LIPO_MISSING" ]; then
         pass "lipo architectures" "x86_64 and arm64 present ($LIPO_INFO)"
     else
