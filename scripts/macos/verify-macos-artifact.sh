@@ -272,10 +272,14 @@ if [ -s "$DYLIB" ]; then
     case "$FILE_OUT" in *x86_64*) ;; *) fail "dylib arch x86_64" "x86_64 not reported by file" ;; esac
     case "$FILE_OUT" in *arm64*) ;; *) fail "dylib arch arm64" "arm64 not reported by file" ;; esac
 
-    if lipo -verify_arch x86_64 arm64 "$DYLIB" >/dev/null 2>&1; then
-        pass "lipo architectures" "x86_64 and arm64 present"
+    LIPO_INFO=$(lipo -info "$DYLIB" 2>&1 || true)
+    LIPO_MISSING=""
+    lipo -verify_arch x86_64 "$DYLIB" >/dev/null 2>&1 || LIPO_MISSING="$LIPO_MISSING x86_64"
+    lipo -verify_arch arm64 "$DYLIB" >/dev/null 2>&1 || LIPO_MISSING="$LIPO_MISSING arm64"
+    if [ -z "$LIPO_MISSING" ]; then
+        pass "lipo architectures" "x86_64 and arm64 present ($LIPO_INFO)"
     else
-        fail "lipo architectures" "lipo -verify_arch x86_64 arm64 failed"
+        fail "lipo architectures" "missing:$LIPO_MISSING ($LIPO_INFO)"
     fi
 
     MINOS_FILE="$WORKDIR/minos.txt"
@@ -331,6 +335,7 @@ if [ -s "$DYLIB" ]; then
                 @rpath*|@loader_path*|@executable_path*)
                     BAD_DEPS="$BAD_DEPS $dep(relative-install-name)" ;;
                 /System/Library/Frameworks/Foundation.framework/*|\
+                /System/Library/Frameworks/CoreFoundation.framework/*|\
                 /System/Library/Frameworks/Metal.framework/*|\
                 /usr/lib/libSystem.B.dylib|\
                 /usr/lib/libc++.1.dylib|\
