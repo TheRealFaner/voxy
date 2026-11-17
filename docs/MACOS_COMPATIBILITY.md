@@ -173,7 +173,7 @@ and GL41Metal cannot be selected. Do not ship those jars to macOS users.
 | Level | What it proves | Where |
 | --- | --- | --- |
 | Artifact verification | Dylib is universal with the expected `minos`, only system dependencies, and JNI exports for both slices; metallib is non-empty with an AIR target; `build-info.properties` matches `gradle.properties` | `scripts/macos/verify-macos-artifact.sh` |
-| CI Metal load | The Metal driver creates a device, loads the metallib, finds `traverse`, and builds its compute pipeline | `macos-metal-probe` workflow on `macos-15`; optional `macos-15-intel` job. `macos-26` currently has no hosted runner in this repository |
+| CI Metal load | The Metal driver creates a device, loads the metallib, finds `traverse`, and builds its compute pipeline | `macos-metal-probe` workflow on `macos-15-intel` (Intel runner; universal cross-compilation). `macos-15` arm64 jobs are temporarily cancelled while waiting for a runner |
 | In-game | Rendering correctness and stability on real hardware | Manual Apple Silicon test: high-altitude flight, render distance 32+, opaque/translucent/water/fog/SSAO, one Iris shader pack. Not performed on Intel |
 
 Big Sur (macOS 11) cannot be runtime-tested in CI: GitHub does not provide
@@ -191,9 +191,10 @@ floor.
 
 CI: run Actions -> `macos-metal-probe` -> Run workflow. Defaults probe
 `metal2.0` through `metal3.0` against deployment targets `11.0`, `11.3`,
-`12.0`, and `13.0` on `macos-15`; enable `intel_probe` to add
-`macos-15-intel`. The workflow never publishes. A monthly schedule re-runs it.
-(`macos-26` is not available as a hosted runner in this repository.)
+`12.0`, and `13.0` on `macos-15-intel`. The workflow never publishes. A monthly
+schedule re-runs it. The Intel runner is used because `macos-15` arm64 jobs are
+temporarily cancelled while waiting for capacity; switch back when arm64 runners
+are available. (`macos-26` is not available as a hosted runner in this repository.)
 Read `report.md` in the job summary and the uploaded artifact;
 `recommendation.env` contains the selection.
 
