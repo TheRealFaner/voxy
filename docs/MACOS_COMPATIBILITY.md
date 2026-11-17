@@ -45,8 +45,8 @@ Probe evidence recorded for the floor:
 | Probe date / workflow run | 2026-11-18, `macos-metal-probe` (macos-15-intel) |
 | Confirmed `gl41metal_msl_std` | `macos-metal2.0` |
 | Confirmed `gl41metal_macos_min` | `11.0` |
-| Measured AIR target | not captured by the first run (metal-objdump lacks `--air-version`); the strings fallback now records it |
-| arm64 runner evidence | pending: macos-15 arm64 jobs were cancelled while waiting for a runner; the metallib is architecture-independent and the universal dylib is verified on both slices |
+| Measured AIR target | `air64-apple-macosx11.0.0` (probe strings fallback) |
+| arm64 runner evidence | pending: macos-15 arm64 jobs were cancelled while waiting for a runner. The metallib is architecture-independent; the universal dylib contains x86_64 and arm64, and build plus load probe ran on macos-15-intel |
 
 ### MSL to macOS reference
 
