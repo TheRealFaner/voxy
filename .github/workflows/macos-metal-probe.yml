@@ -35,7 +35,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-15, macos-26]
+        # macos-26 has no hosted runner in this repository (jobs cancel after 15 min).
+        os: [macos-15]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
