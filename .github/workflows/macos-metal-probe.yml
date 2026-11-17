@@ -97,6 +97,16 @@ jobs:
             echo "probe report was not produced" >> "$GITHUB_STEP_SUMMARY"
           fi
 
+      - name: Annotate probe recommendation
+        if: always()
+        shell: bash
+        run: |
+          if [ -f build/gl41metal-probe/recommendation.env ]; then
+            while IFS= read -r line; do
+              echo "::notice title=Probe recommendation::${line}"
+            done < build/gl41metal-probe/recommendation.env
+          fi
+
       - name: Upload probe artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -168,6 +178,16 @@ jobs:
             cat build/gl41metal-probe/report.md >> "$GITHUB_STEP_SUMMARY"
           else
             echo "probe report was not produced" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Annotate probe recommendation
+        if: always()
+        shell: bash
+        run: |
+          if [ -f build/gl41metal-probe/recommendation.env ]; then
+            while IFS= read -r line; do
+              echo "::notice title=Probe recommendation::${line}"
+            done < build/gl41metal-probe/recommendation.env
           fi
 
       - name: Upload probe artifacts
