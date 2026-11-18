@@ -79,6 +79,49 @@ public interface VoxyRenderBackend extends AutoCloseable {
 
   default void syncVanillaRenderSections(ChunkRenderListIterable renderLists, boolean reverse) {}
 
+  /**
+   * True when this backend can render LOD during portal passes (PORTAL_VIEW_API.md D2). GL46
+   * supports it in S2; GL41Metal remains a pure suppression scope until S3. Backends must return
+   * false after their per-session failure latch.
+   */
+  default boolean supportsPortalViews() {
+    return false;
+  }
+
+  /** Maximum simultaneous (nested) portal passes this backend can render; 0 when unsupported. */
+  default int portalViewDepthLimit() {
+    return 0;
+  }
+
+  /**
+   * Opens a portal pass. Render thread only. The caller MUST call {@link #endPortalView()} exactly
+   * once for every call, including when this returns false. Returns true when this backend will
+   * render LOD for the pass; {@link me.cortex.voxy.client.core.VoxyRenderSystem} opens its
+   * suppression scope regardless of the result.
+   */
+  default boolean beginPortalView(PortalViewOptions options) {
+    return false;
+  }
+
+  /**
+   * Variant of {@link #beginPortalView(PortalViewOptions)} that also states whether this pass may
+   * run the once-per-host-frame foreign-system service work (uploads, model ticks, LOD recenter;
+   * PORTAL_VIEW_API.md §7.4). Home-system passes must pass {@code false}: the main OPAQUE already
+   * serviced that system. Backends that do not service portal passes can keep the one-argument
+   * overload.
+   */
+  default boolean beginPortalView(PortalViewOptions options, boolean service) {
+    return this.beginPortalView(options);
+  }
+
+  /** Closes the innermost portal pass. Idempotent when no pass is open. */
+  default void endPortalView() {}
+
+  /** True while a backend portal pass is open (supported or not). */
+  default boolean isPortalViewActive() {
+    return false;
+  }
+
   @Override
   void close();
 }

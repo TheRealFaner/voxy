@@ -29,6 +29,7 @@ public class ModelBakerySubsystem {
   private final Thread processingThread;
   private volatile boolean isRunning = true;
   private volatile Throwable processingThreadException;
+  private volatile boolean failureLogged = false;
 
   public ModelBakerySubsystem(Mapper mapper) {
     this(mapper, null);
@@ -66,10 +67,13 @@ public class ModelBakerySubsystem {
 
   public void tick(long totalBudget) {
     if (this.processingThreadException != null) {
-      Logger.error(
-          this.processingThreadException.getStackTrace().toString(),
-          this.processingThreadException);
-      throw new RuntimeException(this.processingThreadException);
+      if (!this.failureLogged) {
+        this.failureLogged = true;
+        Logger.error(
+            "Model factory processor failed; LOD model baking is disabled for this session",
+            this.processingThreadException);
+      }
+      return;
     }
     long start = System.nanoTime();
     this.factory.processUploads();

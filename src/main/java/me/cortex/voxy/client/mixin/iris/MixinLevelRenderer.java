@@ -3,6 +3,7 @@ package me.cortex.voxy.client.mixin.iris;
 import static org.lwjgl.opengl.GL11C.glViewport;
 
 import me.cortex.voxy.client.core.IVoxyRenderSystemHolder;
+import me.cortex.voxy.client.core.VoxyRenderSystem;
 import me.cortex.voxy.client.core.util.IrisUtil;
 import net.caffeinemc.mods.sodium.client.render.chunk.ChunkRenderMatrices;
 import net.minecraft.client.Camera;
@@ -43,10 +44,17 @@ public class MixinLevelRenderer {
             Minecraft.getInstance().getMainRenderTarget().width,
             Minecraft.getInstance().getMainRenderTarget().height);
 
-        var pos = camera.getPosition();
-        IrisUtil.CAPTURED_VIEWPORT_PARAMETERS =
-            new IrisUtil.CapturedViewportParameters(
-                new ChunkRenderMatrices(projectionMatrix, positionMatrix), pos.x, pos.y, pos.z);
+        // D3/F4: capture into the renderer this LevelRenderer owns, and skip the nested portal
+        // render entirely. The scope already nulls the field at begin, so the main view's params
+        // can never be replaced by the portal camera's. D1: a nested renderLevel without a scope
+        // is not a portal pass at all (bridge absent/failed); it must not poison the main view's
+        // captured parameters either.
+        if (!renderer.isPortalViewActive() && !VoxyRenderSystem.isNestedLevelRender()) {
+          var pos = camera.getPosition();
+          renderer.captureViewportParameters(
+              new IrisUtil.CapturedViewportParameters(
+                  new ChunkRenderMatrices(projectionMatrix, positionMatrix), pos.x, pos.y, pos.z));
+        }
       }
     }
   }

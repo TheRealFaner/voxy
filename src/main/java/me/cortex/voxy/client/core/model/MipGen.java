@@ -15,9 +15,12 @@ public class MipGen {
           "TODO: THIS MUST BE UPDATED, IT CURRENTLY ASSUMES 16 OR SMALLER SIZE");
   }
 
-  private static final short[] SCRATCH = new short[MODEL_TEXTURE_SIZE * MODEL_TEXTURE_SIZE];
-  private static final ByteArrayFIFOQueue QUEUE =
-      new ByteArrayFIFOQueue(MODEL_TEXTURE_SIZE * MODEL_TEXTURE_SIZE);
+  // Per-thread: each dimension has its own ModelBakerySubsystem thread and Immersive Portals keeps
+  // several alive at once; sharing these statics races the fastutil queue. See PORTAL_VIEW_API.md.
+  private static final ThreadLocal<short[]> SCRATCH =
+      ThreadLocal.withInitial(() -> new short[MODEL_TEXTURE_SIZE * MODEL_TEXTURE_SIZE]);
+  private static final ThreadLocal<ByteArrayFIFOQueue> QUEUE =
+      ThreadLocal.withInitial(() -> new ByteArrayFIFOQueue(MODEL_TEXTURE_SIZE * MODEL_TEXTURE_SIZE));
 
   private static long getOffset(int bx, int by, int i) {
     bx += i & (MODEL_TEXTURE_SIZE - 1);
@@ -26,48 +29,56 @@ public class MipGen {
   }
 
   private static void solidify(long baseAddr, byte msk) {
-    for (int idx = 0; idx < 6; idx++) {
-      if (((msk >> idx) & 1) == 0) continue;
-      int bx = (idx >> 1) * MODEL_TEXTURE_SIZE;
-      int by = (idx & 1) * MODEL_TEXTURE_SIZE;
-      long cAddr = baseAddr + (long) (bx + by * MODEL_TEXTURE_SIZE * 3) * 4;
-      Arrays.fill(SCRATCH, (short) -1);
-      for (int y = 0; y < MODEL_TEXTURE_SIZE; y++) {
-        for (int x = 0; x < MODEL_TEXTURE_SIZE; x++) {
-          int colour = MemoryUtil.memGetInt(cAddr + (x + y * MODEL_TEXTURE_SIZE * 3) * 4);
-          if ((colour & 0xFF000000) != 0) {
-            int pos = x + y * MODEL_TEXTURE_SIZE;
-            SCRATCH[pos] = ((short) pos);
-            QUEUE.enqueue((byte) pos);
+    short[] scratch = SCRATCH.get();
+    ByteArrayFIFOQueue queue = QUEUE.get();
+    queue.clear();
+    try {
+      for (int idx = 0; idx < 6; idx++) {
+        if (((msk >> idx) & 1) == 0) continue;
+        int bx = (idx >> 1) * MODEL_TEXTURE_SIZE;
+        int by = (idx & 1) * MODEL_TEXTURE_SIZE;
+        long cAddr = baseAddr + (long) (bx + by * MODEL_TEXTURE_SIZE * 3) * 4;
+        Arrays.fill(scratch, (short) -1);
+        for (int y = 0; y < MODEL_TEXTURE_SIZE; y++) {
+          for (int x = 0; x < MODEL_TEXTURE_SIZE; x++) {
+            int colour = MemoryUtil.memGetInt(cAddr + (x + y * MODEL_TEXTURE_SIZE * 3) * 4);
+            if ((colour & 0xFF000000) != 0) {
+              int pos = x + y * MODEL_TEXTURE_SIZE;
+              scratch[pos] = ((short) pos);
+              queue.enqueue((byte) pos);
+            }
+          }
+        }
+
+        while (!queue.isEmpty()) {
+          int pos = Byte.toUnsignedInt(queue.dequeueByte());
+          if (pos >= scratch.length) continue;
+          int x = pos & (MODEL_TEXTURE_SIZE - 1);
+          int y = pos / MODEL_TEXTURE_SIZE; // this better be turned into a bitshift
+          short newVal = (short) (scratch[pos] + (short) 0x0100);
+          for (int D = 3; D != -1; D--) {
+            int d = 2 * (D & 1) - 1;
+            int x2 = x + (((D & 2) == 2) ? d : 0);
+            int y2 = y + (((D & 2) == 0) ? d : 0);
+            if (x2 < 0 || x2 >= MODEL_TEXTURE_SIZE || y2 < 0 || y2 >= MODEL_TEXTURE_SIZE) continue;
+            int pos2 = x2 + y2 * MODEL_TEXTURE_SIZE;
+            if ((newVal & 0xFF00) < (scratch[pos2] & 0xFF00)) {
+              scratch[pos2] = newVal;
+              queue.enqueue((byte) pos2);
+            }
+          }
+        }
+
+        for (int i = 0; i < MODEL_TEXTURE_SIZE * MODEL_TEXTURE_SIZE; i++) {
+          int d = Short.toUnsignedInt(scratch[i]);
+          if ((d & 0xFF00) != 0) {
+            int c = MemoryUtil.memGetInt(baseAddr + getOffset(bx, by, d & 0xFF) * 4) & 0x00FFFFFF;
+            MemoryUtil.memPutInt(baseAddr + getOffset(bx, by, i) * 4, c);
           }
         }
       }
-
-      while (!QUEUE.isEmpty()) {
-        int pos = Byte.toUnsignedInt(QUEUE.dequeueByte());
-        int x = pos & (MODEL_TEXTURE_SIZE - 1);
-        int y = pos / MODEL_TEXTURE_SIZE; // this better be turned into a bitshift
-        short newVal = (short) (SCRATCH[pos] + (short) 0x0100);
-        for (int D = 3; D != -1; D--) {
-          int d = 2 * (D & 1) - 1;
-          int x2 = x + (((D & 2) == 2) ? d : 0);
-          int y2 = y + (((D & 2) == 0) ? d : 0);
-          if (x2 < 0 || x2 >= MODEL_TEXTURE_SIZE || y2 < 0 || y2 >= MODEL_TEXTURE_SIZE) continue;
-          int pos2 = x2 + y2 * MODEL_TEXTURE_SIZE;
-          if ((newVal & 0xFF00) < (SCRATCH[pos2] & 0xFF00)) {
-            SCRATCH[pos2] = newVal;
-            QUEUE.enqueue((byte) pos2);
-          }
-        }
-      }
-
-      for (int i = 0; i < MODEL_TEXTURE_SIZE * MODEL_TEXTURE_SIZE; i++) {
-        int d = Short.toUnsignedInt(SCRATCH[i]);
-        if ((d & 0xFF00) != 0) {
-          int c = MemoryUtil.memGetInt(baseAddr + getOffset(bx, by, d & 0xFF) * 4) & 0x00FFFFFF;
-          MemoryUtil.memPutInt(baseAddr + getOffset(bx, by, i) * 4, c);
-        }
-      }
+    } finally {
+      queue.clear();
     }
   }
 

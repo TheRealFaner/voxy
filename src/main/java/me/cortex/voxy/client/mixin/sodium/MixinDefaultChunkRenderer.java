@@ -2,7 +2,6 @@ package me.cortex.voxy.client.mixin.sodium;
 
 import me.cortex.voxy.client.VoxyClient;
 import me.cortex.voxy.client.core.IVoxyRenderSystemHolder;
-import me.cortex.voxy.client.core.rendering.backend.RenderFrameStageState;
 import me.cortex.voxy.client.core.rendering.backend.RenderStage;
 import me.cortex.voxy.client.core.util.IrisUtil;
 import net.caffeinemc.mods.sodium.client.gl.device.CommandList;
@@ -94,10 +93,10 @@ public abstract class MixinDefaultChunkRenderer extends ShaderChunkRenderer {
       }
       renderer.beginVanillaRenderSectionSync();
       renderer.syncVanillaRenderSections(renderLists, renderPass.isTranslucent());
-      RenderFrameStageState.store(
+      renderer.storeFrame(
           renderer.runFrameStage(
               RenderStage.SODIUM_SOLID_SYNC,
-              RenderFrameStageState.currentFrame(),
+              renderer.currentFrame(),
               matrices,
               camera.x,
               camera.y,
@@ -109,13 +108,13 @@ public abstract class MixinDefaultChunkRenderer extends ShaderChunkRenderer {
 
     if (renderPass == DefaultTerrainRenderPasses.CUTOUT) {
       boolean shaderPackActive = IrisUtil.irisShaderPackEnabled();
-      var frame = RenderFrameStageState.currentFrame();
+      var frame = renderer.currentFrame();
       if (!vanillaTerrain) {
         renderer.syncVanillaRenderSections(renderLists, renderPass.isTranslucent());
         frame =
             renderer.runFrameStage(
                 RenderStage.SODIUM_CUTOUT_SYNC,
-                RenderFrameStageState.currentFrame(),
+                renderer.currentFrame(),
                 matrices,
                 camera.x,
                 camera.y,
@@ -134,9 +133,9 @@ public abstract class MixinDefaultChunkRenderer extends ShaderChunkRenderer {
               IrisUtil.IRIS_INSTALLED,
               shaderPackActive);
       if (shaderPackActive) {
-        RenderFrameStageState.store(frame);
+        renderer.storeFrame(frame);
       } else {
-        RenderFrameStageState.clear();
+        renderer.clearFrame();
       }
     }
   }
@@ -150,7 +149,7 @@ public abstract class MixinDefaultChunkRenderer extends ShaderChunkRenderer {
     }
     renderer.runFrameStage(
         RenderStage.TRANSLUCENT,
-        RenderFrameStageState.currentFrame(),
+        renderer.currentFrame(),
         matrices,
         camera.x,
         camera.y,
