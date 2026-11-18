@@ -1,7 +1,6 @@
 package me.cortex.voxy.client.mixin.sodium;
 
 import me.cortex.voxy.client.core.IVoxyRenderSystemHolder;
-import me.cortex.voxy.client.core.rendering.backend.RenderFrameStageState;
 import me.cortex.voxy.client.core.rendering.backend.RenderStage;
 import me.cortex.voxy.client.core.util.IrisUtil;
 import net.caffeinemc.mods.sodium.client.render.SodiumWorldRenderer;
@@ -61,7 +60,7 @@ public class MixinSodiumWorldRendererVS {
         var frame =
             renderer.runFrameStage(
                 RenderStage.OPAQUE,
-                RenderFrameStageState.currentFrame(),
+                renderer.currentFrame(),
                 matrices,
                 x,
                 y,
@@ -69,9 +68,9 @@ public class MixinSodiumWorldRendererVS {
                 IrisUtil.IRIS_INSTALLED,
                 shaderPackActive);
         if (shaderPackActive) {
-          RenderFrameStageState.store(frame);
+          renderer.storeFrame(frame);
         } else {
-          RenderFrameStageState.clear();
+          renderer.clearFrame();
         }
       }
     }
@@ -86,7 +85,7 @@ public class MixinSodiumWorldRendererVS {
     }
     renderer.runFrameStage(
         RenderStage.TRANSLUCENT,
-        RenderFrameStageState.currentFrame(),
+        renderer.currentFrame(),
         matrices,
         x,
         y,

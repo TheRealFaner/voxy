@@ -80,7 +80,17 @@ public class ChunkBoundRenderer {
   // Bind and render, changing as little gl state as possible so that the caller may configure how
   // it wants to render
   public void render(Viewport<?> viewport) {
-    if (!this.remQueue.isEmpty()) {
+    this.renderTo(viewport, true);
+  }
+
+  /**
+   * Rasterizes the known chunk bounds into {@code viewport}. When {@code mutateQueues} is false
+   * the pending add/remove queues are left untouched for the main pass (portal views;
+   * PORTAL_VIEW_API.md §4.1): the committed set is still cleared and rasterized so near-chunk
+   * masking stays correct, but a portal pass never consumes main-frame state.
+   */
+  public void renderTo(Viewport<?> viewport, boolean mutateQueues) {
+    if (mutateQueues && !this.remQueue.isEmpty()) {
       boolean wasEmpty = this.chunk2idx.isEmpty();
       this.remQueue.forEach(this::_remPos); // TODO: REPLACE WITH SCATTER COMPUTE
       this.remQueue.clear();
@@ -90,7 +100,12 @@ public class ChunkBoundRenderer {
       }
     }
 
-    if (this.chunk2idx.isEmpty() && this.addQueue.isEmpty()) return;
+    if (this.chunk2idx.isEmpty() && (this.addQueue.isEmpty() || !mutateQueues)) {
+      if (!mutateQueues) {
+        viewport.depthBoundingBuffer.clear(0);
+      }
+      return;
+    }
 
     viewport.depthBoundingBuffer.clear(0);
 
@@ -161,7 +176,7 @@ public class ChunkBoundRenderer {
       glEnable(GL_DEPTH_TEST);
     }
 
-    if (!this.addQueue.isEmpty()) {
+    if (mutateQueues && !this.addQueue.isEmpty()) {
       this.addQueue.forEach(this::_addPos); // TODO: REPLACE WITH SCATTER COMPUTE
       this.addQueue.clear();
       UploadStream.INSTANCE.commit();
@@ -237,6 +252,10 @@ public class ChunkBoundRenderer {
 
   public void reset() {
     this.chunk2idx.clear();
+    // Drop the pending queues too: otherwise the next renderTo() would re-add sections that were
+    // just reset away (or run _remPos against an emptied map).
+    this.addQueue.clear();
+    this.remQueue.clear();
   }
 
   public void free() {

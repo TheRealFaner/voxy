@@ -11,10 +11,15 @@ import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.common.world.WorldEngine;
 import me.cortex.voxy.commonImpl.VoxyCommon;
 import me.cortex.voxy.commonImpl.WorldIdentifier;
+import net.minecraft.client.Camera;
+import net.minecraft.client.DeltaTracker;
 import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.client.renderer.GameRenderer;
 import net.minecraft.client.renderer.LevelRenderer;
+import net.minecraft.client.renderer.LightTexture;
 import net.minecraft.world.level.Level;
 import org.jetbrains.annotations.Nullable;
+import org.joml.Matrix4f;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.Unique;
@@ -31,6 +36,43 @@ public abstract class MixinLevelRenderer implements IVoxyRenderSystemHolder {
   @Override
   public VoxyRenderSystem voxy$getRenderSystem() {
     return this.renderer;
+  }
+
+  @Override
+  public @Nullable Level voxy$getLevel() {
+    return this.level;
+  }
+
+  // D1 nested-render guard. IP renders portals by calling LevelRenderer.renderLevel again with
+  // Minecraft.levelRenderer swapped to the destination renderer, so every Voxy stage mixin fires a
+  // second time inside that call. Count the nesting so VoxyRenderSystem can refuse all main-style
+  // stages of a nested render that did not open a portal scope (bridge absent, failed or skipped).
+  // order = 50: this must run before the Iris capture mixin (order 100) on the same HEAD, otherwise
+  // a same-dimension nested render could overwrite the main view's captured parameters (F4).
+  @Inject(method = "renderLevel", at = @At("HEAD"), order = 50)
+  private void voxy$enterLevelRender(
+      DeltaTracker tickCounter,
+      boolean renderBlockOutline,
+      Camera camera,
+      GameRenderer gameRenderer,
+      LightTexture lightTexture,
+      Matrix4f positionMatrix,
+      Matrix4f projectionMatrix,
+      CallbackInfo ci) {
+    VoxyRenderSystem.enterLevelRender();
+  }
+
+  @Inject(method = "renderLevel", at = @At("RETURN"), order = 50)
+  private void voxy$exitLevelRender(
+      DeltaTracker tickCounter,
+      boolean renderBlockOutline,
+      Camera camera,
+      GameRenderer gameRenderer,
+      LightTexture lightTexture,
+      Matrix4f positionMatrix,
+      Matrix4f projectionMatrix,
+      CallbackInfo ci) {
+    VoxyRenderSystem.exitLevelRender();
   }
 
   @Inject(
@@ -101,7 +143,10 @@ public abstract class MixinLevelRenderer implements IVoxyRenderSystemHolder {
       return;
     }
     try {
-      this.renderer = new VoxyRenderSystem(world, instance.getServiceManager());
+      // D1: remember which dimension this system renders (same level the WorldEngine came from),
+      // so VoxyRenderSystem can tell the home system from IP's synthetic dimension renderers.
+      this.renderer =
+          new VoxyRenderSystem(world, instance.getServiceManager(), this.level.dimension());
     } catch (RuntimeException e) {
       if (IrisUtil.irisShaderPackEnabled()) {
         IrisUtil.disableIrisShaders();

@@ -18,15 +18,16 @@ public class TimingStatistics {
     }
 
     private void reset() {
-      if (this.running) {
-        throw new IllegalStateException();
+      // Nested portal passes may reset while an outer sampler is still running.
+      if (!this.running) {
+        this.runtime = 0;
       }
-      this.runtime = 0;
     }
 
     public void start() {
       if (this.running) {
-        throw new IllegalStateException();
+        // Already sampling (nested portal pass); keep the outer interval.
+        return;
       }
       this.running = true;
       this.timestamp = System.nanoTime();
@@ -34,7 +35,9 @@ public class TimingStatistics {
 
     public void stop() {
       if (!this.running) {
-        throw new IllegalStateException();
+        // stop() without start() happens for nested portal OPAQUE; ignore it instead of
+        // latched GL46 portal views being disabled for the whole session.
+        return;
       }
       this.running = false;
       this.runtime += System.nanoTime() - this.timestamp;

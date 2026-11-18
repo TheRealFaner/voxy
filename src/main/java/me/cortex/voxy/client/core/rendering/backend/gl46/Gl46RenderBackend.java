@@ -12,9 +12,12 @@ import static org.lwjgl.opengl.GL30C.*;
 import static org.lwjgl.opengl.GL33.glBindSampler;
 import static org.lwjgl.opengl.GL43.GL_SHADER_STORAGE_BUFFER;
 import static org.lwjgl.opengl.GL43C.GL_SHADER_STORAGE_BUFFER_BINDING;
+import static org.lwjgl.opengl.GL45C.glGetNamedFramebufferAttachmentParameteri;
 
 import com.mojang.blaze3d.platform.GlConst;
 import com.mojang.blaze3d.platform.GlStateManager;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import me.cortex.voxy.client.TimingStatistics;
@@ -29,6 +32,9 @@ import me.cortex.voxy.client.core.rendering.Viewport;
 import me.cortex.voxy.client.core.rendering.ViewportSelector;
 import me.cortex.voxy.client.core.rendering.backend.BackendContext;
 import me.cortex.voxy.client.core.rendering.backend.NoopRenderFrame;
+import me.cortex.voxy.client.core.rendering.backend.PortalClipPlane;
+import me.cortex.voxy.client.core.rendering.backend.PortalConfig;
+import me.cortex.voxy.client.core.rendering.backend.PortalViewOptions;
 import me.cortex.voxy.client.core.rendering.backend.RenderBackendId;
 import me.cortex.voxy.client.core.rendering.backend.RenderFrame;
 import me.cortex.voxy.client.core.rendering.backend.RenderFrameContext;
@@ -37,6 +43,7 @@ import me.cortex.voxy.client.core.rendering.backend.RenderStage;
 import me.cortex.voxy.client.core.rendering.backend.RenderStageContext;
 import me.cortex.voxy.client.core.rendering.backend.VoxyRenderBackend;
 import me.cortex.voxy.client.core.rendering.backend.gl46.pipeline.AbstractRenderPipeline;
+import me.cortex.voxy.client.core.rendering.backend.gl46.pipeline.IrisVoxyRenderPipeline;
 import me.cortex.voxy.client.core.rendering.backend.gl46.pipeline.RenderPipelineFactory;
 import me.cortex.voxy.client.core.rendering.backend.gl46.section.AbstractSectionRenderer;
 import me.cortex.voxy.client.core.rendering.backend.gl46.section.UsesMeshlets;
@@ -84,6 +91,23 @@ public final class Gl46RenderBackend implements VoxyRenderBackend {
   private final AbstractRenderPipeline pipeline;
 
   private RenderFrameMatrices lastFrameMatrices = RenderFrameMatrices.identity();
+
+  // Portal LOD state (PORTAL_VIEW_API.md §4.2-§4.5). Viewports are created lazily, one per open
+  // depth, from the section renderer's own factory; they never enter the shared extraViewports
+  // map and the main view's viewport is never touched by a portal pass.
+  private final PortalConfig portalConfig = PortalConfig.fromSystemProperties();
+  private final ArrayDeque<Gl46PortalView> portalViews = new ArrayDeque<>();
+  private final List<Gl46Viewport<?>> portalViewports = new ArrayList<>();
+  private final boolean irisPipeline;
+  private boolean portalFailureLatched;
+  private boolean loggedIrisPortalDegrade;
+  private boolean loggedPortalDegrade;
+  private boolean loggedPortalRectMismatch;
+  private int lastMainViewportWidth = -1;
+  private int lastMainViewportHeight = -1;
+  // D3 `voxy.portal.serviceForeign`: host frame id of the last serviced portal pass, so a foreign
+  // system is serviced at most once per host frame (§7.4).
+  private long lastServicedHostFrame = Long.MIN_VALUE;
 
   private static AbstractSectionRenderer.Factory<?, ? extends GeometryData>
       getRenderBackendFactory() {
@@ -148,6 +172,7 @@ public final class Gl46RenderBackend implements VoxyRenderBackend {
     this.pipeline =
         RenderPipelineFactory.createPipeline(
             this.nodeManager, this.nodeCleaner, this.traversal, this::frexStillHasWork);
+    this.irisPipeline = this.pipeline instanceof IrisVoxyRenderPipeline;
     this.pipeline.setupExtraModelBakeryData(this.modelService); // Configure the model service
 
     // Late stage traversal compile for shaders with taa
@@ -215,6 +240,13 @@ public final class Gl46RenderBackend implements VoxyRenderBackend {
   @Override
   public RenderFrame runFrameStage(
       RenderStage stage, RenderStageContext context, RenderFrame frame) {
+    // D2 owner check: a frame created by another backend/system is never advanced here. Dropping
+    // it makes OPAQUE/VIEWPORT_SETUP build a fresh frame for this system instead of drawing (or
+    // storing) a foreign system's frame.
+    frame = this.acceptFrame(frame);
+    if (!this.portalViews.isEmpty()) {
+      return this.runPortalFrameStage(stage, context, frame);
+    }
     return switch (stage) {
       // Iris beginLevelRendering setup point: always (re)creates the frame, matching the
       // pre-abstraction CAPTURED_VIEWPORT_PARAMETERS.apply() behaviour.
@@ -236,6 +268,182 @@ public final class Gl46RenderBackend implements VoxyRenderBackend {
     };
   }
 
+  /**
+   * D2: only frames created by this backend instance may be advanced. A {@link Gl46Frame} from
+   * another {@code VoxyRenderSystem}'s backend is replaced with {@code null}, which the stage
+   * switch treats as "no frame yet" (fresh {@code setupFrame}), never as a no-op draw of another
+   * system's viewport.
+   */
+  private RenderFrame acceptFrame(RenderFrame frame) {
+    if (frame instanceof Gl46Frame gl46Frame && gl46Frame.owner() != this) {
+      return null;
+    }
+    return frame;
+  }
+
+  @Override
+  public boolean supportsPortalViews() {
+    // Iris stays degraded (§4.7): IrisVoxyRenderPipeline binds the pack's draw targets once at
+    // construction, and a portal-scoped target set is out of scope for S2.
+    return !this.irisPipeline
+        && !this.portalFailureLatched
+        && this.portalConfig.allowsBackend(RenderBackendId.GL46);
+  }
+
+  @Override
+  public int portalViewDepthLimit() {
+    return this.supportsPortalViews() ? this.portalConfig.maxDepth() : 0;
+  }
+
+  @Override
+  public boolean beginPortalView(PortalViewOptions options) {
+    return this.beginPortalView(options, false);
+  }
+
+  @Override
+  public boolean beginPortalView(PortalViewOptions options, boolean service) {
+    if (options == null) {
+      options = PortalViewOptions.disabled();
+    }
+    if (!this.supportsPortalViews() || this.portalViews.size() >= this.portalViewDepthLimit()) {
+      return false;
+    }
+    if (IrisUtil.irisShaderPackEnabled()) {
+      if (!this.loggedIrisPortalDegrade) {
+        this.loggedIrisPortalDegrade = true;
+        Logger.warn(
+            "Voxy portal LOD disabled while an Iris shader pack is active; portal passes are"
+                + " suppressed");
+      }
+      return false;
+    }
+    try {
+      Gl46PortalView view =
+          new Gl46PortalView(this.getPortalViewport(this.portalViews.size()), options, service);
+      this.portalViews.push(view);
+      return true;
+    } catch (RuntimeException e) {
+      this.latchPortalFailure("beginPortalView", e);
+      return false;
+    }
+  }
+
+  @Override
+  public void endPortalView() {
+    // The viewport stays pooled for reuse at the same depth (§3.7/§4.2). Idempotent.
+    this.portalViews.pollFirst();
+  }
+
+  @Override
+  public boolean isPortalViewActive() {
+    return !this.portalViews.isEmpty();
+  }
+
+  /**
+   * Portal stage routing (PORTAL_VIEW_API.md §3.5): only OPAQUE draws; every other stage is
+   * ignored, so the nested render cannot submit a main-style frame, reconfigure the main viewport,
+   * or service render-distance/model work.
+   */
+  private RenderFrame runPortalFrameStage(
+      RenderStage stage, RenderStageContext context, RenderFrame frame) {
+    if (stage != RenderStage.OPAQUE) {
+      return frame;
+    }
+    Gl46PortalView view = this.portalViews.peek();
+    if (view == null || !view.supported) {
+      return frame;
+    }
+    if (IrisUtil.irisShadowActive()) {
+      return frame;
+    }
+    try {
+      if (context.shaderPackActive()) {
+        this.degradePortalView(view, "an Iris shader pack became active");
+        return frame;
+      }
+      RenderFrameContext frameContext = context.frameContext();
+      if (!isSupportedPortalTarget(frameContext, view.options)) {
+        this.degradePortalView(
+            view, "unsupported target framebuffer " + frameContext.sourceFramebuffer());
+        return frame;
+      }
+      this.configureViewport(
+          view.viewport,
+          frameContext,
+          view.options.hasClipPlane() ? view.options.clipPlane() : null,
+          false);
+      this.checkPortalRect(view.viewport);
+      // D3: only a foreign system's pass may service (uploads/models/recenter); a home-system
+      // portal pass never does (F10). `voxy.portal.serviceForeign` gates the foreign case and the
+      // host frame id bounds it to once per host frame.
+      boolean service = this.shouldServicePortalView(view);
+      this.renderOpaqueInternal(view.viewport, service, true);
+      if (service) {
+        this.lastServicedHostFrame = view.options.hostFrameId();
+      }
+    } catch (RuntimeException e) {
+      // Never crash the game from a portal path: disable portal LOD for the session (§10/§11).
+      view.supported = false;
+      this.latchPortalFailure("portal OPAQUE", e);
+    }
+    return frame;
+  }
+
+  /**
+   * D3 `voxy.portal.serviceForeign`/§7.4: a foreign system only renders through portal passes, so
+   * its uploads, model ticks and LOD recenter must run from those passes; at most once per host
+   * frame id. A host frame id of 0 means the adapter could not identify the frame, in which case
+   * each pass services (still bounded by the number of portal passes in that frame).
+   */
+  private boolean shouldServicePortalView(Gl46PortalView view) {
+    if (!view.service || !this.portalConfig.serviceForeign()) {
+      return false;
+    }
+    long hostFrameId = view.options.hostFrameId();
+    return hostFrameId == 0 || hostFrameId != this.lastServicedHostFrame;
+  }
+
+  private Gl46Viewport<?> getPortalViewport(int depth) {
+    while (this.portalViewports.size() <= depth) {
+      this.portalViewports.add(this.viewportSelector.createViewport());
+    }
+    return this.portalViewports.get(depth);
+  }
+
+  private void degradePortalView(Gl46PortalView view, String reason) {
+    view.supported = false;
+    if (!this.loggedPortalDegrade) {
+      this.loggedPortalDegrade = true;
+      Logger.warn("Voxy portal LOD degraded (no LOD for this pass): " + reason);
+    }
+  }
+
+  private void latchPortalFailure(String where, RuntimeException error) {
+    if (this.portalFailureLatched) {
+      return;
+    }
+    this.portalFailureLatched = true;
+    // Keep the open pass stack intact: VoxyRenderSystem still balances endPortalView, and while a
+    // pass is open its stages must keep routing to the portal path (which now no-ops).
+    Logger.error(
+        "Voxy GL46 portal views disabled for this session after failure in " + where, error);
+  }
+
+  /**
+   * S2 target support (§4.3/§4.5): only a non-default framebuffer with a depth attachment (IP's
+   * framebuffer renderer). The shared stencil target is an S4 feature and is rejected here.
+   */
+  private static boolean isSupportedPortalTarget(
+      RenderFrameContext context, PortalViewOptions options) {
+    int framebuffer = context.sourceFramebuffer();
+    if (framebuffer == 0 || options.hasStencilGate() || !glIsFramebuffer(framebuffer)) {
+      return false;
+    }
+    return glGetNamedFramebufferAttachmentParameteri(
+            framebuffer, GL_DEPTH_ATTACHMENT, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE)
+        != GL_NONE;
+  }
+
   @Override
   public RenderFrame setupFrame(RenderFrameContext context) {
     var viewport = this.getViewport();
@@ -243,6 +451,26 @@ public final class Gl46RenderBackend implements VoxyRenderBackend {
       return new NoopRenderFrame(RenderBackendId.GL46);
     }
 
+    this.configureViewport(viewport, context, null, true);
+    this.lastMainViewportWidth = viewport.width;
+    this.lastMainViewportHeight = viewport.height;
+
+    this.lastFrameMatrices =
+        new RenderFrameMatrices(viewport.MVP, viewport.modelView, viewport.projection);
+    return new Gl46Frame(this, viewport);
+  }
+
+  /**
+   * Configures a viewport from a host frame context (PORTAL_VIEW_API.md §4.1). The main path runs
+   * the previous {@code setupFrame} statements in the same order; the portal path reuses them on
+   * its own pooled viewport, so the main viewport, matrices and {@code lastFrameMatrices} are
+   * never touched.
+   */
+  private void configureViewport(
+      Gl46Viewport<?> viewport,
+      RenderFrameContext context,
+      PortalClipPlane clipPlane,
+      boolean mainFrame) {
     double cameraX = context.cameraX();
     double cameraY = context.cameraY();
     double cameraZ = context.cameraZ();
@@ -275,21 +503,72 @@ public final class Gl46RenderBackend implements VoxyRenderBackend {
         .setScreenSize(width, height)
         .update();
 
+    // S2 is culling-only (no oblique projection, §4.6/§11): overwrite the far plane, which the
+    // traversal shader now tests, with the camera-relative clip plane. The main frame always
+    // keeps its far plane.
+    if (!mainFrame && clipPlane != null && clipPlane.isValid()) {
+      applyPortalClipPlane(viewport, clipPlane);
+    }
+
     if (VoxyClient.getOcclusionDebugState() == 0) {
       viewport.frameId++;
     }
+  }
 
-    this.lastFrameMatrices =
-        new RenderFrameMatrices(viewport.MVP, viewport.modelView, viewport.projection);
-    return new Gl46Frame(viewport);
+  /**
+   * Writes the camera-relative plane into the unused far-plane slot (§4.6, Appendix A.1):
+   * {@code n' = n}, {@code d' = -dot(n, planePoint - camera)}; the shader keeps nodes where
+   * {@code dot(n', pos) + d' >= 0}.
+   */
+  private static void applyPortalClipPlane(Gl46Viewport<?> viewport, PortalClipPlane clipPlane) {
+    double d =
+        -(clipPlane.nx() * (clipPlane.px() - viewport.cameraX)
+            + clipPlane.ny() * (clipPlane.py() - viewport.cameraY)
+            + clipPlane.nz() * (clipPlane.pz() - viewport.cameraZ));
+    viewport
+        .frustumPlanes[5]
+        .set((float) clipPlane.nx(), (float) clipPlane.ny(), (float) clipPlane.nz(), (float) d);
+  }
+
+  private void checkPortalRect(Gl46Viewport<?> portalViewport) {
+    if (this.loggedPortalRectMismatch || this.lastMainViewportWidth <= 0) {
+      return;
+    }
+    if (portalViewport.width == this.lastMainViewportWidth
+        && portalViewport.height == this.lastMainViewportHeight) {
+      return;
+    }
+    this.loggedPortalRectMismatch = true;
+    Logger.warn(
+        "Voxy portal target rect "
+            + portalViewport.width
+            + "x"
+            + portalViewport.height
+            + " differs from the main viewport "
+            + this.lastMainViewportWidth
+            + "x"
+            + this.lastMainViewportHeight
+            + "; the render pipeline framebuffer will be resized every frame");
   }
 
   @Override
   public void renderOpaque(RenderFrame frame) {
-    if (!(frame instanceof Gl46Frame gl46Frame)) {
+    // D2 owner check: never draw a frame created by another backend/system.
+    if (!(frame instanceof Gl46Frame gl46Frame) || gl46Frame.owner() != this) {
       return;
     }
-    Gl46Viewport<?> viewport = gl46Frame.viewport();
+    this.renderOpaqueInternal(gl46Frame.viewport(), true, false);
+  }
+
+  /**
+   * Shared setup + draw for the main frame and portal passes (PORTAL_VIEW_API.md §4.1). The main
+   * path ({@code service=true, portal=false}) is the previous {@code renderOpaque} statement for
+   * statement. A portal pass ({@code portal=true}) preserves the host stencil/scissor state (§4.4)
+   * and skips the timing/service block unless it is a serviced foreign system: D3's {@code
+   * voxy.portal.serviceForeign} lets a foreign system run uploads/model ticks/recenter once per
+   * host frame (§7.4), while a home-system portal pass never does (F10).
+   */
+  private void renderOpaqueInternal(Gl46Viewport<?> viewport, boolean service, boolean portal) {
     if (viewport == null) {
       return;
     }
@@ -297,11 +576,14 @@ public final class Gl46RenderBackend implements VoxyRenderBackend {
       return; // Only render on valid viewport
     }
 
-    TimingStatistics.resetSamplers();
-
-    TimingStatistics.all.start();
+    if (service) {
+      TimingStatistics.resetSamplers();
+      TimingStatistics.all.start();
+    }
     GPUTiming.INSTANCE.marker(); // Start marker
-    TimingStatistics.main.start();
+    if (service) {
+      TimingStatistics.main.start();
+    }
 
     // TODO: optimize
     int[] oldBufferBindings = new int[10];
@@ -322,45 +604,61 @@ public final class Gl46RenderBackend implements VoxyRenderBackend {
           "Cannot use the default framebuffer as cannot source from it");
     }
 
+    // The host may keep a scissor rect for the portal shape; the internal pipeline passes assume a
+    // full-target viewport, so disable it for the draw and restore the host state afterwards. This
+    // applies to every portal pass, including a serviced foreign one; the main path keeps its
+    // historical behavior (no capture).
+    PortalGlState hostState = portal ? PortalGlState.capture() : null;
+    if (hostState != null) {
+      glDisable(GL_SCISSOR_TEST);
+    }
+
     this.pipeline.preSetup(viewport);
 
-    TimingStatistics.E.start();
+    if (service) {
+      TimingStatistics.E.start();
+    }
     if ((!VoxyClient.disableSodiumChunkRender()) && !IrisUtil.irisShadowActive()) {
-      this.chunkBoundRenderer.render(viewport);
+      // A portal pass must not mutate the chunk-bound queues that the main frame owns (§4.1).
+      this.chunkBoundRenderer.renderTo(viewport, service);
     } else {
       viewport.depthBoundingBuffer.clear(0);
     }
-    TimingStatistics.E.stop();
+    if (service) {
+      TimingStatistics.E.stop();
+    }
 
     GPUTiming.INSTANCE.marker();
     // The entire rendering pipeline (excluding the chunkbound thing)
     this.pipeline.runPipeline(viewport, boundFB, dims[2], dims[3]);
     GPUTiming.INSTANCE.marker();
 
-    TimingStatistics.main.stop();
-    TimingStatistics.postDynamic.start();
+    if (service) {
+      TimingStatistics.main.stop();
+      TimingStatistics.postDynamic.start();
 
-    PrintfDebugUtil.tick();
+      PrintfDebugUtil.tick();
 
-    // As much dynamic runtime stuff here
-    {
-      // Tick upload stream (this is ok to do here as upload ticking is just memory management)
-      UploadStream.INSTANCE.tick();
+      // As much dynamic runtime stuff here
+      {
+        // Tick upload stream (this is ok to do here as upload ticking is just memory management)
+        UploadStream.INSTANCE.tick();
 
-      while (this.renderDistanceTracker.setCenterAndProcess(viewport.cameraX, viewport.cameraZ)
-          && VoxyClient.isFrexActive())
-        ; // While FF is active, run until everything is processed
-      TimingStatistics.H.start();
-      // Done here as is allows less gl state resetup
-      do {
-        this.modelService.tick(900_000);
-      } while (VoxyClient.isFrexActive() && !this.modelService.areQueuesEmpty());
-      TimingStatistics.H.stop();
+        while (this.renderDistanceTracker.setCenterAndProcess(viewport.cameraX, viewport.cameraZ)
+            && VoxyClient.isFrexActive())
+          ; // While FF is active, run until everything is processed
+        TimingStatistics.H.start();
+        // Done here as is allows less gl state resetup
+        do {
+          this.modelService.tick(900_000);
+        } while (VoxyClient.isFrexActive() && !this.modelService.areQueuesEmpty());
+        TimingStatistics.H.stop();
+      }
+      GPUTiming.INSTANCE.marker();
+      TimingStatistics.postDynamic.stop();
+
+      GPUTiming.INSTANCE.tick();
     }
-    GPUTiming.INSTANCE.marker();
-    TimingStatistics.postDynamic.stop();
-
-    GPUTiming.INSTANCE.tick();
 
     glBindFramebuffer(GlConst.GL_FRAMEBUFFER, oldFB);
     glViewport(dims[0], dims[1], dims[2], dims[3]);
@@ -388,7 +686,13 @@ public final class Gl46RenderBackend implements VoxyRenderBackend {
       }
     }
 
-    TimingStatistics.all.stop();
+    if (hostState != null) {
+      hostState.restore();
+    }
+
+    if (service) {
+      TimingStatistics.all.stop();
+    }
   }
 
   public static float getRenderDistance() {
@@ -546,6 +850,14 @@ public final class Gl46RenderBackend implements VoxyRenderBackend {
 
       this.chunkBoundRenderer.free();
 
+      // Release portal viewports (HiZ + MDIC buffers) before the shared selector; an open pass at
+      // shutdown is dropped without touching GL state (§7.5).
+      this.portalViews.clear();
+      for (Gl46Viewport<?> viewport : this.portalViewports) {
+        viewport.delete();
+      }
+      this.portalViewports.clear();
+
       this.viewportSelector.free();
     } catch (Exception e) {
       Logger.error("Error shutting down renderer components", e);
@@ -559,5 +871,93 @@ public final class Gl46RenderBackend implements VoxyRenderBackend {
 
     Logger.info("Flushing download stream");
     DownloadStream.INSTANCE.flushWaitClear();
+  }
+
+  /** One open portal pass; its viewport is pooled per depth and reused across passes (§4.2). */
+  private static final class Gl46PortalView {
+    private final Gl46Viewport<?> viewport;
+    private final PortalViewOptions options;
+    // D3: true when this pass belongs to a foreign system and may run the once-per-frame service
+    // work (uploads/models/recenter) during its OPAQUE draw.
+    private final boolean service;
+    private boolean supported = true;
+
+    private Gl46PortalView(Gl46Viewport<?> viewport, PortalViewOptions options, boolean service) {
+      this.viewport = viewport;
+      this.options = options;
+      this.service = service;
+    }
+  }
+
+  /**
+   * Host-owned GL state a portal draw must not leave altered (§4.4): stencil, scissor and
+   * (defensively) the clip-distance enables. Voxy never enables clip distances itself.
+   */
+  private static final class PortalGlState {
+    private final boolean stencilTest;
+    private final int stencilFunc;
+    private final int stencilRef;
+    private final int stencilValueMask;
+    private final int stencilWriteMask;
+    private final int stencilFail;
+    private final int stencilDepthFail;
+    private final int stencilDepthPass;
+    private final boolean scissorTest;
+    private final int[] scissorBox = new int[4];
+    private final int clipDistanceMask;
+
+    private PortalGlState() {
+      this.stencilTest = GL11.glIsEnabled(GL11.GL_STENCIL_TEST);
+      this.stencilFunc = GL11.glGetInteger(GL11.GL_STENCIL_FUNC);
+      this.stencilRef = GL11.glGetInteger(GL11.GL_STENCIL_REF);
+      this.stencilValueMask = GL11.glGetInteger(GL11.GL_STENCIL_VALUE_MASK);
+      this.stencilWriteMask = GL11.glGetInteger(GL11.GL_STENCIL_WRITEMASK);
+      this.stencilFail = GL11.glGetInteger(GL11.GL_STENCIL_FAIL);
+      this.stencilDepthFail = GL11.glGetInteger(GL11.GL_STENCIL_PASS_DEPTH_FAIL);
+      this.stencilDepthPass = GL11.glGetInteger(GL11.GL_STENCIL_PASS_DEPTH_PASS);
+
+      this.scissorTest = GL11.glIsEnabled(GL11.GL_SCISSOR_TEST);
+      GL11.glGetIntegerv(GL11.GL_SCISSOR_BOX, this.scissorBox);
+
+      int clipDistances = 0;
+      for (int i = 0; i < 8; i++) {
+        if (GL11.glIsEnabled(GL_CLIP_DISTANCE0 + i)) {
+          clipDistances |= 1 << i;
+        }
+      }
+      this.clipDistanceMask = clipDistances;
+    }
+
+    private static PortalGlState capture() {
+      return new PortalGlState();
+    }
+
+    private void restore() {
+      if (this.stencilTest) {
+        glEnable(GL_STENCIL_TEST);
+      } else {
+        glDisable(GL_STENCIL_TEST);
+      }
+      GL11.glStencilFunc(this.stencilFunc, this.stencilRef, this.stencilValueMask);
+      GL11.glStencilMask(this.stencilWriteMask);
+      GL11.glStencilOp(this.stencilFail, this.stencilDepthFail, this.stencilDepthPass);
+
+      if (this.scissorTest) {
+        glEnable(GL_SCISSOR_TEST);
+      } else {
+        glDisable(GL_SCISSOR_TEST);
+      }
+      GL11.glScissor(
+          this.scissorBox[0], this.scissorBox[1], this.scissorBox[2], this.scissorBox[3]);
+
+      for (int i = 0; i < 8; i++) {
+        int clipDistance = GL_CLIP_DISTANCE0 + i;
+        if ((this.clipDistanceMask & (1 << i)) != 0) {
+          glEnable(clipDistance);
+        } else {
+          glDisable(clipDistance);
+        }
+      }
+    }
   }
 }

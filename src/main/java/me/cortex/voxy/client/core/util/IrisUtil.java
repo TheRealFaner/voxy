@@ -48,8 +48,6 @@ public class IrisUtil {
     }
   }
 
-  public static CapturedViewportParameters CAPTURED_VIEWPORT_PARAMETERS;
-
   // Render-thread-only cache for the strict-bridge shader bindings. Keyed by (pipeline, patch)
   // identity so the value suppliers - in particular VoxyUniforms' PreviousMat (vx*Prev) - persist
   // and accumulate across frames instead of being rebuilt (and reset to identity) every frame. See
@@ -64,10 +62,6 @@ public class IrisUtil {
       true; // System.getProperty("voxy.enableExperimentalIrisPipeline",
 
   // "false").equalsIgnoreCase("true");
-
-  public static CapturedViewportParameters getCapturedOrFallbackViewportParameters() {
-    return CAPTURED_VIEWPORT_PARAMETERS;
-  }
 
   private static boolean irisShadowActive0() {
     return ShadowRenderer.ACTIVE;

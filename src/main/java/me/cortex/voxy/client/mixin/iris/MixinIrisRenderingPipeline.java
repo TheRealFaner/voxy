@@ -1,7 +1,6 @@
 package me.cortex.voxy.client.mixin.iris;
 
 import me.cortex.voxy.client.core.IVoxyRenderSystemHolder;
-import me.cortex.voxy.client.core.rendering.backend.RenderFrameStageState;
 import me.cortex.voxy.client.core.rendering.backend.RenderStage;
 import me.cortex.voxy.client.core.util.IrisUtil;
 import me.cortex.voxy.client.iris.IrisShaderPatch;
@@ -99,15 +98,17 @@ public class MixinIrisRenderingPipeline implements VoxyPatchDataAccess, IrisVoxy
   // The gl46 backend ignores this stage (its setup runs at VIEWPORT_SETUP below).
   @Inject(method = "beginLevelRendering", at = @At("HEAD"), remap = false)
   private void voxy$injectFrameBegin(CallbackInfo ci) {
-    var parameters = IrisUtil.getCapturedOrFallbackViewportParameters();
+    var renderer =
+        ((IVoxyRenderSystemHolder) Minecraft.getInstance().levelRenderer).voxy$getRenderSystem();
+    if (renderer == null) {
+      return;
+    }
+    var parameters = renderer.capturedViewportParameters();
     if (parameters != null) {
-      var renderer =
-          ((IVoxyRenderSystemHolder) Minecraft.getInstance().levelRenderer).voxy$getRenderSystem();
-      if (renderer != null) {
-        RenderFrameStageState.store(
-            parameters.runStage(
-                renderer, RenderStage.FRAME_BEGIN, RenderFrameStageState.currentFrame()));
-      }
+      // Per-renderer frame state (D3): the renderer resolved above is the one IP swapped in for a
+      // nested portal render, so its frame never crosses into the main frame.
+      renderer.storeFrame(
+          parameters.runStage(renderer, RenderStage.FRAME_BEGIN, renderer.currentFrame()));
     }
   }
 
@@ -120,14 +121,15 @@ public class MixinIrisRenderingPipeline implements VoxyPatchDataAccess, IrisVoxy
               shift = At.Shift.BEFORE),
       remap = false)
   private void voxy$injectViewportSetup(CallbackInfo ci) {
-    if (IrisUtil.CAPTURED_VIEWPORT_PARAMETERS != null) {
-      var renderer =
-          ((IVoxyRenderSystemHolder) Minecraft.getInstance().levelRenderer).voxy$getRenderSystem();
-      if (renderer != null) {
-        RenderFrameStageState.store(
-            IrisUtil.CAPTURED_VIEWPORT_PARAMETERS.runStage(
-                renderer, RenderStage.VIEWPORT_SETUP, RenderFrameStageState.currentFrame()));
-      }
+    var renderer =
+        ((IVoxyRenderSystemHolder) Minecraft.getInstance().levelRenderer).voxy$getRenderSystem();
+    if (renderer == null) {
+      return;
+    }
+    var parameters = renderer.capturedViewportParameters();
+    if (parameters != null) {
+      renderer.storeFrame(
+          parameters.runStage(renderer, RenderStage.VIEWPORT_SETUP, renderer.currentFrame()));
     }
   }
 
@@ -135,17 +137,18 @@ public class MixinIrisRenderingPipeline implements VoxyPatchDataAccess, IrisVoxy
   // Run after that copy so GL41Metal's near-depth mask samples current-frame depth.
   @Inject(method = "beginHand", at = @At("RETURN"), remap = false)
   private void voxy$injectPreTranslucentBridge(CallbackInfo ci) {
-    var parameters = IrisUtil.getCapturedOrFallbackViewportParameters();
+    var renderer =
+        ((IVoxyRenderSystemHolder) Minecraft.getInstance().levelRenderer).voxy$getRenderSystem();
+    if (renderer == null) {
+      return;
+    }
+    var parameters = renderer.capturedViewportParameters();
     if (parameters != null) {
-      var renderer =
-          ((IVoxyRenderSystemHolder) Minecraft.getInstance().levelRenderer).voxy$getRenderSystem();
-      if (renderer != null) {
-        parameters.runStage(
-            renderer,
-            RenderStage.PRE_TRANSLUCENT,
-            RenderFrameStageState.consume(),
-            IrisUtil.captureShaderPatchBridgePayload((IrisRenderingPipeline) (Object) this));
-      }
+      parameters.runStage(
+          renderer,
+          RenderStage.PRE_TRANSLUCENT,
+          renderer.consumeFrame(),
+          IrisUtil.captureShaderPatchBridgePayload((IrisRenderingPipeline) (Object) this));
     }
   }
 
@@ -165,18 +168,19 @@ public class MixinIrisRenderingPipeline implements VoxyPatchDataAccess, IrisVoxy
               shift = At.Shift.AFTER),
       remap = false)
   private void voxy$injectTranslucentBridge(CallbackInfo ci) {
-    var parameters = IrisUtil.getCapturedOrFallbackViewportParameters();
+    var renderer =
+        ((IVoxyRenderSystemHolder) Minecraft.getInstance().levelRenderer).voxy$getRenderSystem();
+    if (renderer == null) {
+      return;
+    }
+    var parameters = renderer.capturedViewportParameters();
     if (parameters != null) {
-      var renderer =
-          ((IVoxyRenderSystemHolder) Minecraft.getInstance().levelRenderer).voxy$getRenderSystem();
-      if (renderer != null) {
-        parameters.runStage(
-            renderer,
-            RenderStage.TRANSLUCENT,
-            RenderFrameStageState.currentFrame(),
-            IrisUtil.captureTranslucentShaderPatchBridgePayload(
-                (IrisRenderingPipeline) (Object) this));
-      }
+      parameters.runStage(
+          renderer,
+          RenderStage.TRANSLUCENT,
+          renderer.currentFrame(),
+          IrisUtil.captureTranslucentShaderPatchBridgePayload(
+              (IrisRenderingPipeline) (Object) this));
     }
   }
 

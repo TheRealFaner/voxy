@@ -22,6 +22,14 @@ public class ViewportSelector<T extends Viewport<?>> {
     this.defaultViewport = viewportCreator.get();
   }
 
+  /**
+   * Creates a new, independently-owned viewport (PORTAL_VIEW_API.md §4.2). Portal passes pool
+   * these outside the {@link #extraViewports} map, which has no eviction.
+   */
+  public T createViewport() {
+    return this.creator.get();
+  }
+
   private T getOrCreate(Object holder) {
     return this.extraViewports.computeIfAbsent(holder, a -> this.creator.get());
   }
