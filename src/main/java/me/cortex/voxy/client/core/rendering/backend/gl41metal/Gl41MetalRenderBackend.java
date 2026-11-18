@@ -404,6 +404,15 @@ public final class Gl41MetalRenderBackend implements VoxyRenderBackend {
   }
 
   @Override
+  public void onSectionDisposed(long sectionPos) {
+    // Intentional no-op: DistantChunkBoundRenderer's removal is already immediate by design (its
+    // javadoc mandates it - gl41metal distant LOD is persistently resident, so the bound must stop
+    // clipping the instant near water unloads), and the disposal reaches it through the same
+    // onSectionRemoved call via the updateSectionInfo(section, null) setInfo redirect
+    // (onSectionRenderStateChanged with present=false). There is nothing to accelerate.
+  }
+
+  @Override
   public void close() {
     Logger.info("Shutting down Voxy GL41Metal drawlist backend");
     this.dropHeldTranslucentSlot();

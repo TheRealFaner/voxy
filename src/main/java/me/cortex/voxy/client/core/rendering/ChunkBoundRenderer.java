@@ -63,7 +63,6 @@ public class ChunkBoundRenderer {
       this.delayedRemovalQueue[i] = new LongArrayList();
     }
 
-
     String vert = ShaderLoader.parse("voxy:chunkoutline/outline.vsh");
     String taa = pipeline.taaFunction("getTAA");
     if (taa != null) {
@@ -102,6 +101,11 @@ public class ChunkBoundRenderer {
   public void removeSection(long pos) {
     if (this.addQueue.remove(pos)) {
       return; // Was a pending add that never became live; just cancel it
+    }
+    // An immediate removal (section disposal) has already queued this section; the delayed path
+    // must not re-park it or a second, spurious removal would hit remQueue 12 frames later.
+    if (this.remQueue.contains(pos)) {
+      return;
     }
     // Only sections actually being masked need removing. Sodium drives this from several places
     // (build-state change and section disposal), so ignore anything not currently tracked to
@@ -145,16 +149,18 @@ public class ChunkBoundRenderer {
   }
 
   /**
-   * Rasterizes the known chunk bounds into {@code viewport}. When {@code mutateQueues} is false
-   * the pending add/remove queues are left untouched for the main pass (portal views;
-   * PORTAL_VIEW_API.md §4.1): the committed set is still cleared and rasterized so near-chunk
-   * masking stays correct, but a portal pass never consumes main-frame state.
+   * Rasterizes the known chunk bounds into {@code viewport}. When {@code mutateQueues} is false the
+   * pending add/remove queues are left untouched for the main pass (portal views;
+   * PORTAL_VIEW_API.md §4.1): the viewport's own depth bound buffer is still cleared and
+   * re-rasterized from the committed set so near-chunk masking stays correct, but a portal pass
+   * never consumes main-frame queue state.
    */
   public void renderTo(Viewport<?> viewport, boolean mutateQueues) {
     if (mutateQueues) {
-      // Delayed-removal ring: rotate to the slot behind the write head and move everything that
-      // has waited REMOVAL_DELAY_FRAMES into remQueue. Portal passes (mutateQueues=false) skip
-      // this: they draw the committed set only and must not consume main-frame state.
+      // Delayed-removal ring: the slot ahead of the write head holds the oldest entries (parked
+      // REMOVAL_DELAY_FRAMES renders ago); move them into remQueue and advance the head into that
+      // slot. Portal passes (mutateQueues=false) skip all queue mutation - the ring does not
+      // advance and no pending add/remove is consumed; they rasterize the committed set only.
       int oldestSlot = (this.delayQueueIndex + 1) % REMOVAL_DELAY_FRAMES;
       LongArrayList oldestQueue = this.delayedRemovalQueue[oldestSlot];
       if (!oldestQueue.isEmpty()) {
@@ -338,6 +344,9 @@ public class ChunkBoundRenderer {
     for (LongArrayList queue : this.delayedRemovalQueue) {
       queue.clear();
     }
+    // All slots are empty now, so rewinding the write head to 0 is safe and restores constructor
+    // state; entries written after the reset then wait the full REMOVAL_DELAY_FRAMES window.
+    this.delayQueueIndex = 0;
   }
 
   public void free() {

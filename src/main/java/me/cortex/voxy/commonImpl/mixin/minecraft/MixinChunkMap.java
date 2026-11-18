@@ -11,23 +11,23 @@ import org.spongepowered.asm.mixin.injection.At;
 /**
  * Limits one pass over the chunk unload queue to the entries that were in it when the pass began.
  *
- * An unload that finds its chunk still claimed puts itself straight back on the queue
+ * <p>An unload that finds its chunk still claimed puts itself straight back on the queue
  * (ChunkMap.scheduleUnload), and vanilla keeps polling until the queue is empty or the tick is out
  * of time. A chunk that was queued for unload and then claimed again (e.g. as a generation
  * neighbour while background generation runs) stays claimed for as long as work around it
- * continues. Two things follow from that:
- *  - every server tick spins on those entries until its 50ms are gone, so MSPT reads ~50 with
- *    nothing actually slow, and work that backs off on MSPT stalls itself;
- *  - when the world closes the pass gets unlimited time, while the claims can only be released by
- *    work this same thread does after the pass returns. It never returns: the game hangs on
- *    "Saving worlds".
- * An entry that put itself back cannot succeed until the server thread has done something else, so
- * retrying it within the same pass is never useful.
+ * continues. Two things follow from that: - every server tick spins on those entries until its 50ms
+ * are gone, so MSPT reads ~50 with nothing actually slow, and work that backs off on MSPT stalls
+ * itself; - when the world closes the pass gets unlimited time, while the claims can only be
+ * released by work this same thread does after the pass returns. It never returns: the game hangs
+ * on "Saving worlds". An entry that put itself back cannot succeed until the server thread has done
+ * something else, so retrying it within the same pass is never useful.
  *
- * Optional (require = 0): without claim-requeueing generation the loop is already bounded, and a
- * replacement chunk system has no such loop and does not need this.
+ * <p>Required (require = 1): both wrap targets (Queue.size() and Queue.poll() inside
+ * processUnloads) were verified present in the pinned NeoForge 21.1.230 and on 21.1.262, so a
+ * future injection miss fails the mixin loudly at load time instead of silently skipping the bound
+ * (and re-introducing the world-close hang).
  *
- * Port of falling-colud/voxy-forged fd087e4 (world-close hang part).
+ * <p>Port of falling-colud/voxy-forged fd087e4 (world-close hang part).
  */
 @Mixin(ChunkMap.class)
 public class MixinChunkMap {
@@ -35,11 +35,12 @@ public class MixinChunkMap {
   // happens if only the poll hook below applied
   @Unique private int voxy$unloadsLeftInPass = -1;
 
-  // int k = Math.max(0, this.unloadQueue.size() - 2000); - evaluated once, right before the poll loop
+  // int k = Math.max(0, this.unloadQueue.size() - 2000); - evaluated once, right before the poll
+  // loop
   @WrapOperation(
       method = "processUnloads",
       at = @At(value = "INVOKE", target = "Ljava/util/Queue;size()I"),
-      require = 0)
+      require = 1)
   private int voxy$beginUnloadPass(Queue<?> queue, Operation<Integer> original) {
     int size = original.call(queue);
     this.voxy$unloadsLeftInPass = size;
@@ -50,7 +51,7 @@ public class MixinChunkMap {
   @WrapOperation(
       method = "processUnloads",
       at = @At(value = "INVOKE", target = "Ljava/util/Queue;poll()Ljava/lang/Object;"),
-      require = 0)
+      require = 1)
   private Object voxy$pollOncePerPass(Queue<?> queue, Operation<Object> original) {
     if (this.voxy$unloadsLeftInPass == 0) {
       return null;

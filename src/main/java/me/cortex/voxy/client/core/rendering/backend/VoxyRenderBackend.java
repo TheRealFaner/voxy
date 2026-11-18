@@ -75,6 +75,16 @@ public interface VoxyRenderBackend extends AutoCloseable {
 
   void onSectionRenderStateChanged(long sectionPos, boolean present);
 
+  /**
+   * A Sodium render section was disposed (chunk unloaded / left the render distance), as opposed to
+   * the transient build-state change reported by {@link #onSectionRenderStateChanged}. Fired from
+   * the {@code RenderSectionManager.onSectionRemoved} HEAD injection, before Sodium deletes the
+   * section. Backends that delay chunk-bound removals (to let the LOD build catch up on rebuilds)
+   * must remove the section immediately here: the LOD for the disposed area is already prepared, so
+   * the delay window would only leave a see-through gap. Default no-op.
+   */
+  default void onSectionDisposed(long sectionPos) {}
+
   default void beginVanillaRenderSectionSync() {}
 
   default void syncVanillaRenderSections(ChunkRenderListIterable renderLists, boolean reverse) {}

@@ -225,13 +225,10 @@ public class VoxyRenderSystem {
       var player = Minecraft.getInstance().player;
       Logger.info(
           "Voxy portal pass diagnostic (one-shot): sourceDim={} systemDim={} supported={} foreignDimensions={}",
-          player == null || player.level() == null
-              ? "none"
-              : player.level().dimension().location(),
+          player == null || player.level() == null ? "none" : player.level().dimension().location(),
           this.dimensionKey == null ? "none" : this.dimensionKey.location(),
           scope.supported,
-          this.portalConfig.foreignDimensions()
-      );
+          this.portalConfig.foreignDimensions());
     }
     return scope.supported;
   }
@@ -305,8 +302,8 @@ public class VoxyRenderSystem {
   }
 
   /**
-   * D1/D3: the home system renders the dimension that is currently being drawn. A system without
-   * a captured dimension (old constructor) is always home, preserving previous behavior.
+   * D1/D3: the home system renders the dimension that is currently being drawn. A system without a
+   * captured dimension (old constructor) is always home, preserving previous behavior.
    */
   public boolean isHomeSystem() {
     if (this.dimensionKey == null) {
@@ -627,6 +624,22 @@ public class VoxyRenderSystem {
       return;
     }
     this.backend.onSectionRenderStateChanged(sectionPos, present);
+  }
+
+  /**
+   * A Sodium render section was disposed (chunk unloaded / left the render distance), not merely
+   * rebuilt. Fired from the {@code RenderSectionManager.onSectionRemoved} HEAD injection, i.e.
+   * before Sodium's own {@code updateSectionInfo(section, null)} redirect (which would route the
+   * same section through the 12-frame delayed removal). Backends that delay chunk-bound removals to
+   * avoid pop-out on transient rebuilds drop the bound immediately here: the LOD for the unloaded
+   * area is already prepared, so the delay window would only leave a see-through gap. Same
+   * main-frame-only routing as {@link #onSectionRenderStateChanged}.
+   */
+  public void onSectionDisposed(long sectionPos) {
+    if (this.isMainStageSuppressed() || !this.portalScopes.isEmpty()) {
+      return;
+    }
+    this.backend.onSectionDisposed(sectionPos);
   }
 
   public void beginVanillaRenderSectionSync() {
