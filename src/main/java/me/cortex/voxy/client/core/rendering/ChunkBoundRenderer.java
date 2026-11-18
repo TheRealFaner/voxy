@@ -11,6 +11,7 @@ import static org.lwjgl.opengl.GL31.glDrawElementsInstanced;
 import static org.lwjgl.opengl.GL42.glDrawElementsInstancedBaseInstance;
 
 import it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap;
+import it.unimi.dsi.fastutil.longs.LongArrayList;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import me.cortex.voxy.client.core.gl.GlBuffer;
 import me.cortex.voxy.client.core.gl.GlVertexArray;
@@ -41,10 +42,27 @@ public class ChunkBoundRenderer {
   private final LongOpenHashSet addQueue = new LongOpenHashSet();
   private final LongOpenHashSet remQueue = new LongOpenHashSet();
 
+  // Sections currently sitting in a delayed-removal slot, so removeSection is idempotent (it can
+  // be driven from multiple Sodium hooks for the same section without double-removing).
+  private final LongOpenHashSet pendingRemoval = new LongOpenHashSet();
+
+  // Delayed removal to prevent pop-out when a section is rebuilt: a queued removal is only moved
+  // into remQueue after REMOVAL_DELAY_FRAMES frames (~200ms at 60fps), giving the LOD build
+  // window time to prepare before the chunk bound disappears. Port of falling-colud/voxy-forged
+  // ChunkBoundRenderer (delayQueueIndex ring + removeSectionImmediate).
+  private static final int REMOVAL_DELAY_FRAMES = 12;
+  private final LongArrayList[] delayedRemovalQueue = new LongArrayList[REMOVAL_DELAY_FRAMES];
+  private int delayQueueIndex = 0;
+
   private final AbstractRenderPipeline pipeline;
 
   public ChunkBoundRenderer(AbstractRenderPipeline pipeline) {
     this.chunk2idx.defaultReturnValue(-1);
+
+    for (int i = 0; i < REMOVAL_DELAY_FRAMES; i++) {
+      this.delayedRemovalQueue[i] = new LongArrayList();
+    }
+
 
     String vert = ShaderLoader.parse("voxy:chunkoutline/outline.vsh");
     String taa = pipeline.taaFunction("getTAA");
@@ -66,15 +84,58 @@ public class ChunkBoundRenderer {
   }
 
   public void addSection(long pos) {
+    // A section coming back while its removal is still counting down cancels the removal: it
+    // never left the bound, so there is nothing to remove.
+    if (this.pendingRemoval.remove(pos)) {
+      for (LongArrayList queue : this.delayedRemovalQueue) {
+        if (queue.rem(pos)) {
+          break;
+        }
+      }
+      return;
+    }
     if (!this.remQueue.remove(pos)) {
       this.addQueue.add(pos);
     }
   }
 
   public void removeSection(long pos) {
-    if (!this.addQueue.remove(pos)) {
-      this.remQueue.add(pos);
+    if (this.addQueue.remove(pos)) {
+      return; // Was a pending add that never became live; just cancel it
     }
+    // Only sections actually being masked need removing. Sodium drives this from several places
+    // (build-state change and section disposal), so ignore anything not currently tracked to
+    // avoid spurious "Chunk not in map" churn, and dedupe via pendingRemoval.
+    if (!this.chunk2idx.containsKey(pos)) {
+      return;
+    }
+    if (this.pendingRemoval.add(pos)) {
+      // Delayed removal instead of immediate: gives the LOD system time to prepare before the
+      // chunk bound disappears (the transient build-state-change path).
+      this.delayedRemovalQueue[this.delayQueueIndex].add(pos);
+    }
+  }
+
+  // Removes a section from the occlusion bound on the next frame, skipping the delayed-removal
+  // window. Use this when the section is actually disposed (chunk unloaded / left render
+  // distance): the LOD is already prepared, so the ~200ms delay would only leave a see-through
+  // gap. The delayed path is still used for transient build-state changes (rebuilds).
+  public void removeSectionImmediate(long pos) {
+    if (this.addQueue.remove(pos)) {
+      return; // Was a pending add that never became live; just cancel it
+    }
+    if (!this.chunk2idx.containsKey(pos)) {
+      return;
+    }
+    // Cancel any in-flight delayed removal so we don't process it twice.
+    if (this.pendingRemoval.remove(pos)) {
+      for (LongArrayList queue : this.delayedRemovalQueue) {
+        if (queue.rem(pos)) {
+          break;
+        }
+      }
+    }
+    this.remQueue.add(pos);
   }
 
   // Bind and render, changing as little gl state as possible so that the caller may configure how
@@ -90,13 +151,30 @@ public class ChunkBoundRenderer {
    * masking stays correct, but a portal pass never consumes main-frame state.
    */
   public void renderTo(Viewport<?> viewport, boolean mutateQueues) {
-    if (mutateQueues && !this.remQueue.isEmpty()) {
-      boolean wasEmpty = this.chunk2idx.isEmpty();
-      this.remQueue.forEach(this::_remPos); // TODO: REPLACE WITH SCATTER COMPUTE
-      this.remQueue.clear();
-      if (this.chunk2idx.isEmpty()
-          && !wasEmpty) { // When going from stuff to nothing need to clear the depth buffer
-        viewport.depthBoundingBuffer.clear(0);
+    if (mutateQueues) {
+      // Delayed-removal ring: rotate to the slot behind the write head and move everything that
+      // has waited REMOVAL_DELAY_FRAMES into remQueue. Portal passes (mutateQueues=false) skip
+      // this: they draw the committed set only and must not consume main-frame state.
+      int oldestSlot = (this.delayQueueIndex + 1) % REMOVAL_DELAY_FRAMES;
+      LongArrayList oldestQueue = this.delayedRemovalQueue[oldestSlot];
+      if (!oldestQueue.isEmpty()) {
+        for (int i = 0; i < oldestQueue.size(); i++) {
+          long p = oldestQueue.getLong(i);
+          this.remQueue.add(p);
+          this.pendingRemoval.remove(p);
+        }
+        oldestQueue.clear();
+      }
+      this.delayQueueIndex = oldestSlot;
+
+      if (!this.remQueue.isEmpty()) {
+        boolean wasEmpty = this.chunk2idx.isEmpty();
+        this.remQueue.forEach(this::_remPos); // TODO: REPLACE WITH SCATTER COMPUTE
+        this.remQueue.clear();
+        if (this.chunk2idx.isEmpty()
+            && !wasEmpty) { // When going from stuff to nothing need to clear the depth buffer
+          viewport.depthBoundingBuffer.clear(0);
+        }
       }
     }
 
@@ -256,6 +334,10 @@ public class ChunkBoundRenderer {
     // just reset away (or run _remPos against an emptied map).
     this.addQueue.clear();
     this.remQueue.clear();
+    this.pendingRemoval.clear();
+    for (LongArrayList queue : this.delayedRemovalQueue) {
+      queue.clear();
+    }
   }
 
   public void free() {
