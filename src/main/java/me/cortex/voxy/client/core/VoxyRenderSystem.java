@@ -47,6 +47,7 @@ public class VoxyRenderSystem {
   private final ArrayDeque<PortalScope> portalScopes = new ArrayDeque<>();
   private boolean portalFailureLatched;
   private boolean loggedNonRenderThread;
+  private boolean loggedPortalPassDiagnostic;
 
   // Per-renderer frame state (D3), replacing the former global RenderFrameStageState.currentFrame.
   // Every mixin resolves its renderer from Minecraft.levelRenderer, which IP swaps to the
@@ -219,6 +220,19 @@ public class VoxyRenderSystem {
         scope.supported = false;
       }
     }
+    if (!this.loggedPortalPassDiagnostic) {
+      this.loggedPortalPassDiagnostic = true;
+      var player = Minecraft.getInstance().player;
+      Logger.info(
+          "Voxy portal pass diagnostic (one-shot): sourceDim={} systemDim={} supported={} foreignDimensions={}",
+          player == null || player.level() == null
+              ? "none"
+              : player.level().dimension().location(),
+          this.dimensionKey == null ? "none" : this.dimensionKey.location(),
+          scope.supported,
+          this.portalConfig.foreignDimensions()
+      );
+    }
     return scope.supported;
   }
 
@@ -291,18 +305,47 @@ public class VoxyRenderSystem {
   }
 
   /**
-   * D1/D3: the home system renders the dimension the client player is currently in. A system
-   * without a captured dimension (old constructor) is always home, preserving previous behavior.
+   * D1/D3: the home system renders the dimension that is currently being drawn. A system without
+   * a captured dimension (old constructor) is always home, preserving previous behavior.
    */
   public boolean isHomeSystem() {
     if (this.dimensionKey == null) {
       return true;
     }
-    var player = Minecraft.getInstance().player;
-    if (player == null || player.level() == null) {
-      return true;
+    // Compare against the world that is actually being RENDERED, not the client player's level:
+    // IP swaps Minecraft.levelRenderer (and its ClientLevel) to the destination dimension for
+    // nested portal renders, and player.level can transiently diverge from the rendered world,
+    // so a foreign system would otherwise pass the home check and draw its LODs in the wrong
+    // world. The player's level is only a last-resort fallback.
+    var minecraft = Minecraft.getInstance();
+    Level renderedLevel = null;
+    var levelRenderer = minecraft.levelRenderer;
+    if (levelRenderer instanceof IVoxyRenderSystemHolder holder) {
+      renderedLevel = holder.voxy$getLevel();
     }
-    return this.dimensionKey.equals(player.level().dimension());
+    if (renderedLevel == null) {
+      renderedLevel = minecraft.level;
+    }
+    if (renderedLevel == null) {
+      var player = minecraft.player;
+      if (player == null || player.level() == null) {
+        return true;
+      }
+      renderedLevel = player.level();
+    }
+    if (!this.dimensionKey.equals(renderedLevel.dimension())) {
+      return false;
+    }
+    // D1: a system is home only when the player's dimension agrees as well. IP
+    // swaps the renderer before the player's level settles on a dimension change,
+    // so a renderer/player desync must make the drawn system non-home (its main
+    // stages are then suppressed) instead of passing the tautological rendered-
+    // level check.
+    var player = minecraft.player;
+    if (player != null && player.level() != null) {
+      return this.dimensionKey.equals(player.level().dimension());
+    }
+    return true;
   }
 
   /**
@@ -568,10 +611,21 @@ public class VoxyRenderSystem {
   }
 
   public void onChunkTrackerReset() {
+    // D1: these hooks mutate main-frame-owned chunk-bound state (the loaded-chunk
+    // outline map). A suppressed system must not run them, and a portal pass must
+    // never route them (portal paths are draw-only). Letting a foreign system or a
+    // nested render feed/reset this map is what produced the "Chunk not in map"/
+    // "Chunk already in map" warning storms.
+    if (this.isMainStageSuppressed() || !this.portalScopes.isEmpty()) {
+      return;
+    }
     this.backend.onChunkTrackerReset();
   }
 
   public void onSectionRenderStateChanged(long sectionPos, boolean present) {
+    if (this.isMainStageSuppressed() || !this.portalScopes.isEmpty()) {
+      return;
+    }
     this.backend.onSectionRenderStateChanged(sectionPos, present);
   }
 

@@ -252,6 +252,10 @@ public class ChunkBoundRenderer {
 
   public void reset() {
     this.chunk2idx.clear();
+    // Drop the pending queues too: otherwise the next renderTo() would re-add sections that were
+    // just reset away (or run _remPos against an emptied map).
+    this.addQueue.clear();
+    this.remQueue.clear();
   }
 
   public void free() {

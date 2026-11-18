@@ -38,6 +38,11 @@ public abstract class MixinLevelRenderer implements IVoxyRenderSystemHolder {
     return this.renderer;
   }
 
+  @Override
+  public @Nullable Level voxy$getLevel() {
+    return this.level;
+  }
+
   // D1 nested-render guard. IP renders portals by calling LevelRenderer.renderLevel again with
   // Minecraft.levelRenderer swapped to the destination renderer, so every Voxy stage mixin fires a
   // second time inside that call. Count the nesting so VoxyRenderSystem can refuse all main-style
