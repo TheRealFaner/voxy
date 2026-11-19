@@ -93,9 +93,14 @@ public class ChunkBoundRenderer {
       }
       return;
     }
-    if (!this.remQueue.remove(pos)) {
-      this.addQueue.add(pos);
+    this.remQueue.remove(pos);
+    // Duplicate add: the section is already tracked (the main frame and a portal
+    // manager can feed the same position, and remesh events can repeat). Re-adding
+    // it is a no-op that only produced the "Chunk already in map" warning storm.
+    if (this.chunk2idx.containsKey(pos)) {
+      return;
     }
+    this.addQueue.add(pos);
   }
 
   public void removeSection(long pos) {
