@@ -23,8 +23,8 @@ public class ViewportSelector<T extends Viewport<?>> {
   }
 
   /**
-   * Creates a new, independently-owned viewport (PORTAL_VIEW_API.md §4.2). Portal passes pool
-   * these outside the {@link #extraViewports} map, which has no eviction.
+   * Creates a new, independently-owned viewport (PORTAL_VIEW_API.md §4.2). Portal passes pool these
+   * outside the {@link #extraViewports} map, which has no eviction.
    */
   public T createViewport() {
     return this.creator.get();

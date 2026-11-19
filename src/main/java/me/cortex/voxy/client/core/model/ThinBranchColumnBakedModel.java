@@ -23,8 +23,8 @@ import org.joml.Vector3f;
  * <p>DT's thin-branch model is generated from neighbour-supplied connection data. On the
  * neighbour-less base bake (LOD1+ and any LOD0 fallback while a variant is capped, back-pressured
  * or not yet baked) it degrades to a connectionless model that only paints the centre band/stick,
- * so a distant thin trunk renders as dashed slivers. Neighbour-aware variants are LOD0-only, so
- * the stick would otherwise persist at every coarser LOD.
+ * so a distant thin trunk renders as dashed slivers. Neighbour-aware variants are LOD0-only, so the
+ * stick would otherwise persist at every coarser LOD.
  *
  * <p>This model reproduces the branch's own cell: a square bark column spanning the full cell
  * height ({@code y 0..16}), {@code 2*radius} texels wide/deep and centred at 8, textured with the
@@ -32,8 +32,8 @@ import org.joml.Vector3f;
  * appear as vertical columns at LOD1+, which is the intended coarse-LOD approximation.
  *
  * <p>Quads are registered as culled faces like {@link SolidBarkBakedModel}: the null-direction
- * query returns nothing and each directional query returns that face. Both Voxy bakeries call
- * every direction plus null, so exactly six quads are emitted: four sides and two end caps.
+ * query returns nothing and each directional query returns that face. Both Voxy bakeries call every
+ * direction plus null, so exactly six quads are emitted: four sides and two end caps.
  */
 final class ThinBranchColumnBakedModel implements BakedModel {
   private final TextureAtlasSprite sprite;

@@ -232,8 +232,7 @@ public class TextureUtils {
     if (planeCount == 0) {
       return new ColourDepthTextureData[0][];
     }
-    final ColourDepthTextureData[][] planes =
-        new ColourDepthTextureData[planeCount][faces.length];
+    final ColourDepthTextureData[][] planes = new ColourDepthTextureData[planeCount][faces.length];
     for (int f = 0; f < faces.length; f++) {
       final ColourDepthTextureData src = faces[f];
       final int[] bands = bandsPerFace[f];

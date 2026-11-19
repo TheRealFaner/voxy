@@ -16,7 +16,8 @@ public interface IVoxyRenderSystemHolder {
   // The ClientLevel this LevelRenderer renders. IP swaps Minecraft.levelRenderer (and with it the
   // rendered level) to the destination dimension for nested portal renders, so this identifies the
   // world that is actually being drawn right now.
-  @Nullable Level voxy$getLevel();
+  @Nullable
+  Level voxy$getLevel();
 
   static VoxyRenderSystem getNullable() {
     var lr = getNullableHolder();

@@ -1,8 +1,8 @@
 package me.cortex.voxy.client.iris;
 
 import java.util.function.IntSupplier;
-import me.cortex.voxy.client.core.VoxyRenderSystem;
 import me.cortex.voxy.client.core.IVoxyRenderSystemHolder;
+import me.cortex.voxy.client.core.VoxyRenderSystem;
 import net.irisshaders.iris.gl.sampler.SamplerHolder;
 import net.irisshaders.iris.pipeline.IrisRenderingPipeline;
 import net.irisshaders.iris.targets.RenderTargets;
