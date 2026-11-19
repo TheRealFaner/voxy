@@ -185,8 +185,8 @@ final class RootVertFilterBakedModel implements BakedModel {
 
   /**
    * True when no vertex is above the cap height {@code maxY}, expressed in block units. The
-   * comparison is scale-aware like {@link #isBoundaryCap}: DT 0..1 quads are scaled by 16 first,
-   * so the limit keeps its block-unit meaning for both vertex spaces.
+   * comparison is scale-aware like {@link #isBoundaryCap}: DT 0..1 quads are scaled by 16 first, so
+   * the limit keeps its block-unit meaning for both vertex spaces.
    */
   static boolean withinHeight(BakedQuad quad, float maxY) {
     int[] vertices = quad.getVertices();

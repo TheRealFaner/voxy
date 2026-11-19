@@ -18,11 +18,16 @@ import me.cortex.voxy.commonImpl.VoxyCommon;
 import me.cortex.voxy.commonImpl.compat.sable.SableContraptionRenderDistance;
 
 public class VoxyConfig {
+  // excludeFieldsWithModifiers REPLACES Gson's default exclusions (static, transient) rather than
+  // adding to them, so they have to be listed again. With only PRIVATE here, static fields like
+  // the public CONFIG holder are serialized into voxy-config.json (as a bogus "config" entry),
+  // and reading a 'static final' field back throws - which resets every setting to its default
+  // on each launch after the first save. Port of falling-colud/voxy-forged fd087e4 (config part).
   private static final Gson GSON =
       new GsonBuilder()
           .setFieldNamingPolicy(FieldNamingPolicy.LOWER_CASE_WITH_UNDERSCORES)
           .setPrettyPrinting()
-          .excludeFieldsWithModifiers(Modifier.PRIVATE)
+          .excludeFieldsWithModifiers(Modifier.PRIVATE, Modifier.STATIC, Modifier.TRANSIENT)
           .create();
 
   public static VoxyConfig CONFIG = loadOrCreate();

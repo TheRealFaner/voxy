@@ -26,7 +26,7 @@ jobs:
           cache-cleanup: always
 
       - name: Gradle build
-        run: ./gradlew build
+        run: ./gradlew spotlessCheck :neoforge:build
 
       - name: Publish jars to rolling release
         env:
@@ -37,17 +37,12 @@ jobs:
           MOD=$(sed -n 's/^mod_version[[:space:]]*=[[:space:]]*//p' gradle.properties)
           MC=$(sed -n 's/^minecraft_version[[:space:]]*=[[:space:]]*//p' gradle.properties)
           NEO="${BASE}-${MOD}+${MC}-neoforge.jar"
-          FAB="${BASE}-${MOD}+${MC}-fabric.jar"
           NEO_JAR=$(ls neoforge/build/libs/*.jar | head -n 1)
-          FAB_JAR=$(ls fabric/build/libs/*.jar | head -n 1)
           if [ "$(basename "$NEO_JAR")" != "$NEO" ]; then
             cp "$NEO_JAR" "neoforge/build/libs/$NEO"
           fi
-          if [ "$(basename "$FAB_JAR")" != "$FAB" ]; then
-            cp "$FAB_JAR" "fabric/build/libs/$FAB"
-          fi
           gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" \
             --title "Manual builds" \
-            --notes "Rolling manual Voxy builds for NeoForge and Fabric. Updated on every manual run." \
+            --notes "Rolling manual Voxy builds for NeoForge. Updated on every manual run." \
             --prerelease --latest=false
-          gh release upload "$TAG" "neoforge/build/libs/$NEO" "fabric/build/libs/$FAB" --clobber
+          gh release upload "$TAG" "neoforge/build/libs/$NEO" --clobber

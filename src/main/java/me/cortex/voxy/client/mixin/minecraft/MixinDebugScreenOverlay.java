@@ -2,8 +2,8 @@ package me.cortex.voxy.client.mixin.minecraft;
 
 import java.util.ArrayList;
 import java.util.List;
-import me.cortex.voxy.client.core.VoxyRenderSystem;
 import me.cortex.voxy.client.core.IVoxyRenderSystemHolder;
+import me.cortex.voxy.client.core.VoxyRenderSystem;
 import me.cortex.voxy.common.platform.PlatformAccess;
 import me.cortex.voxy.commonImpl.VoxyCommon;
 import net.minecraft.ChatFormatting;

@@ -20,7 +20,8 @@ public class MipGen {
   private static final ThreadLocal<short[]> SCRATCH =
       ThreadLocal.withInitial(() -> new short[MODEL_TEXTURE_SIZE * MODEL_TEXTURE_SIZE]);
   private static final ThreadLocal<ByteArrayFIFOQueue> QUEUE =
-      ThreadLocal.withInitial(() -> new ByteArrayFIFOQueue(MODEL_TEXTURE_SIZE * MODEL_TEXTURE_SIZE));
+      ThreadLocal.withInitial(
+          () -> new ByteArrayFIFOQueue(MODEL_TEXTURE_SIZE * MODEL_TEXTURE_SIZE));
 
   private static long getOffset(int bx, int by, int i) {
     bx += i & (MODEL_TEXTURE_SIZE - 1);

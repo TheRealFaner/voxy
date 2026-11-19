@@ -2,8 +2,8 @@ package me.cortex.voxy.client.mixin.sodium;
 
 import me.cortex.voxy.client.ClientChunkCacheAccess;
 import me.cortex.voxy.client.config.VoxyConfig;
-import me.cortex.voxy.client.core.VoxyRenderSystem;
 import me.cortex.voxy.client.core.IVoxyRenderSystemHolder;
+import me.cortex.voxy.client.core.VoxyRenderSystem;
 import me.cortex.voxy.common.VoxyFlags;
 import me.cortex.voxy.common.platform.PlatformAccess;
 import me.cortex.voxy.common.world.service.VoxelIngestService;
@@ -75,6 +75,22 @@ public class MixinRenderSectionManager {
         if (chunk != null) {
           VoxelIngestService.tryAutoIngestChunk(chunk);
         }
+      }
+    }
+  }
+
+  // Sodium 0.8.12 RenderSectionManager.onSectionRemoved(int, int, int): a render section was
+  // disposed (chunk unloaded / left the render distance). HEAD runs before the method's own
+  // updateSectionInfo(section, null) - which our setInfo redirect routes into the 12-frame
+  // delayed chunk-bound removal - and before section.delete(), so the bound drops in the same
+  // frame instead of leaving a stale AABB that can depth-cull already-prepared LOD at the unload
+  // frontier. The position matches the one the redirect computes via SectionPos.asLong.
+  @Inject(method = "onSectionRemoved", at = @At("HEAD"))
+  private void voxy$onSectionRemoved(int x, int y, int z, CallbackInfo ci) {
+    if (this.level.levelRenderer != null) {
+      var system = ((IVoxyRenderSystemHolder) (this.level.levelRenderer)).voxy$getRenderSystem();
+      if (system != null) {
+        system.onSectionDisposed(SectionPos.asLong(x, y, z));
       }
     }
   }

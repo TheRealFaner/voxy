@@ -463,8 +463,8 @@ public final class Gl46RenderBackend implements VoxyRenderBackend {
   /**
    * Configures a viewport from a host frame context (PORTAL_VIEW_API.md §4.1). The main path runs
    * the previous {@code setupFrame} statements in the same order; the portal path reuses them on
-   * its own pooled viewport, so the main viewport, matrices and {@code lastFrameMatrices} are
-   * never touched.
+   * its own pooled viewport, so the main viewport, matrices and {@code lastFrameMatrices} are never
+   * touched.
    */
   private void configureViewport(
       Gl46Viewport<?> viewport,
@@ -516,18 +516,17 @@ public final class Gl46RenderBackend implements VoxyRenderBackend {
   }
 
   /**
-   * Writes the camera-relative plane into the unused far-plane slot (§4.6, Appendix A.1):
-   * {@code n' = n}, {@code d' = -dot(n, planePoint - camera)}; the shader keeps nodes where
-   * {@code dot(n', pos) + d' >= 0}.
+   * Writes the camera-relative plane into the unused far-plane slot (§4.6, Appendix A.1): {@code n'
+   * = n}, {@code d' = -dot(n, planePoint - camera)}; the shader keeps nodes where {@code dot(n',
+   * pos) + d' >= 0}.
    */
   private static void applyPortalClipPlane(Gl46Viewport<?> viewport, PortalClipPlane clipPlane) {
     double d =
         -(clipPlane.nx() * (clipPlane.px() - viewport.cameraX)
             + clipPlane.ny() * (clipPlane.py() - viewport.cameraY)
             + clipPlane.nz() * (clipPlane.pz() - viewport.cameraZ));
-    viewport
-        .frustumPlanes[5]
-        .set((float) clipPlane.nx(), (float) clipPlane.ny(), (float) clipPlane.nz(), (float) d);
+    viewport.frustumPlanes[5].set(
+        (float) clipPlane.nx(), (float) clipPlane.ny(), (float) clipPlane.nz(), (float) d);
   }
 
   private void checkPortalRect(Gl46Viewport<?> portalViewport) {
@@ -768,6 +767,11 @@ public final class Gl46RenderBackend implements VoxyRenderBackend {
     } else {
       this.chunkBoundRenderer.removeSection(sectionPos);
     }
+  }
+
+  @Override
+  public void onSectionDisposed(long sectionPos) {
+    this.chunkBoundRenderer.removeSectionImmediate(sectionPos);
   }
 
   @Override

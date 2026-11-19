@@ -17,9 +17,9 @@ package me.cortex.voxy.client.core.rendering.backend;
  *       whose destination is not the client player's dimension (PORTAL_VIEW_API.md D7/§3.8). The
  *       scope is still opened when this is false; the pass simply renders no LOD.
  *   <li>{@code voxy.portal.serviceForeign} (default {@code true}) — allow once-per-host-frame
- *       servicing (uploads, model ticks, LOD recenter) of a foreign {@code VoxyRenderSystem}
- *       during its portal pass (PORTAL_VIEW_API.md §7.4). Only reachable when {@link
- *       #foreignDimensions()} is enabled and the pass target is supported.
+ *       servicing (uploads, model ticks, LOD recenter) of a foreign {@code VoxyRenderSystem} during
+ *       its portal pass (PORTAL_VIEW_API.md §7.4). Only reachable when {@link #foreignDimensions()}
+ *       is enabled and the pass target is supported.
  *   <li>{@code voxy.portal.suppressForeignMain} (default {@code true}) — cross-dimension isolation
  *       rollback switch (D1): a non-home system whose dimension differs from the client player's
  *       level renders no main-style stages at all while no portal scope is open. Set to {@code
